@@ -1223,7 +1223,7 @@ async fn execute_rss_search(
     let search_types = rss_search_types(req, search_caps.as_ref());
 
     log!(
-        LogLevel::Info,
+        LogLevel::Debug,
         "rss_search: fetching recent releases cat={} search_types={:?}",
         cat_str,
         search_types
@@ -1349,7 +1349,7 @@ async fn execute_rss_search(
             };
 
         log!(
-            LogLevel::Info,
+            LogLevel::Debug,
             "rss_search: t={} returned {} results",
             search_type,
             page_results.len()
@@ -1370,7 +1370,7 @@ async fn execute_rss_search(
     }
 
     log!(
-        LogLevel::Info,
+        LogLevel::Debug,
         "rss_search: total {} results across {} search types",
         all_results.len(),
         search_types.len()

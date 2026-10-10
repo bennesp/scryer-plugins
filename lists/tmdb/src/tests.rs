@@ -108,10 +108,21 @@ fn descriptor_round_trips_and_passes_host_checks() {
         }
     );
     assert!(list.capabilities.health);
+    let server_key = list
+        .config_fields
+        .iter()
+        .find(|field| field.key == CONFIG_API_KEY)
+        .unwrap();
     assert!(
-        list.config_fields
-            .iter()
-            .any(|field| field.key == CONFIG_API_KEY)
+        !server_key.required,
+        "members can link with their own token on a server that has none"
+    );
+    // A member's own token starts the same approval; it is never the credential.
+    let member_key = list.member_key.as_ref().expect("members can bring a token");
+    assert_eq!(member_key.use_as, ListMemberKeyUse::AccountApp);
+    assert_eq!(
+        member_key.help_url.as_deref(),
+        Some("https://www.themoviedb.org/settings/api")
     );
     assert_eq!(list.allowed_hosts, vec!["api.themoviedb.org".to_string()]);
     let sources: Vec<_> = list.groups[0]

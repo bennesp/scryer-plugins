@@ -36,6 +36,12 @@
 //! token goes in the `Authorization` header and nowhere else; its
 //! `external_user_id` is the v4 account object id the account endpoints are
 //! addressed by.
+//!
+//! TMDb issues that user access token only to an application, through an
+//! approval the member gives on themoviedb.org. The application is the
+//! server's v4 read access token or, declared as `member_key`, the member's
+//! own: the host starts the approval with whichever it has, and this plugin
+//! never sees the member's application token at all.
 
 use list_provider_common::error::{
     Access, auth_failed, check_status, invalid_config, missing_param, not_found, permanent,
@@ -50,12 +56,13 @@ use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::host::{PluginHttpRequest, PluginHttpResponse};
 use scryer_plugin_sdk::{
     ConfigFieldDef, ConfigFieldType, ListAccountExchange, ListAccountFlow, ListAccountList,
-    ListAuthBadge, ListCredential, ListMediaKind, ListNoteTone, ListPluginAccountResponse,
-    ListPluginFetchRequest, ListPluginFetchResponse, ListPluginHealthResponse, ListPluginItem,
-    ListProviderAuth, ListProviderCapabilities, ListProviderDescriptor, ListProviderGroup,
-    ListProviderItem, ListProviderNote, ListProviderRating, ListProviderTile, ListSourceParam,
-    ListSourceParamType, ListUrlPattern, ListUrlPatternCapture, PluginDescriptor, PluginError,
-    PluginErrorCode, PluginResult, ProviderDescriptor,
+    ListAuthBadge, ListCredential, ListMediaKind, ListMemberKey, ListMemberKeyUse, ListNoteTone,
+    ListPluginAccountResponse, ListPluginFetchRequest, ListPluginFetchResponse,
+    ListPluginHealthResponse, ListPluginItem, ListProviderAuth, ListProviderCapabilities,
+    ListProviderDescriptor, ListProviderGroup, ListProviderItem, ListProviderNote,
+    ListProviderRating, ListProviderTile, ListSourceParam, ListSourceParamType, ListUrlPattern,
+    ListUrlPatternCapture, PluginDescriptor, PluginError, PluginErrorCode, PluginResult,
+    ProviderDescriptor,
 };
 use serde_json::Value;
 
@@ -196,6 +203,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["themoviedb".to_string()],
@@ -227,6 +235,18 @@ pub fn descriptor() -> PluginDescriptor {
                 byo_app: false,
                 scopes: Vec::new(),
             },
+            // A member can start that approval with their own TMDb
+            // application instead of the server's.
+            member_key: Some(ListMemberKey {
+                label: "Your TMDb API Read Access Token".to_string(),
+                help_text: Some(
+                    "The long API Read Access Token on the API page of your TMDb account \
+                     settings, not the shorter API key."
+                        .to_string(),
+                ),
+                help_url: Some(format!("{SITE_BASE}/settings/api")),
+                use_as: ListMemberKeyUse::AccountApp,
+            }),
             groups: vec![
                 ListProviderGroup {
                     label: "Public sources".to_string(),
@@ -354,10 +374,12 @@ pub fn descriptor() -> PluginDescriptor {
                 key: CONFIG_API_KEY.to_string(),
                 label: "TMDb API key or read access token".to_string(),
                 field_type: ConfigFieldType::Password,
-                required: true,
+                required: false,
                 help_text: Some(
                     "A v3 API key or a v4 API read access token from your TMDb account settings. \
-                     Members can link their own TMDb accounts only with the v4 read access token."
+                     Needed for public lists, people, companies and keywords. Members link their \
+                     own TMDb accounts through it when it is the v4 read access token, or with \
+                     a read access token of their own."
                         .to_string(),
                 ),
                 ..Default::default()

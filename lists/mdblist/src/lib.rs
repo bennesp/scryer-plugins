@@ -6,25 +6,35 @@
 //! reads the API's items endpoint, which also reaches the key owner's private
 //! lists and pages through lists longer than one response.
 //!
-//! The key is server configuration declared in the descriptor; no member
-//! credential is ever read or stored. MDBList's directory of top lists is not
-//! a list itself, so it is not a source here: any top list is followed by its
-//! address like every other list.
+//! That key is server configuration declared in the descriptor. MDBList's
+//! directory of top lists is not a list itself, so it is not a source here:
+//! any top list is followed by its address like every other list.
+//!
+//! A member who links their own MDBList account does it with their own API
+//! key, which the host hands back as that member's credential and never as
+//! configuration. It reads two personal sources, and nothing else:
+//!
+//! - `my_list`: one of the member's own lists, public or private, by its id.
+//! - `watchlist`: the member's MDBList watchlist, movies and shows.
+//!
+//! A personal source never falls back to the server key, and the public
+//! source never reads a member's.
 
 use list_provider_common::error::{
-    Access, check_status, invalid_config, missing_param, plugin_error, unsupported_source,
+    Access, auth_failed, check_status, invalid_config, missing_param, permanent, unsupported_source,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, header, json_body};
 use list_provider_common::ids::{Ids, build_item, dedupe_and_rank, json_id, json_text, json_year};
 use list_provider_common::page::{numeric_cursor, single_page};
 use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::{
-    ConfigFieldDef, ConfigFieldType, ListAuthBadge, ListMediaKind, ListNoteTone,
+    ConfigFieldDef, ConfigFieldType, ListAccountList, ListAuthBadge, ListCredential, ListMediaKind,
+    ListMemberKey, ListMemberKeyUse, ListNoteTone, ListPluginAccountResponse,
     ListPluginFetchRequest, ListPluginFetchResponse, ListPluginHealthResponse, ListPluginItem,
     ListProviderAuth, ListProviderCapabilities, ListProviderDescriptor, ListProviderGroup,
     ListProviderItem, ListProviderNote, ListProviderTile, ListSourceParam, ListSourceParamType,
-    ListUrlPattern, ListUrlPatternCapture, PluginDescriptor, PluginError, PluginErrorCode,
-    PluginResult, ProviderDescriptor,
+    ListUrlPattern, ListUrlPatternCapture, PluginDescriptor, PluginError, PluginResult,
+    ProviderDescriptor,
 };
 use serde_json::Value;
 
@@ -41,6 +51,11 @@ pub const PROVIDER_TYPE: &str = "mdblist";
 pub const CONFIG_API_KEY: &str = "api_key";
 pub const SOURCE_LIST: &str = "list";
 pub const PARAM_LIST: &str = "list";
+/// One of the linked member's own lists, by the id their account names it by.
+pub const SOURCE_MY_LIST: &str = "my_list";
+pub const PARAM_LIST_ID: &str = "list_id";
+/// The linked member's watchlist.
+pub const SOURCE_WATCHLIST: &str = "watchlist";
 
 pub const API_BASE: &str = "https://api.mdblist.com";
 pub const SITE_BASE: &str = "https://mdblist.com";
@@ -63,6 +78,7 @@ pub fn descriptor() -> PluginDescriptor {
         sdk_version: scryer_plugin_sdk::SDK_VERSION.to_string(),
         sdk_constraint: scryer_plugin_sdk::current_sdk_constraint(),
         socket_permissions: Vec::new(),
+        settings: Vec::new(),
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
@@ -70,7 +86,8 @@ pub fn descriptor() -> PluginDescriptor {
             blurb: Some(
                 "Paste an MDBList list address. Public lists need no key; an MDBList API \
                  key in the provider settings also reaches that account's private lists \
-                 and numeric list ids."
+                 and numeric list ids. Members who connect their own MDBList API key can \
+                 follow their own lists and watchlist."
                     .to_string(),
             ),
             tile: Some(ListProviderTile {
@@ -83,29 +100,77 @@ pub fn descriptor() -> PluginDescriptor {
             auth: ListProviderAuth::ServerApiKey {
                 config_field: CONFIG_API_KEY.to_string(),
             },
-            groups: vec![ListProviderGroup {
-                label: "Lists".to_string(),
-                auth_badge: ListAuthBadge::NoAccountNeedsValue,
-                items: vec![ListProviderItem {
-                    id: "list".to_string(),
-                    name: "List".to_string(),
-                    description: Some(
-                        "Any public list by its address, or a numeric id with the API key"
-                            .to_string(),
-                    ),
-                    kinds: both,
-                    source_type: SOURCE_LIST.to_string(),
-                    params: vec![ListSourceParam {
-                        key: PARAM_LIST.to_string(),
-                        label: "List (user/slug or id)".to_string(),
-                        param_type: ListSourceParamType::Text,
-                        options: Vec::new(),
-                        required: true,
+            // How a member links an account: MDBList has no sign-in to send
+            // them through, so they paste the key MDBList issues them.
+            member_key: Some(ListMemberKey {
+                label: "Your MDBList API key".to_string(),
+                help_text: Some(
+                    "Copy it from the API access section of your MDBList preferences.".to_string(),
+                ),
+                help_url: Some(format!("{SITE_BASE}/preferences/#api")),
+                use_as: ListMemberKeyUse::Credential,
+            }),
+            groups: vec![
+                ListProviderGroup {
+                    label: "Lists".to_string(),
+                    auth_badge: ListAuthBadge::NoAccountNeedsValue,
+                    items: vec![ListProviderItem {
+                        id: "list".to_string(),
+                        name: "List".to_string(),
+                        description: Some(
+                            "Any public list by its address, or a numeric id with the API key"
+                                .to_string(),
+                        ),
+                        kinds: both.clone(),
+                        source_type: SOURCE_LIST.to_string(),
+                        params: vec![ListSourceParam {
+                            key: PARAM_LIST.to_string(),
+                            label: "List (user/slug or id)".to_string(),
+                            param_type: ListSourceParamType::Text,
+                            options: Vec::new(),
+                            required: true,
+                        }],
+                        personal: false,
+                        default_interval_seconds: DEFAULT_INTERVAL_SECONDS,
                     }],
-                    personal: false,
-                    default_interval_seconds: DEFAULT_INTERVAL_SECONDS,
-                }],
-            }],
+                },
+                ListProviderGroup {
+                    label: "Your MDBList account".to_string(),
+                    auth_badge: ListAuthBadge::MemberAccount,
+                    items: vec![
+                        ListProviderItem {
+                            id: "watchlist".to_string(),
+                            name: "Watchlist".to_string(),
+                            description: Some(
+                                "Movies and shows on your MDBList watchlist".to_string(),
+                            ),
+                            kinds: both.clone(),
+                            source_type: SOURCE_WATCHLIST.to_string(),
+                            params: Vec::new(),
+                            personal: true,
+                            default_interval_seconds: DEFAULT_INTERVAL_SECONDS,
+                        },
+                        ListProviderItem {
+                            id: "my-list".to_string(),
+                            name: "Your list".to_string(),
+                            description: Some(
+                                "One of your own MDBList lists, public or private".to_string(),
+                            ),
+                            kinds: both,
+                            source_type: SOURCE_MY_LIST.to_string(),
+                            params: vec![ListSourceParam {
+                                key: PARAM_LIST_ID.to_string(),
+                                label: "List id".to_string(),
+                                param_type: ListSourceParamType::Text,
+                                options: Vec::new(),
+                                required: true,
+                            }],
+                            personal: true,
+                            default_interval_seconds: DEFAULT_INTERVAL_SECONDS,
+                        },
+                    ],
+                },
+            ],
             notes: vec![ListProviderNote {
                 tone: ListNoteTone::Info,
                 text_key: "lists.note.mdblist_dynamic".to_string(),
@@ -120,7 +185,7 @@ pub fn descriptor() -> PluginDescriptor {
                 }],
             }],
             capabilities: ListProviderCapabilities {
-                account: false,
+                account: true,
                 health: true,
                 requires_member_credential: false,
             },
@@ -130,7 +195,9 @@ pub fn descriptor() -> PluginDescriptor {
                 field_type: ConfigFieldType::Password,
                 required: false,
                 help_text: Some(
-                    "Optional. Needed for private lists and numeric list ids.".to_string(),
+                    "Optional. Needed for private lists and numeric list ids. Members connect \
+                     their own lists and watchlist with their own key instead."
+                        .to_string(),
                 ),
                 ..Default::default()
             }],
@@ -168,13 +235,91 @@ pub async fn run<H: ListHttp>(
         PluginListCommand::Health(_) => {
             PluginListCommandResult::Health(into_result(health(http, api_key).await))
         }
-        PluginListCommand::Account(_) => {
-            PluginListCommandResult::Account(PluginResult::Err(plugin_error(
-                PluginErrorCode::Unsupported,
-                "MDBList has no member accounts here",
-            )))
+        PluginListCommand::Account(request) => {
+            PluginListCommandResult::Account(into_result(account(http, &request.credential).await))
         }
     }
+}
+
+/// The API key a member linked their account with, for one call.
+fn member_key(credential: Option<&ListCredential>) -> Result<&str, PluginError> {
+    credential
+        .map(|credential| credential.access_token.trim())
+        .filter(|key| !key.is_empty())
+        .ok_or_else(|| auth_failed("this list needs a linked MDBList account"))
+}
+
+/// A member's own read. MDBList answers a key it does not accept with 401 or
+/// 403, and neither a refusal nor a 404 says the member's watchlist or list
+/// index is gone.
+fn check_member_status(
+    response: &scryer_plugin_sdk::host::PluginHttpResponse,
+    what: &str,
+) -> Result<(), PluginError> {
+    match response.status {
+        401 | 403 => Err(auth_failed("MDBList did not accept the API key")),
+        404 | 410 => Err(permanent(format!(
+            "MDBList has no {what} for this account (HTTP {})",
+            response.status
+        ))),
+        _ => check_status(response, Access::ServerKey, what),
+    }
+}
+
+/// Whose key this is and the lists they own. A key MDBList refuses is
+/// `auth_failed`, which is how the host learns the member typed a wrong one.
+pub async fn account<H: ListHttp>(
+    http: &H,
+    credential: &ListCredential,
+) -> Result<ListPluginAccountResponse, PluginError> {
+    let key = encode_component(member_key(Some(credential))?);
+    let response = http
+        .send(get(
+            format!("{API_BASE}/user?apikey={key}"),
+            USER_AGENT,
+            ACCEPT,
+        ))
+        .await?;
+    check_member_status(&response, "account")?;
+    let user = json_body(&response)?;
+    let external_user_id = json_id(user.get("user_id"))
+        .ok_or_else(|| permanent("MDBList did not say whose API key this is"))?;
+    let username = json_text(user.get("username")).unwrap_or_else(|| external_user_id.clone());
+
+    let response = http
+        .send(get(
+            format!("{API_BASE}/lists/user?apikey={key}"),
+            USER_AGENT,
+            ACCEPT,
+        ))
+        .await?;
+    check_member_status(&response, "lists")?;
+    let owned_lists = json_body(&response)?
+        .as_array()
+        .map(|lists| lists.iter().filter_map(account_list).collect())
+        .unwrap_or_default();
+    Ok(ListPluginAccountResponse {
+        external_user_id,
+        username,
+        display_name: json_text(user.get("name")),
+        avatar_url: json_text(user.get("avatar_url")).filter(|url| url.starts_with("https://")),
+        owned_lists,
+        statuses: Vec::new(),
+    })
+}
+
+/// One of the member's lists as an account source. An MDBList list holds
+/// movies or shows; one that says neither is offered as both.
+fn account_list(entry: &Value) -> Option<ListAccountList> {
+    Some(ListAccountList {
+        id: json_id(entry.get("id"))?,
+        name: json_text(entry.get("name"))?,
+        kinds: match entry.get("mediatype").and_then(Value::as_str) {
+            Some("movie") => vec![ListMediaKind::Movie],
+            Some("show") => vec![ListMediaKind::Series],
+            _ => vec![ListMediaKind::Movie, ListMediaKind::Series],
+        },
+    })
 }
 
 /// Where a list lives: its owner and slug, or its numeric id.
@@ -236,19 +381,98 @@ pub async fn fetch<H: ListHttp>(
     api_key: Option<&str>,
     request: &ListPluginFetchRequest,
 ) -> Result<ListPluginFetchResponse, PluginError> {
-    if request.source_type != SOURCE_LIST {
-        return Err(unsupported_source(&request.source_type));
+    match request.source_type.as_str() {
+        SOURCE_LIST => {
+            let list = parse_list_ref(
+                request
+                    .params
+                    .get(PARAM_LIST)
+                    .ok_or_else(|| missing_param(PARAM_LIST))?,
+            )?;
+            match api_key {
+                Some(key) => fetch_api(http, key, &list, request).await,
+                None => fetch_public(http, &list, request).await,
+            }
+        }
+        SOURCE_MY_LIST => {
+            let key = member_key(request.credential.as_ref())?;
+            let id = request
+                .params
+                .get(PARAM_LIST_ID)
+                .map(|id| id.trim())
+                .ok_or_else(|| missing_param(PARAM_LIST_ID))?;
+            if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(invalid_config("an MDBList list id is a number"));
+            }
+            fetch_api(http, key, &ListRef::Id(id.to_string()), request).await
+        }
+        SOURCE_WATCHLIST => {
+            fetch_watchlist(http, member_key(request.credential.as_ref())?, request).await
+        }
+        other => Err(unsupported_source(other)),
     }
-    let list = parse_list_ref(
-        request
-            .params
-            .get(PARAM_LIST)
-            .ok_or_else(|| missing_param(PARAM_LIST))?,
-    )?;
-    match api_key {
-        Some(key) => fetch_api(http, key, &list, request).await,
-        None => fetch_public(http, &list, request).await,
+}
+
+/// The member's watchlist, movies then shows, a page of each per request.
+/// MDBList reports whether more follows in the body's `pagination` block.
+async fn fetch_watchlist<H: ListHttp>(
+    http: &H,
+    key: &str,
+    request: &ListPluginFetchRequest,
+) -> Result<ListPluginFetchResponse, PluginError> {
+    let offset = numeric_cursor(request.page_cursor.as_deref(), 0)?;
+    let url = format!(
+        "{API_BASE}/watchlist/items?limit={PAGE_LIMIT}&offset={offset}&apikey={}",
+        encode_component(key)
+    );
+    let response = http.send(get(url, USER_AGENT, ACCEPT)).await?;
+    check_member_status(&response, "watchlist")?;
+    let body = json_body(&response)?;
+    let pagination = body.get("pagination");
+    let has_more = pagination
+        .and_then(|pagination| pagination.get("has_more"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        && count_entries(&body) > 0;
+    let mut items = entries(&body);
+    if offset == 0 && !has_more {
+        return Ok(single_page(
+            items,
+            None,
+            None,
+            request.since_fingerprint.as_deref(),
+        ));
     }
+    let next_offset = offset.saturating_add(PAGE_LIMIT);
+    if has_more && next_offset >= PAGE_LIMIT * MAX_PAGES {
+        // Stopping here would read every later title as having left.
+        return Err(permanent(format!(
+            "this MDBList watchlist is longer than the {} titles Scryer follows",
+            PAGE_LIMIT * MAX_PAGES
+        )));
+    }
+    for item in &mut items {
+        if let Some(rank) = item.rank.as_mut() {
+            *rank += offset;
+        }
+    }
+    let total = |key: &str| {
+        pagination
+            .and_then(|pagination| pagination.get(key))
+            .and_then(Value::as_u64)
+    };
+    Ok(ListPluginFetchResponse {
+        items,
+        next_cursor: has_more.then(|| next_offset.to_string()),
+        list_name: None,
+        list_url: None,
+        total_hint: match (total("total_movies"), total("total_shows")) {
+            (None, None) => None,
+            (movies, shows) => u32::try_from(movies.unwrap_or(0) + shows.unwrap_or(0)).ok(),
+        },
+        fingerprint: None,
+        unchanged: false,
+    })
 }
 
 async fn fetch_public<H: ListHttp>(

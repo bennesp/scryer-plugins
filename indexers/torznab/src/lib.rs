@@ -4,9 +4,9 @@ use newznab_common::{
     Capabilities, IndexerCategoryModel, IndexerCategoryValueKind, IndexerDescriptor,
     IndexerFeedMode, IndexerLimitCapabilities, IndexerProtocol, IndexerResponseFeatures,
     IndexerSearchInput, IndexerSourceKind, IndexerTorrentCapabilities, NewznabConfig,
-    PluginActionRequest, PluginActionResponse, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
-    SearchRequest, SearchResponse, current_sdk_constraint, execute_full_search,
-    standard_config_fields,
+    PasswordMetadataClassification, PluginActionRequest, PluginActionResponse, PluginDescriptor,
+    ProviderDescriptor, SDK_VERSION, SearchRequest, SearchResponse, classify_password_metadata,
+    current_sdk_constraint, execute_paged_search, standard_config_fields,
 };
 use scryer_plugin_pdk::*;
 
@@ -18,6 +18,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::Indexer(IndexerDescriptor {
             provider_type: "torznab".to_string(),
             provider_aliases: vec!["jackett".to_string()],
@@ -82,6 +83,10 @@ fn build_descriptor() -> PluginDescriptor {
                     rate_limit_hint_seconds: Some(2),
                     api_quota_supported: true,
                     grab_quota_supported: true,
+                    // Paged responses carry at most one provider page, so a host
+                    // must follow `next_cursor` to see the rest. Hosts that cannot
+                    // are kept off this release by the SDK floor above (3.14).
+                    paged_search: true,
                 }),
                 torrent: Some(IndexerTorrentCapabilities {
                     reports_seeders: true,
@@ -102,8 +107,8 @@ fn build_descriptor() -> PluginDescriptor {
                     info_url: true,
                     guid: true,
                     raw_provider_metadata: true,
+                    password_hint: true,
                     protection_hint: true,
-                    ..IndexerResponseFeatures::default()
                 }),
             },
             scoring_policies: vec![],
@@ -116,7 +121,7 @@ fn build_descriptor() -> PluginDescriptor {
 
 async fn search(req: SearchRequest) -> Result<SearchResponse, Error> {
     let config = NewznabConfig::from_host()?;
-    let mut response = execute_full_search(&config, &req, torznab_metadata_extractor).await?;
+    let mut response = execute_paged_search(&config, &req, torznab_metadata_extractor).await?;
     apply_magnet_fallback(&mut response);
     Ok(response)
 }
@@ -173,6 +178,7 @@ fn torznab_metadata_extractor(
     let mut genres: Vec<String> = Vec::new();
     let mut tags: Vec<String> = Vec::new();
     let mut languages: Vec<String> = Vec::new();
+    let mut password = PasswordMetadataClassification::Empty;
 
     for (name, value) in pairs {
         let normalized = name
@@ -227,6 +233,9 @@ fn torznab_metadata_extractor(
             }
             "tag" => {
                 tags.extend(split_multi_value(trimmed));
+            }
+            "password" => {
+                password = classify_password_metadata(Some(trimmed));
             }
             _ => {}
         }
@@ -303,6 +312,29 @@ fn torznab_metadata_extractor(
             "tags".to_string(),
             serde_json::to_value(dedupe(tags)).unwrap_or_default(),
         );
+    }
+
+    match password {
+        PasswordMetadataClassification::Real(password) => {
+            extra.insert("password".to_string(), serde_json::Value::from(password));
+            extra.insert(
+                "password_protected".to_string(),
+                serde_json::Value::from(true),
+            );
+        }
+        PasswordMetadataClassification::ProtectedFlag => {
+            extra.insert(
+                "password_protected".to_string(),
+                serde_json::Value::from(true),
+            );
+        }
+        PasswordMetadataClassification::UnprotectedFlag => {
+            extra.insert(
+                "password_protected".to_string(),
+                serde_json::Value::from(false),
+            );
+        }
+        PasswordMetadataClassification::Empty => {}
     }
 
     (dedupe(languages), grabs, extra)
@@ -535,6 +567,34 @@ mod tests {
             serde_json::from_value::<Vec<String>>(extra.get("tags").unwrap().clone()).unwrap(),
             vec!["remux", "internal"]
         );
+    }
+
+    #[test]
+    fn keeps_a_real_password_and_marks_the_release_protected() {
+        let p = pairs(&[("password", "example-archive-key")]);
+        let (_, _, extra) = torznab_metadata_extractor(&p);
+        assert_eq!(
+            extra.get("password"),
+            Some(&serde_json::Value::from("example-archive-key"))
+        );
+        assert_eq!(
+            extra.get("password_protected"),
+            Some(&serde_json::Value::from(true))
+        );
+    }
+
+    #[test]
+    fn a_password_flag_marks_protection_without_inventing_a_password() {
+        for (flag, protected) in [("1", true), ("0", false)] {
+            let p = pairs(&[("password", flag)]);
+            let (_, _, extra) = torznab_metadata_extractor(&p);
+            assert_eq!(extra.get("password"), None, "flag {flag}");
+            assert_eq!(
+                extra.get("password_protected"),
+                Some(&serde_json::Value::from(protected)),
+                "flag {flag}"
+            );
+        }
     }
 
     #[test]

@@ -12,8 +12,8 @@ use std::time::{Duration, UNIX_EPOCH};
 #[cfg(not(all(target_arch = "wasm32", target_os = "wasi", target_env = "p2")))]
 use std::time::SystemTime;
 
-use quick_xml::escape::unescape;
-use quick_xml::events::{Event, attributes::Attribute};
+use quick_xml::escape::resolve_predefined_entity;
+use quick_xml::events::{BytesRef, Event, attributes::Attribute};
 use quick_xml::{Reader, XmlVersion};
 use scryer_plugin_pdk::component::{self, StructuredPluginError, structured_plugin_error};
 use scryer_plugin_pdk::log::LogLevel;
@@ -26,10 +26,10 @@ pub use scryer_plugin_sdk::{
     IndexerResponseFeatures, IndexerSearchIncompleteReason, IndexerSearchInput,
     IndexerSearchInvalidResponseKind, IndexerSearchPluginError, IndexerSourceKind,
     IndexerTorrentCapabilities, PluginDescriptor, PluginError, PluginErrorCode, PluginErrorDetails,
-    PluginResult, PluginRssCatchUp, PluginScoringPolicy as ScoringPolicy,
-    PluginSearchRequest as SearchRequest, PluginSearchResponse as SearchResponse,
-    PluginSearchResult as SearchResult, PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION,
-    current_sdk_constraint,
+    PluginResult, PluginRssCatchUp, PluginScoringPolicy as ScoringPolicy, PluginSearchOrigin,
+    PluginSearchQueryKind, PluginSearchRequest as SearchRequest,
+    PluginSearchResponse as SearchResponse, PluginSearchResult as SearchResult,
+    PluginSearchSubjectKind, ProviderDescriptor, SDK_VERSION, current_sdk_constraint,
 };
 use serde::{Deserialize, Serialize};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
@@ -131,6 +131,12 @@ fn protected_from_extra(extra: &HashMap<String, serde_json::Value>) -> Option<bo
 // ---------------------------------------------------------------------------
 
 const DEFAULT_MAX_SEARCH_PAGES: usize = 30;
+/// Largest `limit` a Newznab request asks for, and so the most results one
+/// page of a paged search returns. Plugins advertise it as `max_page_size`.
+pub const NEWZNAB_MAX_PAGE_SIZE: usize = 100;
+/// Prefix of the page cursors a paged search hands the host; the rest is the
+/// provider offset the next page starts at.
+const PAGE_CURSOR_OFFSET_PREFIX: &str = "offset:";
 const DEFAULT_REQUEST_INTERVAL_MS: u64 = 500;
 /// Time an RSS catch-up keeps in hand before the operation deadline. A page is
 /// only started with at least this much left, so the pages already read are
@@ -265,8 +271,8 @@ impl NewznabConfig {
         let page_size = configured("page_size")
             .and_then(|v| v.parse::<usize>().ok())
             .or_else(|| profile.map(|profile| profile.page_size as usize))
-            .unwrap_or(100)
-            .clamp(1, 100);
+            .unwrap_or(NEWZNAB_MAX_PAGE_SIZE)
+            .clamp(1, NEWZNAB_MAX_PAGE_SIZE);
         let mut http_behavior = NewznabHttpBehavior::default();
         if let Some(profile) = profile {
             http_behavior.plugin_id = profile.profile_id.clone();
@@ -731,6 +737,7 @@ fn newznab_search_response(results: Vec<SearchResult>, limits: &ApiLimits) -> Se
         api_max: limits.api_max,
         grab_current: limits.grab_current,
         grab_max: limits.grab_max,
+        next_cursor: None,
     }
 }
 
@@ -784,11 +791,142 @@ fn incomplete_newznab_search_error(
 /// 3. Executes a tiered search (query+ID → ID-only → generic fallback)
 /// 4. Auto-detects response format (JSON or XML) and parses
 /// 5. Classifies errors with Newznab-specific handling
+///
+/// Searches page through the provider inside this one call, up to the page
+/// ceiling or the request's `limit`. Plugins that declare `paged_search` use
+/// [`execute_paged_search`] instead.
 pub async fn execute_full_search(
     config: &NewznabConfig,
     req: &SearchRequest,
     extract_fn: MetadataExtractor,
 ) -> Result<SearchResponse, Error> {
+    search_with_paging(config, req, extract_fn, SearchPaging::Accumulate).await
+}
+
+/// Execute one page of a Newznab search, for plugins that declare
+/// `paged_search`.
+///
+/// Without a `page_cursor` the page starts at offset 0; with one it starts at
+/// the offset the cursor names. The page asks the provider for
+/// `min(limit, page_size)` results (`limit` 0 meaning `page_size`), never more
+/// than [`NEWZNAB_MAX_PAGE_SIZE`], and the response carries a `next_cursor`
+/// when that page came back full. A short page ends the search. Requests for
+/// recent releases (no query, no ids) keep the RSS behaviour, including
+/// catch-up paging, and never carry a cursor.
+pub async fn execute_paged_search(
+    config: &NewznabConfig,
+    req: &SearchRequest,
+    extract_fn: MetadataExtractor,
+) -> Result<SearchResponse, Error> {
+    let offset = decode_page_cursor(req.page_cursor.as_deref())?;
+    search_with_paging(config, req, extract_fn, SearchPaging::OnePage { offset }).await
+}
+
+/// How a search walks the provider's pages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchPaging {
+    /// Read pages into one response until the request's limit is met, a page
+    /// comes back short, or the page ceiling is reached.
+    Accumulate,
+    /// Read exactly one page starting at `offset` and report where the next
+    /// one starts.
+    OnePage { offset: usize },
+}
+
+impl SearchPaging {
+    fn first_offset(self) -> usize {
+        match self {
+            Self::Accumulate => 0,
+            Self::OnePage { offset } => offset,
+        }
+    }
+
+    fn max_pages(self, config: &NewznabConfig) -> usize {
+        match self {
+            Self::Accumulate => config
+                .http_behavior
+                .max_search_pages
+                .clamp(1, DEFAULT_MAX_SEARCH_PAGES),
+            Self::OnePage { .. } => 1,
+        }
+    }
+
+    /// Results one call asks for: the caller's limit, and for a single page
+    /// never more than [`NEWZNAB_MAX_PAGE_SIZE`].
+    fn wanted(self, limit: usize) -> usize {
+        match self {
+            Self::Accumulate => requested_result_cap(limit),
+            Self::OnePage { .. } => requested_result_cap(limit).min(NEWZNAB_MAX_PAGE_SIZE),
+        }
+    }
+}
+
+fn encode_page_cursor(offset: usize) -> String {
+    format!("{PAGE_CURSOR_OFFSET_PREFIX}{offset}")
+}
+
+/// The offset a page cursor names; no cursor starts at offset 0.
+fn decode_page_cursor(cursor: Option<&str>) -> Result<usize, Error> {
+    let Some(cursor) = cursor else {
+        return Ok(0);
+    };
+    cursor
+        .strip_prefix(PAGE_CURSOR_OFFSET_PREFIX)
+        .and_then(|offset| offset.parse::<usize>().ok())
+        .ok_or_else(|| {
+            structured_plugin_error(PluginError {
+                code: PluginErrorCode::Permanent,
+                public_message: "indexer search page cursor is not valid".to_string(),
+                debug_message: Some(format!(
+                    "Newznab page cursor {cursor:?} was not issued by this plugin"
+                )),
+                retry_after_seconds: None,
+                details: None,
+            })
+        })
+}
+
+/// The successful response of a search, carrying the API counters the
+/// provider or the local hit budget reported.
+fn completed_search_response(
+    config: &NewznabConfig,
+    results: Vec<SearchResult>,
+    limits: &ApiLimits,
+    next_cursor: Option<String>,
+) -> Result<SearchResponse, Error> {
+    let (budget_current, budget_max) = hit_budget_snapshot(&config.http_behavior)?
+        .map(NewznabHitBudgetSnapshot::limiting_current_max)
+        .unwrap_or((None, None));
+
+    Ok(SearchResponse {
+        results,
+        api_current: limits.api_current.or(budget_current),
+        api_max: limits.api_max.or(budget_max),
+        grab_current: limits.grab_current,
+        grab_max: limits.grab_max,
+        next_cursor,
+    })
+}
+
+/// Where the page after one read at `offset` starts, when the provider may
+/// have more: the page came back full.
+fn next_page_cursor(offset: usize, page_limit: usize, page_count: usize) -> Option<String> {
+    (page_limit > 0 && page_count >= page_limit).then(|| encode_page_cursor(offset + page_limit))
+}
+
+async fn search_with_paging(
+    config: &NewznabConfig,
+    req: &SearchRequest,
+    extract_fn: MetadataExtractor,
+    paging: SearchPaging,
+) -> Result<SearchResponse, Error> {
+    // A search the user typed goes to the indexer as typed, the way Prowlarr's
+    // manual search sends it; title cleaning and typed search modes belong to
+    // searches the host derived from a title.
+    if is_interactive_text_search(req) {
+        return raw_search_with_paging(config, req, extract_fn, paging).await;
+    }
+
     let query = req.query.trim().to_string();
     let query_variants = build_query_variants(&query);
 
@@ -861,20 +999,23 @@ pub async fn execute_full_search(
     let endpoint = build_endpoint(&config.base_url, &config.api_path)?;
     let search_caps = resolve_search_caps_for_search(config, &endpoint).await?;
 
-    // Paginated search: fetch up to DEFAULT_MAX_SEARCH_PAGES pages.
-    // Stop early if a page returns fewer results than the page size.
+    // Paginated search: fetch up to DEFAULT_MAX_SEARCH_PAGES pages, or the
+    // one page a paged search asked for. Stop early if a page returns fewer
+    // results than the page size.
     let page_size = config.page_size;
-    let max_pages = config
-        .http_behavior
-        .max_search_pages
-        .clamp(1, DEFAULT_MAX_SEARCH_PAGES);
+    let max_pages = paging.max_pages(config);
+    let first_offset = paging.first_offset();
+
+    let wanted = paging.wanted(req.limit);
 
     let mut all_results: Vec<SearchResult> = Vec::new();
     let mut last_limits = ApiLimits::default();
     let mut completed_page = false;
 
+    let mut offset = first_offset;
     for page in 0..max_pages {
-        let page_params = offset_page_params(&config.additional_params, page * page_size);
+        let page_params = offset_page_params(&config.additional_params, offset);
+        let page_limit = page_size.min(wanted - all_results.len());
 
         let search_result = if search_shape == NabSearchShape::AnimeExact {
             execute_exact_anime_search(
@@ -887,7 +1028,7 @@ pub async fn execute_full_search(
                 tvrage_id.as_deref(),
                 tvmaze_id.as_deref(),
                 newznab_cat.as_deref(),
-                page_size,
+                page_limit,
                 req.season,
                 req.episode,
                 req.absolute_episode,
@@ -908,7 +1049,7 @@ pub async fn execute_full_search(
                 tvrage_id.as_deref(),
                 tvmaze_id.as_deref(),
                 newznab_cat.as_deref(),
-                page_size,
+                page_limit,
                 req.season,
                 req.episode,
                 &page_params,
@@ -995,7 +1136,7 @@ pub async fn execute_full_search(
         }
 
         let (page_results, limits, page_count) =
-            match parse_newznab_feed(&body, is_xml, page_size, extract_fn) {
+            match parse_newznab_feed(&body, is_xml, page_limit, extract_fn) {
                 Ok(parsed) => parsed,
                 Err(failure) => {
                     return Err(incomplete_newznab_search_error(
@@ -1013,9 +1154,13 @@ pub async fn execute_full_search(
         all_results.extend(page_results);
         completed_page = true;
 
-        // Stop if this page was less than full (no more results)
-        // or we've hit the overall max
-        if page_count < page_size {
+        if let SearchPaging::OnePage { .. } = paging {
+            let next_cursor = next_page_cursor(offset, page_limit, page_count);
+            return completed_search_response(config, all_results, &last_limits, next_cursor);
+        }
+        // Stop once the caller has as many results as it asked for, or once a
+        // page comes back short (the indexer has nothing further).
+        if all_results.len() >= wanted || page_count < page_limit {
             break;
         }
         if page + 1 == max_pages {
@@ -1030,46 +1175,57 @@ pub async fn execute_full_search(
                 ),
             ));
         }
+        // The next page starts after the results this one asked for: fewer
+        // than a full page once the limit is nearly met, so advancing by the
+        // page size would skip the records between.
+        offset += page_limit;
     }
 
-    let (budget_current, budget_max) = hit_budget_snapshot(&config.http_behavior)?
-        .map(NewznabHitBudgetSnapshot::limiting_current_max)
-        .unwrap_or((None, None));
-
-    Ok(SearchResponse {
-        results: all_results,
-        api_current: last_limits.api_current.or(budget_current),
-        api_max: last_limits.api_max.or(budget_max),
-        grab_current: last_limits.grab_current,
-        grab_max: last_limits.grab_max,
-    })
+    completed_search_response(config, all_results, &last_limits, None)
 }
 
+/// Run a plain `t=search` with the request's text and categories, one request
+/// per page.
+///
+/// The text goes out as the user wrote it apart from whitespace and `&`: the
+/// categories only filter, they never change the search mode, and no title
+/// cleaning or context stripping applies. This is the shape Prowlarr's manual
+/// search sends.
 pub async fn execute_raw_search(
     config: &NewznabConfig,
     req: &SearchRequest,
     extract_fn: MetadataExtractor,
 ) -> Result<SearchResponse, Error> {
+    raw_search_with_paging(config, req, extract_fn, SearchPaging::Accumulate).await
+}
+
+async fn raw_search_with_paging(
+    config: &NewznabConfig,
+    req: &SearchRequest,
+    extract_fn: MetadataExtractor,
+    paging: SearchPaging,
+) -> Result<SearchResponse, Error> {
     let endpoint = build_endpoint(&config.base_url, &config.api_path)?;
-    let query = req.query.trim();
+    let query = raw_search_query(&req.query);
     let newznab_cat = build_category_param(&req.categories);
     let page_size = config.page_size;
-    let max_pages = config
-        .http_behavior
-        .max_search_pages
-        .clamp(1, DEFAULT_MAX_SEARCH_PAGES);
+    let max_pages = paging.max_pages(config);
+    let first_offset = paging.first_offset();
+    let wanted = paging.wanted(req.limit);
 
     let mut all_results = Vec::new();
     let mut last_limits = ApiLimits::default();
     let mut completed_page = false;
 
+    let mut offset = first_offset;
     for page in 0..max_pages {
-        let page_params = offset_page_params(&config.additional_params, page * page_size);
+        let page_params = offset_page_params(&config.additional_params, offset);
+        let page_limit = page_size.min(wanted - all_results.len());
 
         let search_result = execute_search(
             &endpoint,
             "search",
-            (!query.is_empty()).then_some(query),
+            (!query.is_empty()).then_some(query.as_str()),
             &config.api_key,
             None,
             None,
@@ -1077,7 +1233,7 @@ pub async fn execute_raw_search(
             None,
             None,
             newznab_cat.as_deref(),
-            page_size,
+            page_limit,
             None,
             None,
             &page_params,
@@ -1162,7 +1318,7 @@ pub async fn execute_raw_search(
         }
 
         let (page_results, limits, page_count) =
-            match parse_newznab_feed(&body, is_xml, page_size, extract_fn) {
+            match parse_newznab_feed(&body, is_xml, page_limit, extract_fn) {
                 Ok(parsed) => parsed,
                 Err(failure) => {
                     return Err(incomplete_newznab_search_error(
@@ -1180,7 +1336,11 @@ pub async fn execute_raw_search(
         all_results.extend(page_results);
         completed_page = true;
 
-        if page_count < page_size {
+        if let SearchPaging::OnePage { .. } = paging {
+            let next_cursor = next_page_cursor(offset, page_limit, page_count);
+            return completed_search_response(config, all_results, &last_limits, next_cursor);
+        }
+        if all_results.len() >= wanted || page_count < page_limit {
             break;
         }
         if page + 1 == max_pages {
@@ -1195,15 +1355,46 @@ pub async fn execute_raw_search(
                 ),
             ));
         }
+        // The next page starts after the results this one asked for: fewer
+        // than a full page once the limit is nearly met, so advancing by the
+        // page size would skip the records between.
+        offset += page_limit;
     }
 
-    Ok(SearchResponse {
-        results: all_results,
-        api_current: last_limits.api_current,
-        api_max: last_limits.api_max,
-        grab_current: last_limits.grab_current,
-        grab_max: last_limits.grab_max,
-    })
+    completed_search_response(config, all_results, &last_limits, None)
+}
+
+/// Whether `req` is text the user typed into an interactive search, with no
+/// title, facet or id behind it.
+fn is_interactive_text_search(req: &SearchRequest) -> bool {
+    let Some(context) = req.context.as_ref() else {
+        return false;
+    };
+    context.query_kind == PluginSearchQueryKind::Text
+        && matches!(
+            context.search_origin,
+            PluginSearchOrigin::Interactive | PluginSearchOrigin::Manual
+        )
+        && !req.query.trim().is_empty()
+        && req.ids.values().all(|value| value.trim().is_empty())
+}
+
+/// The `q` value for a raw search: the text as written, with runs of
+/// whitespace collapsed and `&` spelled out. Newznab indexers treat a bare `&`
+/// as a separator and match nothing, so `Law & Order` is sent the way the
+/// titles are indexed, `Law and Order`.
+fn raw_search_query(query: &str) -> String {
+    query
+        .replace('&', " and ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The number of results a request asks for; zero asks for no cap beyond the
+/// page ceiling.
+fn requested_result_cap(limit: usize) -> usize {
+    if limit == 0 { usize::MAX } else { limit }
 }
 
 // ---------------------------------------------------------------------------
@@ -1246,6 +1437,7 @@ async fn execute_rss_search(
                 api_max: None,
                 grab_current: None,
                 grab_max: None,
+                next_cursor: None,
             });
         }
     };
@@ -1491,6 +1683,7 @@ async fn execute_rss_search(
         api_max: last_limits.api_max.or(budget_max),
         grab_current: last_limits.grab_current,
         grab_max: last_limits.grab_max,
+        next_cursor: None,
     })
 }
 
@@ -1707,7 +1900,7 @@ fn parse_rfc2822_epoch_seconds(value: &str) -> Option<i64> {
     let year_text = parts.next()?;
     let year = match (ascii_number(year_text)?, year_text.len()) {
         (year, 1 | 2) if year < 50 => year + 2_000,
-        (year, 1 | 2 | 3) => year + 1_900,
+        (year, 1..=3) => year + 1_900,
         (year, _) => year,
     };
     let mut clock = parts.next()?.split(':');
@@ -2537,10 +2730,11 @@ async fn execute_search(
         additional_params,
     )?;
 
-    let (status, body) = polite_http_get(
+    let (status, body) = polite_http_get_redacting(
         &url,
         "application/json, application/xml, */*; q=0.8",
         behavior,
+        &[api_key],
     )
     .await?;
     Ok((status, body))
@@ -2554,7 +2748,18 @@ pub async fn polite_http_get(
     accept: &str,
     behavior: &NewznabHttpBehavior,
 ) -> Result<(u16, String), Error> {
-    let logged_url = redact_url_for_log(url);
+    polite_http_get_redacting(url, accept, behavior, &[]).await
+}
+
+/// [`polite_http_get`], additionally keeping `secrets` (the plugin's own
+/// credentials) out of every logged URL wherever they appear in it.
+async fn polite_http_get_redacting(
+    url: &str,
+    accept: &str,
+    behavior: &NewznabHttpBehavior,
+    secrets: &[&str],
+) -> Result<(u16, String), Error> {
+    let logged_url = redact_url_for_log_with_secrets(url, secrets);
     let mut total_wait = Duration::ZERO;
     let mut attempt = 1usize;
     let start_interval_ms = behavior
@@ -2960,34 +3165,108 @@ fn capture_known_headers(response: &PluginHttpResponse) -> HashMap<String, Strin
     headers
 }
 
+#[cfg(test)]
 fn redact_url_for_log(url: &str) -> String {
-    let Some((base, query)) = url.split_once('?') else {
-        return url.to_string();
+    redact_url_for_log_with_secrets(url, &[])
+}
+
+/// `url` with its credentials replaced by `REDACTED`, for logging.
+///
+/// Credential-named query parameters are always redacted. A credential can
+/// also sit in the path (DogNZB serves `/fetch/<id>/<apikey>`) or under a
+/// parameter name nobody standardised, so every path segment and query value
+/// equal to one of `secrets` — or to the value of a credential-named
+/// parameter in the same URL — is redacted too.
+fn redact_url_for_log_with_secrets(url: &str, secrets: &[&str]) -> String {
+    let (without_fragment, fragment) = match url.split_once('#') {
+        Some((head, fragment)) => (head, Some(fragment)),
+        None => (url, None),
+    };
+    let (base, query) = match without_fragment.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (without_fragment, None),
     };
 
-    let redacted_query = query
-        .split('&')
-        .map(|pair| {
-            let Some((key, value)) = pair.split_once('=') else {
-                return pair.to_string();
-            };
+    let mut known_secrets: Vec<&str> = secrets
+        .iter()
+        .map(|secret| secret.trim())
+        .filter(|secret| !secret.is_empty())
+        .collect();
+    if let Some(query) = query {
+        known_secrets.extend(query.split('&').filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            (is_sensitive_query_key(key) && !value.is_empty()).then_some(value)
+        }));
+    }
+    let is_secret = |value: &str| known_secrets.contains(&value);
 
-            if is_sensitive_query_key(key) {
-                format!("{key}=REDACTED")
-            } else {
-                format!("{key}={value}")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("&");
+    let path_start =
+        base.find("://")
+            .map(|scheme_end| scheme_end + 3)
+            .and_then(|authority_start| {
+                base[authority_start..]
+                    .find('/')
+                    .map(|slash| authority_start + slash)
+            });
+    let mut redacted = match path_start {
+        Some(path_start) => {
+            let path = base[path_start..]
+                .split('/')
+                .map(|segment| {
+                    if !segment.is_empty() && is_secret(segment) {
+                        "REDACTED"
+                    } else {
+                        segment
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{}{path}", &base[..path_start])
+        }
+        None => base.to_string(),
+    };
 
-    format!("{base}?{redacted_query}")
+    if let Some(query) = query {
+        let redacted_query = query
+            .split('&')
+            .map(|pair| {
+                let Some((key, value)) = pair.split_once('=') else {
+                    return pair.to_string();
+                };
+                if is_sensitive_query_key(key) || is_secret(value) {
+                    format!("{key}=REDACTED")
+                } else {
+                    format!("{key}={value}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        redacted.push('?');
+        redacted.push_str(&redacted_query);
+    }
+    if let Some(fragment) = fragment {
+        redacted.push('#');
+        redacted.push_str(fragment);
+    }
+    redacted
 }
 
 fn is_sensitive_query_key(key: &str) -> bool {
     matches!(
         key.trim().to_ascii_lowercase().as_str(),
-        "apikey" | "api_key" | "token" | "key" | "password" | "pass"
+        "apikey"
+            | "api_key"
+            | "api-key"
+            | "token"
+            | "api_token"
+            | "key"
+            | "password"
+            | "pass"
+            | "passkey"
+            | "rsskey"
+            | "authkey"
+            | "auth"
+            | "r"
     )
 }
 
@@ -3706,10 +3985,10 @@ fn parse_error_xml(body: &str) -> Option<(String, String)> {
                 for attr in e.attributes().flatten() {
                     match attr.key.as_ref() {
                         "code" => {
-                            code = Some(attr.value.to_string());
+                            code = Some(unescaped_attr_value(&attr));
                         }
                         "description" => {
-                            description = Some(attr.value.to_string());
+                            description = Some(unescaped_attr_value(&attr));
                         }
                         _ => {}
                     }
@@ -3896,12 +4175,15 @@ fn parse_newznab_xml(
     limit: usize,
     extract_fn: MetadataExtractor,
 ) -> Result<(Vec<SearchResult>, ApiLimits, usize), Error> {
+    // Text is not trimmed per event: an element's content arrives as several
+    // events split at every entity, so the whitespace around `&amp;` belongs
+    // to the value. It is trimmed once, when the element closes.
     let mut reader = Reader::from_str(body);
-    reader.config_mut().trim_text(true);
 
     let mut buf = Vec::new();
     let mut results = Vec::new();
     let mut item_count = 0;
+    let mut text = String::new();
     let mut api_limits = ApiLimits::default();
     let mut in_item = false;
 
@@ -3947,6 +4229,7 @@ fn parse_newznab_xml(
                     attrs.clear();
                     current_tag = None;
                 } else if in_item {
+                    text.clear();
                     match tag_name.as_str() {
                         "title" | "guid" | "link" | "comments" | "pubDate" | "category" => {
                             current_tag = Some(tag_name);
@@ -3993,22 +4276,32 @@ fn parse_newznab_xml(
                     );
                 }
             }
-            Ok(Event::Text(ref e)) if in_item => {
-                if let Some(ref tag) = current_tag {
-                    let text = unescape(e).map(|text| text.to_string()).unwrap_or_default();
-                    match tag.as_str() {
-                        "title" => title = Some(text),
-                        "guid" => guid = Some(text),
-                        "link" => link = Some(text),
-                        "comments" => comments = Some(text),
-                        "pubDate" => pub_date = Some(text),
-                        "category" => push_category_element(&text, &mut attrs),
-                        _ => {}
-                    }
-                }
+            Ok(Event::Text(ref e)) if in_item && current_tag.is_some() => {
+                text.push_str(&e.xml10_content());
+            }
+            Ok(Event::GeneralRef(ref e)) if in_item && current_tag.is_some() => {
+                push_general_ref(&mut text, e);
+            }
+            Ok(Event::CData(ref e)) if in_item && current_tag.is_some() => {
+                text.push_str(&e.xml10_content());
             }
             Ok(Event::End(ref e)) => {
                 let tag_name = e.name().as_ref().to_string();
+                if in_item && current_tag.as_deref() == Some(tag_name.as_str()) {
+                    let value = text.trim().to_string();
+                    text.clear();
+                    if !value.is_empty() {
+                        match tag_name.as_str() {
+                            "title" => title = Some(value),
+                            "guid" => guid = Some(value),
+                            "link" => link = Some(value),
+                            "comments" => comments = Some(value),
+                            "pubDate" => pub_date = Some(value),
+                            "category" => push_category_element(&value, &mut attrs),
+                            _ => {}
+                        }
+                    }
+                }
                 if tag_name == "rss" {
                     saw_rss_end = true;
                 } else if tag_name == "channel" {
@@ -4151,16 +4444,40 @@ fn push_category_element(text: &str, attrs: &mut Vec<(String, String)>) {
     }
 }
 
+/// Append the text an entity or character reference stands for. A named entity
+/// XML does not predefine is kept as written rather than dropped.
+fn push_general_ref(text: &mut String, reference: &BytesRef<'_>) {
+    if let Ok(Some(ch)) = reference.resolve_char_ref() {
+        text.push(ch);
+        return;
+    }
+    let name = reference.xml10_content();
+    match resolve_predefined_entity(&name) {
+        Some(resolved) => text.push_str(resolved),
+        None => {
+            text.push('&');
+            text.push_str(&name);
+            text.push(';');
+        }
+    }
+}
+
+/// An attribute's value with entity and character references resolved, or
+/// the raw value when it holds a reference XML does not define.
+fn unescaped_attr_value(attr: &Attribute<'_>) -> String {
+    normalized_attr_value(attr).unwrap_or_else(|| attr.value.to_string())
+}
+
 fn push_attr_element(e: &quick_xml::events::BytesStart<'_>, attrs: &mut Vec<(String, String)>) {
     let mut attr_name = None;
     let mut attr_value = None;
     for a in e.attributes().flatten() {
         match a.key.as_ref() {
             "name" => {
-                attr_name = Some(a.value.to_string());
+                attr_name = Some(unescaped_attr_value(&a));
             }
             "value" => {
-                attr_value = Some(a.value.to_string());
+                attr_value = Some(unescaped_attr_value(&a));
             }
             _ => {}
         }
@@ -5712,6 +6029,217 @@ mod tests {
         assert!(redacted.contains("apikey=REDACTED"));
         assert!(redacted.contains("token=REDACTED"));
         assert!(redacted.contains("t=movie"));
+    }
+
+    #[test]
+    fn redact_url_for_log_covers_every_credential_parameter_name() {
+        let redacted = redact_url_for_log(
+            "https://example.test/rss?api_key=k1&passkey=k2&r=k3&rsskey=k4&authkey=k5&t=search&q=sample",
+        );
+        assert_eq!(
+            redacted,
+            "https://example.test/rss?api_key=REDACTED&passkey=REDACTED&r=REDACTED&rsskey=REDACTED&authkey=REDACTED&t=search&q=sample"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_log_redacts_the_plugin_key_in_the_path() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let url = format!("https://dl.example.test/fetch/abc123/{key}");
+        let redacted = redact_url_for_log_with_secrets(&url, &[key]);
+        assert_eq!(redacted, "https://dl.example.test/fetch/abc123/REDACTED");
+        assert!(!redacted.contains(key));
+    }
+
+    #[test]
+    fn redact_url_for_log_redacts_a_query_key_echoed_in_the_path_or_an_unknown_parameter() {
+        let key = "fedcba9876543210";
+        let url =
+            format!("https://example.test/getnzb/{key}/abc.nzb?apikey={key}&i=12&sig={key}#frag");
+        let redacted = redact_url_for_log(&url);
+        assert_eq!(
+            redacted,
+            "https://example.test/getnzb/REDACTED/abc.nzb?apikey=REDACTED&i=12&sig=REDACTED#frag"
+        );
+    }
+
+    #[test]
+    fn redact_url_for_log_leaves_urls_without_credentials_alone() {
+        let url = "https://example.test/api/details/abc?t=search&q=sample+name";
+        assert_eq!(redact_url_for_log_with_secrets(url, &["", "  "]), url);
+        assert_eq!(
+            redact_url_for_log("https://example.test"),
+            "https://example.test"
+        );
+    }
+
+    #[test]
+    fn raw_search_query_keeps_the_text_and_spells_out_ampersands() {
+        assert_eq!(
+            raw_search_query("  Sample   Film 2021 "),
+            "Sample Film 2021"
+        );
+        assert_eq!(
+            raw_search_query("Sample.Release.Name.2021.1080p"),
+            "Sample.Release.Name.2021.1080p"
+        );
+        assert_eq!(raw_search_query("sampleos 24.04"), "sampleos 24.04");
+        assert_eq!(raw_search_query("4815"), "4815");
+        assert_eq!(raw_search_query("Sample's Show"), "Sample's Show");
+        assert_eq!(raw_search_query("Sample & Order"), "Sample and Order");
+        assert_eq!(raw_search_query("S&P"), "S and P");
+    }
+
+    fn text_search_request(
+        query: &str,
+        origin: scryer_plugin_sdk::PluginSearchOrigin,
+    ) -> SearchRequest {
+        SearchRequest {
+            query: query.to_string(),
+            context: Some(scryer_plugin_sdk::PluginSearchContext {
+                query_kind: PluginSearchQueryKind::Text,
+                search_origin: origin,
+                ..scryer_plugin_sdk::PluginSearchContext::default()
+            }),
+            ..SearchRequest::default()
+        }
+    }
+
+    #[test]
+    fn only_typed_interactive_text_counts_as_a_raw_search() {
+        assert!(is_interactive_text_search(&text_search_request(
+            "Sample Film",
+            PluginSearchOrigin::Interactive
+        )));
+        assert!(is_interactive_text_search(&text_search_request(
+            "Sample Film",
+            PluginSearchOrigin::Manual
+        )));
+        assert!(!is_interactive_text_search(&text_search_request(
+            "Sample Film",
+            PluginSearchOrigin::Automatic
+        )));
+        assert!(!is_interactive_text_search(&text_search_request(
+            "   ",
+            PluginSearchOrigin::Interactive
+        )));
+
+        let mut with_id = text_search_request("Sample Film", PluginSearchOrigin::Interactive);
+        with_id
+            .ids
+            .insert("imdb_id".to_string(), "tt0000001".to_string());
+        assert!(!is_interactive_text_search(&with_id));
+
+        let mut titled = text_search_request("Sample Film", PluginSearchOrigin::Interactive);
+        titled.context.as_mut().unwrap().query_kind = PluginSearchQueryKind::Title;
+        assert!(!is_interactive_text_search(&titled));
+
+        let mut legacy = text_search_request("Sample Film", PluginSearchOrigin::Interactive);
+        legacy.context = None;
+        assert!(!is_interactive_text_search(&legacy));
+    }
+
+    #[test]
+    fn xml_text_keeps_entities_and_the_whitespace_around_them() {
+        let body = r#"<?xml version="1.0"?>
+<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+<channel>
+  <item>
+    <title>Sample &amp; Order S01E01 &#39;Pilot&#39; &#x2013; &lt;Part&gt; 1</title>
+    <guid isPermaLink="true">https://nab.example.test/details/abc?x=1&amp;y=2</guid>
+    <link>https://nab.example.test/getnzb/abc.nzb&amp;i=12&amp;r=synthetic-key</link>
+    <comments>https://nab.example.test/details/abc&amp;cmt=1#comments</comments>
+    <category>5040</category>
+    <enclosure url="https://nab.example.test/getnzb/abc.nzb&amp;i=12" length="10" type="application/x-nzb"/>
+  </item>
+</channel>
+</rss>"#;
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
+        assert_eq!(results.len(), 1);
+        let result = &results[0];
+        assert_eq!(
+            result.title,
+            "Sample & Order S01E01 'Pilot' \u{2013} <Part> 1"
+        );
+        assert_eq!(
+            result.guid.as_deref(),
+            Some("https://nab.example.test/details/abc?x=1&y=2")
+        );
+        assert_eq!(
+            result.link.as_deref(),
+            Some("https://nab.example.test/getnzb/abc.nzb&i=12&r=synthetic-key")
+        );
+        assert_eq!(
+            result.info_url.as_deref(),
+            Some("https://nab.example.test/details/abc&cmt=1")
+        );
+        assert_eq!(
+            result.download_url.as_deref(),
+            Some("https://nab.example.test/getnzb/abc.nzb&i=12")
+        );
+    }
+
+    #[test]
+    fn xml_cdata_title_and_unknown_entities_survive() {
+        let body = r#"<?xml version="1.0"?>
+<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/">
+<channel>
+  <item>
+    <title><![CDATA[Sample & Friends <Special> 720p]]></title>
+    <guid>cdata-1</guid>
+  </item>
+  <item>
+    <title>
+      Sample &custom; Title
+    </title>
+    <guid>entity-1</guid>
+  </item>
+  <item>
+    <title>   </title>
+    <guid>empty-1</guid>
+  </item>
+</channel>
+</rss>"#;
+        let (results, _, item_count) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
+        assert_eq!(item_count, 3);
+        let titles: Vec<&str> = results.iter().map(|result| result.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Sample & Friends <Special> 720p", "Sample &custom; Title"]
+        );
+    }
+
+    #[test]
+    fn xml_attr_values_are_unescaped() {
+        let body = r#"<?xml version="1.0"?>
+<rss xmlns:torznab="http://torznab.com/schemas/2015/feed">
+<channel>
+  <item>
+    <title>Sample.Torrent.Release</title>
+    <torznab:attr name="magneturl" value="magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12&amp;dn=Sample&amp;tr=udp%3A%2F%2Ftracker.example.test%3A1337"/>
+    <torznab:attr name="infohash" value="ABCDEF1234567890ABCDEF1234567890ABCDEF12"/>
+    <torznab:attr name="seeders" value="7"/>
+  </item>
+</channel>
+</rss>"#;
+        let (results, _, _) = parse_newznab_xml(body, 100, extract_base_metadata).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].magnet_url.as_deref(),
+            Some(
+                "magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12&dn=Sample&tr=udp%3A%2F%2Ftracker.example.test%3A1337"
+            )
+        );
+        assert_eq!(results[0].seeders, Some(7));
+    }
+
+    #[test]
+    fn xml_error_description_is_unescaped() {
+        let body = r#"<?xml version="1.0"?><error code="100" description="Bad key &amp; retry"/>"#;
+        assert_eq!(
+            parse_error_xml(body),
+            Some(("100".to_string(), "Bad key & retry".to_string()))
+        );
     }
 
     #[test]
@@ -7705,7 +8233,11 @@ mod tests {
             /// expires.
             deadline_after_ms: Option<u64>,
             pages: HashMap<(String, usize), String>,
+            /// Pages the indexer answers with HTTP 500 instead of a feed.
+            failing: HashSet<(String, usize)>,
             requests: Vec<(String, Option<usize>)>,
+            /// Every requested URL, capability probes included, in order.
+            urls: Vec<String>,
         }
 
         thread_local! {
@@ -7733,6 +8265,7 @@ mod tests {
                         return Err(HostError::Transport);
                     }
                     let url = Url::parse(&request.url).map_err(|_| HostError::InvalidRequest)?;
+                    SCRIPT.with(|script| script.borrow_mut().urls.push(request.url.clone()));
                     let param = |name: &str| {
                         url.query_pairs()
                             .find(|(key, _)| key == name)
@@ -7747,17 +8280,18 @@ mod tests {
                         });
                     }
                     let offset = param("offset").map(|value| value.parse::<usize>().unwrap());
-                    let body = SCRIPT.with(|script| {
+                    let (status, body) = SCRIPT.with(|script| {
                         let mut script = script.borrow_mut();
                         script.requests.push((search_type.clone(), offset));
-                        script
-                            .pages
-                            .get(&(search_type, offset.unwrap_or(0)))
-                            .cloned()
-                            .unwrap_or_else(|| feed(&[]))
+                        let key = (search_type, offset.unwrap_or(0));
+                        if script.failing.contains(&key) {
+                            return (500, String::new());
+                        }
+                        let body = script.pages.get(&key).cloned().unwrap_or_else(|| feed(&[]));
+                        (200, body)
                     });
                     Ok(PluginHttpFieldsResponse {
-                        status: 200,
+                        status,
                         headers: Vec::new(),
                         body: body.into_bytes(),
                     })
@@ -7847,6 +8381,32 @@ mod tests {
                     .iter()
                     .map(|release| (guid(search_type, *release), *release))
                     .collect::<Vec<_>>(),
+            );
+            SCRIPT.with(|script| {
+                script
+                    .borrow_mut()
+                    .pages
+                    .insert((search_type.to_string(), offset), body)
+            });
+        }
+
+        /// Serve a page like [`serve_page`], except that `untitled` has no
+        /// title: the parser counts the item but keeps no result for it.
+        fn serve_page_with_untitled(
+            search_type: &str,
+            offset: usize,
+            releases: &[usize],
+            untitled: usize,
+        ) {
+            let body = feed(
+                &releases
+                    .iter()
+                    .map(|release| (guid(search_type, *release), *release))
+                    .collect::<Vec<_>>(),
+            )
+            .replace(
+                &format!("<title>Sample.Feed.Release.{untitled}</title>"),
+                "",
             );
             SCRIPT.with(|script| {
                 script
@@ -8198,6 +8758,630 @@ mod tests {
                     "guid-shared-3"
                 ]
             );
+        }
+
+        /// Searches driven end to end through the same scripted host,
+        /// asserting on the exact requests the indexer receives.
+        mod search_requests {
+            use super::*;
+
+            fn text_request(
+                query: &str,
+                origin: PluginSearchOrigin,
+                categories: &[&str],
+                limit: usize,
+            ) -> SearchRequest {
+                SearchRequest {
+                    query: query.to_string(),
+                    categories: categories
+                        .iter()
+                        .map(|category| category.to_string())
+                        .collect(),
+                    limit,
+                    context: Some(scryer_plugin_sdk::PluginSearchContext {
+                        query_kind: PluginSearchQueryKind::Text,
+                        search_origin: origin,
+                        ..scryer_plugin_sdk::PluginSearchContext::default()
+                    }),
+                    ..SearchRequest::default()
+                }
+            }
+
+            /// The query parameters of every search request, capability
+            /// probes left out.
+            fn sent() -> Vec<BTreeMap<String, String>> {
+                SCRIPT.with(|script| {
+                    script
+                        .borrow()
+                        .urls
+                        .iter()
+                        .map(|url| {
+                            Url::parse(url)
+                                .unwrap()
+                                .query_pairs()
+                                .into_owned()
+                                .collect::<BTreeMap<_, _>>()
+                        })
+                        .filter(|params| params.get("t").map(String::as_str) != Some("caps"))
+                        .collect()
+                })
+            }
+
+            fn one_short_page(search_type: &str) {
+                serve_page(search_type, 0, &[0]);
+            }
+
+            #[test]
+            fn typed_text_is_sent_verbatim_in_a_single_search_request() {
+                for query in [
+                    "Sample Film 2021",
+                    "Sample Show S01E05 1080p",
+                    "Sample.Release.Name.2021.1080p",
+                    "sampleos 24.04",
+                    "4815",
+                ] {
+                    install_script();
+                    one_short_page("search");
+
+                    let response = run(
+                        &config(10),
+                        &text_request(query, PluginSearchOrigin::Interactive, &[], 1000),
+                    )
+                    .expect("raw search completes");
+
+                    let sent = sent();
+                    assert_eq!(sent.len(), 1, "{query}: {sent:?}");
+                    let params = &sent[0];
+                    assert_eq!(params.get("t").map(String::as_str), Some("search"));
+                    assert_eq!(params.get("q").map(String::as_str), Some(query));
+                    assert_eq!(params.get("offset").map(String::as_str), Some("0"));
+                    for absent in ["cat", "season", "ep", "imdbid", "tvdbid"] {
+                        assert!(!params.contains_key(absent), "{query}: {params:?}");
+                    }
+                    assert_eq!(response.results.len(), 1);
+                }
+            }
+
+            #[test]
+            fn an_ampersand_is_sent_spelled_out() {
+                install_script();
+                one_short_page("search");
+
+                run(
+                    &config(10),
+                    &text_request("Sample  &  Order", PluginSearchOrigin::Interactive, &[], 0),
+                )
+                .expect("raw search completes");
+
+                assert_eq!(
+                    sent()[0].get("q").map(String::as_str),
+                    Some("Sample and Order")
+                );
+            }
+
+            #[test]
+            fn categories_filter_without_changing_the_search_mode() {
+                install_script();
+                one_short_page("search");
+
+                run(
+                    &config(10),
+                    &text_request(
+                        "Sample Film",
+                        PluginSearchOrigin::Interactive,
+                        &["2000", "5070"],
+                        0,
+                    ),
+                )
+                .expect("raw search completes");
+
+                let sent = sent();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].get("t").map(String::as_str), Some("search"));
+                assert_eq!(sent[0].get("cat").map(String::as_str), Some("2000,5070"));
+            }
+
+            #[test]
+            fn the_request_limit_ends_paging_once_it_is_met() {
+                install_script();
+                serve_full_pages("search", 4);
+
+                let response = run(
+                    &config(10),
+                    &text_request("Sample Film", PluginSearchOrigin::Interactive, &[], 5),
+                )
+                .expect("a met limit is a complete search");
+
+                let sent = sent();
+                assert_eq!(sent.len(), 2);
+                assert_eq!(sent[0].get("offset").map(String::as_str), Some("0"));
+                assert_eq!(sent[0].get("limit").map(String::as_str), Some("3"));
+                assert_eq!(sent[1].get("offset").map(String::as_str), Some("3"));
+                assert_eq!(sent[1].get("limit").map(String::as_str), Some("2"));
+                assert_eq!(response.results.len(), 5);
+            }
+
+            #[test]
+            fn a_reduced_final_page_with_a_discarded_item_resumes_where_it_stopped() {
+                install_script();
+                serve_full_pages("search", 1);
+                // The second page asks for the 2 results still wanted; the
+                // indexer answers 2 items but one has no title, so only one
+                // result comes back and the search reads on.
+                serve_page_with_untitled("search", 3, &[3, 4], 4);
+                serve_page("search", 5, &[5]);
+
+                let response = run(
+                    &config(10),
+                    &text_request("Sample Film", PluginSearchOrigin::Interactive, &[], 5),
+                )
+                .expect("the search completes");
+
+                let offsets: Vec<String> = sent()
+                    .iter()
+                    .map(|params| params.get("offset").cloned().unwrap_or_default())
+                    .collect();
+                assert_eq!(
+                    offsets,
+                    vec!["0", "3", "5"],
+                    "the third page starts after the two records the second asked for"
+                );
+                assert_eq!(
+                    guids(&response.results),
+                    vec![
+                        "guid-search-0",
+                        "guid-search-1",
+                        "guid-search-2",
+                        "guid-search-3",
+                        "guid-search-5",
+                    ]
+                );
+            }
+
+            #[test]
+            fn automatic_searches_still_page_to_the_request_limit() {
+                install_script();
+                serve_full_pages("search", 4);
+                let mut request =
+                    text_request("Sample Show", PluginSearchOrigin::Automatic, &[], 4);
+                request.context = None;
+
+                let response = run(&config(10), &request).expect("a met limit is complete");
+
+                let limits: Vec<String> = sent()
+                    .iter()
+                    .map(|params| params.get("limit").cloned().unwrap_or_default())
+                    .collect();
+                assert_eq!(limits, vec!["3", "1"]);
+                assert_eq!(response.results.len(), 4);
+            }
+
+            #[test]
+            fn automatic_text_searches_keep_their_title_cleaning() {
+                install_script();
+                one_short_page("search");
+
+                run(
+                    &config(10),
+                    &text_request("Sample Show S01E05", PluginSearchOrigin::Automatic, &[], 0),
+                )
+                .expect("automatic search completes");
+
+                let sent = sent();
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].get("q").map(String::as_str), Some("Sample Show"));
+            }
+
+            /// Searches for plugins that declare `paged_search`: one provider
+            /// page per call, resumed from the cursor the previous call
+            /// returned.
+            mod paged {
+                use super::*;
+
+                /// Results per page on the paged endpoint, the Newznab default.
+                const NAB_PAGE: usize = 100;
+                /// More hits than the 30-page ceiling of an unpaged search
+                /// can reach at 100 per page.
+                const LARGE_RESULT_SET: usize = 3_250;
+
+                fn paged_config() -> NewznabConfig {
+                    NewznabConfig {
+                        page_size: NAB_PAGE,
+                        ..config(DEFAULT_MAX_SEARCH_PAGES)
+                    }
+                }
+
+                /// Serve `total` hits of `search_type` in pages of
+                /// [`NAB_PAGE`], whatever `limit` a request names.
+                fn serve_hits(search_type: &str, total: usize) {
+                    for offset in (0..total).step_by(NAB_PAGE) {
+                        let releases: Vec<usize> =
+                            (offset..(offset + NAB_PAGE).min(total)).collect();
+                        serve_page(search_type, offset, &releases);
+                    }
+                }
+
+                fn run_paged(
+                    config: &NewznabConfig,
+                    request: &SearchRequest,
+                ) -> Result<SearchResponse, Error> {
+                    let future = execute_paged_search(config, request, extract_base_metadata);
+                    let mut future = std::pin::pin!(future);
+                    let mut context = Context::from_waker(Waker::noop());
+                    match future.as_mut().poll(&mut context) {
+                        Poll::Ready(output) => output,
+                        Poll::Pending => panic!("the scripted host never suspends"),
+                    }
+                }
+
+                /// An automatic episode search with a TVDB id: the tiered
+                /// shape, `t=tvsearch` with `season` and `ep`.
+                fn tiered_request(limit: usize, cursor: Option<&str>) -> SearchRequest {
+                    SearchRequest {
+                        query: "Sample Show".to_string(),
+                        ids: HashMap::from([("tvdb_id".to_string(), "990001".to_string())]),
+                        facet: Some("series".to_string()),
+                        limit,
+                        season: Some(1),
+                        episode: Some(5),
+                        context: Some(scryer_plugin_sdk::PluginSearchContext {
+                            subject_kind: PluginSearchSubjectKind::Episode,
+                            search_origin: PluginSearchOrigin::Automatic,
+                            query_kind: PluginSearchQueryKind::Title,
+                            ..scryer_plugin_sdk::PluginSearchContext::default()
+                        }),
+                        page_cursor: cursor.map(str::to_string),
+                        ..SearchRequest::default()
+                    }
+                }
+
+                /// An automatic anime episode search: the exact-anime shape,
+                /// `t=tvsearch` with the absolute number as `ep` and no
+                /// season.
+                fn anime_request(limit: usize, cursor: Option<&str>) -> SearchRequest {
+                    SearchRequest {
+                        query: "Sample Anime".to_string(),
+                        ids: HashMap::from([("tvdb_id".to_string(), "990002".to_string())]),
+                        facet: Some("anime".to_string()),
+                        limit,
+                        season: Some(1),
+                        episode: Some(12),
+                        absolute_episode: Some(112),
+                        context: Some(scryer_plugin_sdk::PluginSearchContext {
+                            subject_kind: PluginSearchSubjectKind::AnimeEpisode,
+                            search_origin: PluginSearchOrigin::Automatic,
+                            query_kind: PluginSearchQueryKind::Title,
+                            ..scryer_plugin_sdk::PluginSearchContext::default()
+                        }),
+                        page_cursor: cursor.map(str::to_string),
+                        ..SearchRequest::default()
+                    }
+                }
+
+                fn param<'a>(params: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+                    params.get(key).map(String::as_str)
+                }
+
+                #[test]
+                fn following_the_cursor_walks_every_page_one_request_per_call() {
+                    install_script();
+                    serve_hits("tvsearch", LARGE_RESULT_SET);
+                    let config = paged_config();
+
+                    let mut cursor: Option<String> = None;
+                    let mut seen = Vec::new();
+                    let mut calls = 0;
+                    loop {
+                        let before = sent().len();
+                        let response = run_paged(&config, &tiered_request(1000, cursor.as_deref()))
+                            .expect("every page completes");
+                        calls += 1;
+                        let sent = sent();
+                        assert_eq!(sent.len(), before + 1, "one provider request per call");
+                        let params = &sent[before];
+                        assert_eq!(
+                            param(params, "offset"),
+                            Some((seen.len()).to_string().as_str()),
+                            "the cursor names the offset after the last page"
+                        );
+                        assert_eq!(param(params, "limit"), Some("100"));
+                        if calls == 1 {
+                            assert_eq!(response.results.len(), NAB_PAGE);
+                            assert_eq!(response.next_cursor.as_deref(), Some("offset:100"));
+                        }
+                        seen.extend(guids(&response.results));
+                        match response.next_cursor {
+                            Some(next) => cursor = Some(next),
+                            None => {
+                                assert_eq!(
+                                    response.results.len(),
+                                    LARGE_RESULT_SET % NAB_PAGE,
+                                    "the short last page ends the walk"
+                                );
+                                break;
+                            }
+                        }
+                        assert!(calls < 100, "the walk must end");
+                    }
+
+                    assert_eq!(calls, LARGE_RESULT_SET.div_ceil(NAB_PAGE));
+                    assert_eq!(
+                        seen.len(),
+                        LARGE_RESULT_SET,
+                        "no page read twice or skipped"
+                    );
+                    assert_eq!(seen.first().map(String::as_str), Some("guid-tvsearch-0"));
+                    assert_eq!(
+                        seen.last().cloned(),
+                        Some(guid("tvsearch", LARGE_RESULT_SET - 1))
+                    );
+                }
+
+                #[test]
+                fn a_short_first_page_ends_the_search() {
+                    install_script();
+                    serve_hits("tvsearch", 7);
+
+                    let response = run_paged(&paged_config(), &tiered_request(1000, None))
+                        .expect("a short page completes");
+
+                    assert_eq!(sent().len(), 1);
+                    assert_eq!(response.results.len(), 7);
+                    assert_eq!(response.next_cursor, None);
+                }
+
+                #[test]
+                fn a_full_last_page_is_confirmed_by_an_empty_one() {
+                    install_script();
+                    serve_hits("tvsearch", 2 * NAB_PAGE);
+
+                    let second = run_paged(&paged_config(), &tiered_request(0, Some("offset:100")))
+                        .expect("the second page completes");
+                    assert_eq!(second.results.len(), NAB_PAGE);
+                    assert_eq!(second.next_cursor.as_deref(), Some("offset:200"));
+
+                    let third = run_paged(&paged_config(), &tiered_request(0, Some("offset:200")))
+                        .expect("an empty page completes");
+                    assert!(third.results.is_empty());
+                    assert_eq!(third.next_cursor, None);
+                }
+
+                #[test]
+                fn the_cursor_is_honoured_by_the_tiered_shape() {
+                    install_script();
+                    serve_hits("tvsearch", 1_000);
+
+                    let response =
+                        run_paged(&paged_config(), &tiered_request(1000, Some("offset:300")))
+                            .expect("the page completes");
+
+                    let sent = sent();
+                    assert_eq!(sent.len(), 1);
+                    let params = &sent[0];
+                    assert_eq!(param(params, "t"), Some("tvsearch"));
+                    assert_eq!(param(params, "tvdbid"), Some("990001"));
+                    assert_eq!(param(params, "season"), Some("1"));
+                    assert_eq!(param(params, "ep"), Some("5"));
+                    assert_eq!(param(params, "offset"), Some("300"));
+                    assert_eq!(
+                        response.results.first().and_then(|r| r.guid.clone()),
+                        Some(guid("tvsearch", 300))
+                    );
+                    assert_eq!(response.next_cursor.as_deref(), Some("offset:400"));
+                }
+
+                #[test]
+                fn the_cursor_is_honoured_by_the_exact_anime_shape() {
+                    install_script();
+                    serve_hits("tvsearch", 1_000);
+
+                    let response =
+                        run_paged(&paged_config(), &anime_request(1000, Some("offset:500")))
+                            .expect("the page completes");
+
+                    let sent = sent();
+                    assert_eq!(sent.len(), 1);
+                    let params = &sent[0];
+                    assert_eq!(param(params, "t"), Some("tvsearch"));
+                    assert_eq!(param(params, "tvdbid"), Some("990002"));
+                    assert_eq!(param(params, "ep"), Some("112"), "absolute number as ep");
+                    assert_eq!(param(params, "season"), None);
+                    assert_eq!(param(params, "offset"), Some("500"));
+                    assert_eq!(
+                        response.results.first().and_then(|r| r.guid.clone()),
+                        Some(guid("tvsearch", 500))
+                    );
+                    assert_eq!(response.next_cursor.as_deref(), Some("offset:600"));
+                }
+
+                #[test]
+                fn the_cursor_is_honoured_by_a_typed_search() {
+                    install_script();
+                    serve_hits("search", 1_000);
+
+                    let mut request =
+                        text_request("Sample Film", PluginSearchOrigin::Interactive, &[], 0);
+                    request.page_cursor = Some("offset:200".to_string());
+                    let response =
+                        run_paged(&paged_config(), &request).expect("the page completes");
+
+                    let sent = sent();
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(param(&sent[0], "t"), Some("search"));
+                    assert_eq!(param(&sent[0], "q"), Some("Sample Film"));
+                    assert_eq!(param(&sent[0], "offset"), Some("200"));
+                    assert_eq!(response.next_cursor.as_deref(), Some("offset:300"));
+                }
+
+                #[test]
+                fn a_smaller_limit_bounds_the_page_and_the_next_offset() {
+                    install_script();
+                    serve_hits("tvsearch", 1_000);
+
+                    let response = run_paged(&paged_config(), &tiered_request(40, None))
+                        .expect("the page completes");
+
+                    assert_eq!(param(&sent()[0], "limit"), Some("40"));
+                    assert_eq!(
+                        response.results.len(),
+                        40,
+                        "an indexer that ignores limit is truncated to it"
+                    );
+                    assert_eq!(response.next_cursor.as_deref(), Some("offset:40"));
+                }
+
+                #[test]
+                fn an_unpaged_search_resumes_after_a_reduced_page_with_a_discarded_item() {
+                    install_script();
+                    serve_page("tvsearch", 0, &(0..NAB_PAGE).collect::<Vec<_>>());
+                    serve_page_with_untitled(
+                        "tvsearch",
+                        NAB_PAGE,
+                        &(100..150).collect::<Vec<_>>(),
+                        120,
+                    );
+                    serve_page("tvsearch", 150, &[150]);
+
+                    let response = run(&paged_config(), &tiered_request(150, None))
+                        .expect("the search completes");
+
+                    let sent = sent();
+                    let offsets: Vec<Option<&str>> =
+                        sent.iter().map(|params| param(params, "offset")).collect();
+                    assert_eq!(offsets, vec![Some("0"), Some("100"), Some("150")]);
+                    let limits: Vec<Option<&str>> =
+                        sent.iter().map(|params| param(params, "limit")).collect();
+                    assert_eq!(limits, vec![Some("100"), Some("50"), Some("1")]);
+                    let seen = guids(&response.results);
+                    assert_eq!(seen.len(), 150);
+                    assert!(!seen.iter().any(|guid| guid == "guid-tvsearch-120"));
+                    assert_eq!(seen.last().map(String::as_str), Some("guid-tvsearch-150"));
+                }
+
+                #[test]
+                fn an_oversized_page_is_truncated_to_the_page_size() {
+                    install_script();
+                    let releases: Vec<usize> = (0..250).collect();
+                    serve_page("tvsearch", 0, &releases);
+
+                    let response = run_paged(&paged_config(), &tiered_request(1000, None))
+                        .expect("the page completes");
+
+                    assert_eq!(response.results.len(), NAB_PAGE);
+                    assert_eq!(response.next_cursor.as_deref(), Some("offset:100"));
+                }
+
+                #[test]
+                fn a_page_size_above_the_newznab_maximum_is_still_bounded() {
+                    install_script();
+                    serve_page("tvsearch", 0, &(0..300).collect::<Vec<_>>());
+                    let config = NewznabConfig {
+                        page_size: 500,
+                        ..paged_config()
+                    };
+
+                    let response =
+                        run_paged(&config, &tiered_request(0, None)).expect("the page completes");
+
+                    assert_eq!(param(&sent()[0], "limit"), Some("100"));
+                    assert_eq!(response.results.len(), NEWZNAB_MAX_PAGE_SIZE);
+                }
+
+                #[test]
+                fn a_failed_page_is_deferred_without_a_cursor() {
+                    install_script();
+                    serve_hits("tvsearch", 1_000);
+                    SCRIPT.with(|script| {
+                        script
+                            .borrow_mut()
+                            .failing
+                            .insert(("tvsearch".to_string(), 200));
+                    });
+
+                    let error =
+                        run_paged(&paged_config(), &tiered_request(1000, Some("offset:200")))
+                            .expect_err("the page fails");
+
+                    match indexer_search_details(&error) {
+                        IndexerSearchPluginError::Deferred { reason, .. } => {
+                            assert_eq!(reason, IndexerSearchIncompleteReason::UpstreamFailure);
+                        }
+                        other => panic!("expected a deferred page, got {other:?}"),
+                    }
+                }
+
+                #[test]
+                fn a_cursor_this_plugin_never_issued_is_refused() {
+                    install_script();
+                    serve_hits("tvsearch", 1_000);
+
+                    for cursor in ["300", "offset:", "offset:-1", "page:3"] {
+                        let error = run_paged(&paged_config(), &tiered_request(1000, Some(cursor)))
+                            .expect_err("a foreign cursor is refused");
+                        let structured = error
+                            .downcast_ref::<StructuredPluginError>()
+                            .expect("structured plugin error");
+                        assert_eq!(
+                            structured.plugin_error().code,
+                            PluginErrorCode::Permanent,
+                            "{cursor}"
+                        );
+                    }
+                    assert!(sent().is_empty(), "no request goes out for a bad cursor");
+                }
+
+                #[test]
+                fn a_recent_releases_request_keeps_the_rss_behaviour_and_no_cursor() {
+                    install_script();
+                    serve_hits("tvsearch", 1_000);
+
+                    let response = run_paged(&paged_config(), &rss_request(&["5000"], None))
+                        .expect("the newest page completes");
+
+                    assert_eq!(requests(), vec![("tvsearch".to_string(), None)]);
+                    assert_eq!(response.results.len(), NAB_PAGE);
+                    assert_eq!(response.next_cursor, None);
+                }
+
+                /// The unpaged search pages to the request's limit: the 1,000
+                /// the host asks for take ten pages and end without a ceiling.
+                #[test]
+                fn an_unpaged_search_stops_at_the_requested_limit() {
+                    install_script();
+                    serve_hits("tvsearch", LARGE_RESULT_SET);
+
+                    let response = run(&paged_config(), &tiered_request(1000, None))
+                        .expect("a met limit is a complete search");
+
+                    assert_eq!(sent().len(), 10);
+                    assert_eq!(response.results.len(), 1000);
+                    assert_eq!(response.next_cursor, None);
+                }
+
+                /// Without a limit the unpaged search reads the full 30-page
+                /// ceiling, 3,000 results at 100 per page, and reports the
+                /// ceiling: the shape a search takes when the limit is lost.
+                #[test]
+                fn an_unpaged_search_without_a_limit_ends_at_the_page_ceiling() {
+                    install_script();
+                    serve_hits("tvsearch", LARGE_RESULT_SET);
+
+                    let error = run(&paged_config(), &tiered_request(0, None))
+                        .expect_err("the ceiling leaves results unread");
+
+                    assert_eq!(sent().len(), DEFAULT_MAX_SEARCH_PAGES);
+                    match indexer_search_details(&error) {
+                        IndexerSearchPluginError::PartialResults {
+                            response, reason, ..
+                        } => {
+                            assert_eq!(reason, IndexerSearchIncompleteReason::PageCeilingReached);
+                            assert_eq!(response.results.len(), DEFAULT_MAX_SEARCH_PAGES * NAB_PAGE);
+                            assert_eq!(response.next_cursor, None);
+                        }
+                        other => panic!("expected partial results, got {other:?}"),
+                    }
+                }
+            }
         }
     }
 }

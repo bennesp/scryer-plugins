@@ -14,7 +14,6 @@ use scryer_plugin_sdk::{ConfigFieldOption, ConfigFieldValueSource};
 
 const PROVIDER_ID: &str = "animetosho-xyz";
 const DEFAULT_BASE_URL: &str = "https://feed.animetosho.net";
-const LEGACY_BASE_URL: &str = "https://feed.animetosho.xyz";
 const DEFAULT_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 const PAGE_SIZE: usize = 200;
 const NATIVE_PAGE_SIZE: usize = 75;
@@ -181,6 +180,12 @@ async fn search(mut req: SearchRequest) -> FnResult<SearchResponse> {
 }
 
 async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    if request.action.trim() == "newznabCategories" {
+        let config = animetosho_config(DownloadMode::from_config()?)?;
+        return Ok(PluginActionResponse {
+            payload: newznab_common::newznab_categories_with_config(&config).await,
+        });
+    }
     newznab_common::execute_provider_action(request).await
 }
 
@@ -261,12 +266,11 @@ fn animetosho_config_from(
     mut read: impl FnMut(&str) -> Result<Option<String>, Error>,
 ) -> Result<NewznabConfig, Error> {
     let base_url = read("base_url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
-    let base_url =
-        if base_url.trim().is_empty() || base_url.trim().trim_end_matches('/') == LEGACY_BASE_URL {
-            DEFAULT_BASE_URL.to_string()
-        } else {
-            base_url
-        };
+    let base_url = if base_url.trim().is_empty() {
+        DEFAULT_BASE_URL.to_string()
+    } else {
+        migrate_animetosho_url(&base_url)
+    };
     let api_key = read("api_key")?.unwrap_or_default().trim().to_string();
     Ok(NewznabConfig {
         base_url,
@@ -548,6 +552,12 @@ fn is_leap_year(year: i64) -> bool {
 
 fn annotate_response(response: &mut SearchResponse, mode: DownloadMode) {
     for result in &mut response.results {
+        for url in [&mut result.download_url, &mut result.info_url]
+            .into_iter()
+            .flatten()
+        {
+            *url = migrate_animetosho_url(url);
+        }
         result.source_kind = Some(mode.source_kind());
         result.protocol = Some(mode.protocol());
         result.provider_extra.insert(
@@ -885,7 +895,7 @@ mod tests {
             ("https://feed.animetosho.xyz", "https://feed.animetosho.net"),
             (
                 "https://feed.animetosho.xyz/",
-                "https://feed.animetosho.net",
+                "https://feed.animetosho.net/",
             ),
             ("", "https://feed.animetosho.net"),
             ("https://feed.example.test", "https://feed.example.test"),
@@ -953,5 +963,109 @@ mod tests {
         assert_eq!(result.leechers, Some(28));
         assert_eq!(result.peers, Some(31));
         assert_eq!(result.published_at.as_deref(), Some("2023-11-14T22:13:20Z"));
+    }
+}
+
+// Rewrite only the URL hostname, never credentials, paths, or lookalike domains.
+fn migrate_animetosho_url(value: &str) -> String {
+    let value = value.trim();
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return value.to_string();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host_start = authority.rfind('@').map_or(0, |index| index + 1);
+    let host_end = authority[host_start..]
+        .find(':')
+        .map_or(authority.len(), |index| host_start + index);
+    let hostname = authority[host_start..host_end]
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if hostname != "animetosho.xyz" && !hostname.ends_with(".animetosho.xyz") {
+        return value.to_string();
+    }
+    let hostname = format!("{}.net", hostname.strip_suffix(".xyz").unwrap());
+    format!(
+        "{scheme}://{}{hostname}{}{}",
+        &authority[..host_start],
+        &authority[host_end..],
+        &rest[authority_end..]
+    )
+}
+
+#[cfg(test)]
+mod legacy_url_tests {
+    use super::*;
+    #[test]
+    fn migrates_only_legacy_hostnames() {
+        for (before, after) in [
+            ("https://feed.animetosho.xyz", "https://feed.animetosho.net"),
+            (
+                " http://FEED.ANIMETOSHO.XYZ:8080/api?q=1#part ",
+                "http://feed.animetosho.net:8080/api?q=1#part",
+            ),
+            (
+                "https://animetosho.xyz./download/42",
+                "https://animetosho.net/download/42",
+            ),
+            (
+                "https://storage.animetosho.xyz/releases/42.xz",
+                "https://storage.animetosho.net/releases/42.xz",
+            ),
+            (
+                "https://user:pass@feed.animetosho.xyz/api",
+                "https://user:pass@feed.animetosho.net/api",
+            ),
+        ] {
+            assert_eq!(migrate_animetosho_url(before), after);
+        }
+        for custom in [
+            "https://feed.animetosho.xyz.example.test/path",
+            "https://notanimetosho.xyz/",
+            "https://feed.animetosho.xyz@example.test/path",
+            "https://example.test/?url=https://animetosho.xyz",
+            "https://example.test/animetosho.xyz",
+            "https://feed.animetosho.net/",
+            "http://[::1]:8080/",
+        ] {
+            assert_eq!(migrate_animetosho_url(custom), custom);
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_result_tests {
+    use super::*;
+    #[test]
+    fn download_and_info_links_migrate_without_changing_identity() {
+        let mut response = SearchResponse::default();
+        response.results.push(SearchResult {
+            download_url: Some("https://storage.animetosho.xyz/releases/42.nzb".into()),
+            info_url: Some("https://animetosho.xyz/view/42".into()),
+            ..SearchResult::default()
+        });
+        annotate_response(&mut response, DownloadMode::Nzb);
+        assert_eq!(
+            response.results[0].download_url.as_deref(),
+            Some("https://storage.animetosho.net/releases/42.nzb")
+        );
+        assert_eq!(
+            response.results[0].info_url.as_deref(),
+            Some("https://animetosho.net/view/42")
+        );
+    }
+    #[test]
+    fn both_download_modes_migrate_saved_base_urls() {
+        for mode in [DownloadMode::Nzb, DownloadMode::Torrent] {
+            let config = animetosho_config_from(mode, |key| {
+                Ok((key == "base_url").then(|| "http://FEED.ANIMETOSHO.XYZ:8080/proxy".into()))
+            })
+            .unwrap();
+            assert_eq!(config.base_url, "http://feed.animetosho.net:8080/proxy");
+            assert_eq!(config.api_path, mode.api_path());
+        }
     }
 }

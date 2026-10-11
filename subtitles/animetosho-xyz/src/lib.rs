@@ -1,4 +1,4 @@
-//! AnimeTosho.xyz subtitles, as a WASI Preview 2 component.
+//! AnimeTosho.net subtitles, as a WASI Preview 2 component.
 //!
 //! The plugin implements `scryer:subtitle/subtitle-provider@1.1.0`: two
 //! exports carrying UTF-8 JSON (`describe` returns a `PluginDescriptor`,
@@ -73,9 +73,9 @@ scryer_plugin_pdk::scryer_subtitle_component_main!(
     handler = handle_subtitle_command,
 );
 
-const DEFAULT_BASE_URL: &str = "https://feed.animetosho.xyz";
-const DEFAULT_SITE_URL: &str = "https://animetosho.xyz";
-const STORAGE_BASE_URL: &str = "https://storage.animetosho.xyz";
+const DEFAULT_BASE_URL: &str = "https://feed.animetosho.net";
+const DEFAULT_SITE_URL: &str = "https://animetosho.net";
+const STORAGE_BASE_URL: &str = "https://storage.animetosho.net";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 const DEFAULT_SEARCH_THRESHOLD: usize = 6;
 const MAX_SEARCH_THRESHOLD: usize = 15;
@@ -152,7 +152,7 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         PluginSubtitleCommand::Generate(_) => {
             PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
                 code: PluginErrorCode::Unsupported,
-                public_message: "AnimeTosho.xyz is a catalog subtitle provider and cannot \
+                public_message: "AnimeTosho.net is a catalog subtitle provider and cannot \
                                  generate subtitles"
                     .to_string(),
                 debug_message: Some(
@@ -164,13 +164,13 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
-        // the operation whether or not it can serve one. AnimeTosho.xyz cannot: it has
+        // the operation whether or not it can serve one. AnimeTosho.net cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
         PluginSubtitleCommand::Sync(_) => {
             PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
                 code: PluginErrorCode::Unsupported,
-                public_message: "AnimeTosho.xyz cannot align subtitles".to_string(),
+                public_message: "AnimeTosho.net cannot align subtitles".to_string(),
                 debug_message: Some(
                     "SubtitleCapabilities::sync is None for this provider".to_string(),
                 ),
@@ -273,12 +273,25 @@ fn retry_after_from_message(error: &str) -> Option<i64> {
 
 impl AnimeToshoConfig {
     fn from_host() -> Result<Self, String> {
+        Self::from_config(config_string)
+    }
+
+    fn from_config(
+        mut read: impl FnMut(&str) -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
         Ok(Self {
-            base_url: config_string("base_url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            site_url: config_string("site_url")?.unwrap_or_else(|| DEFAULT_SITE_URL.to_string()),
-            api_key: config_string("api_key")?
-                .ok_or_else(|| "api_key is not configured".to_string())?,
-            search_threshold: config_string("search_threshold")?
+            base_url: migrate_animetosho_url(
+                &read("base_url")?
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            ),
+            site_url: migrate_animetosho_url(
+                &read("site_url")?
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_SITE_URL.to_string()),
+            ),
+            api_key: read("api_key")?.ok_or_else(|| "api_key is not configured".to_string())?,
+            search_threshold: read("search_threshold")?
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SEARCH_THRESHOLD)
                 .clamp(1, MAX_SEARCH_THRESHOLD),
@@ -289,7 +302,7 @@ impl AnimeToshoConfig {
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         id: "animetosho-xyz-subtitles".to_string(),
-        name: "AnimeTosho.xyz Subtitles".to_string(),
+        name: "AnimeTosho.net Subtitles".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
@@ -300,9 +313,9 @@ fn descriptor() -> PluginDescriptor {
             config_fields: config_fields(),
             default_base_url: Some(DEFAULT_BASE_URL.to_string()),
             allowed_hosts: vec![
-                "feed.animetosho.xyz".to_string(),
-                "animetosho.xyz".to_string(),
-                "storage.animetosho.xyz".to_string(),
+                "feed.animetosho.net".to_string(),
+                "animetosho.net".to_string(),
+                "storage.animetosho.net".to_string(),
             ],
             capabilities: SubtitleCapabilities {
                 mode: SubtitleProviderMode::Catalog,
@@ -344,7 +357,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             role: Some(ConfigFieldRole::ConnectionUrl),
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.xyz JSON API base URL".to_string()),
+            help_text: Some("AnimeTosho.net JSON API base URL".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -357,7 +370,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             role: Some(ConfigFieldRole::ConnectionUrl),
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.xyz web site URL used for subtitle links".to_string()),
+            help_text: Some("AnimeTosho.net web site URL used for subtitle links".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -370,7 +383,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             role: None,
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.xyz API key".to_string()),
+            help_text: Some("AnimeTosho.net API key".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -534,13 +547,14 @@ fn download_subtitle_impl(
     config: &AnimeToshoConfig,
     reference: &AnimeToshoDownloadRef,
 ) -> Result<SubtitlePluginDownloadResponse, String> {
+    let url = migrate_animetosho_url(&reference.url);
     let site_prefix = format!("{}/download/", config.site_url.trim_end_matches('/'));
     let storage_prefix = format!("{STORAGE_BASE_URL}/releases/");
-    if !reference.url.starts_with(&site_prefix) && !reference.url.starts_with(&storage_prefix) {
+    if !url.starts_with(&site_prefix) && !url.starts_with(&storage_prefix) {
         return Err("invalid AnimeTosho subtitle download URL".to_string());
     }
 
-    let response = http_get_follow(&reference.url, "application/octet-stream, */*")?;
+    let response = http_get_follow(&url, "application/octet-stream, */*")?;
     if response.status_code() >= 400 {
         return Err(http_error("AnimeTosho subtitle", &response));
     }
@@ -593,7 +607,7 @@ fn api_url(config: &AnimeToshoConfig, path: &str) -> String {
 }
 
 fn http_get_follow(url: &str, accept: &str) -> Result<HttpResponse, String> {
-    let mut current = url.to_string();
+    let mut current = migrate_animetosho_url(url);
     for _ in 0..=MAX_REDIRECTS {
         let response = http_get_with_rate_limit_retry(&current, accept)?;
         if !matches!(response.status_code(), 300..=399) {
@@ -606,7 +620,7 @@ fn http_get_follow(url: &str, accept: &str) -> Result<HttpResponse, String> {
         else {
             return Ok(response);
         };
-        current = resolve_location(&current, location)?;
+        current = migrate_animetosho_url(&resolve_location(&current, location)?);
         std::thread::sleep(Duration::from_millis(100));
     }
     Err("AnimeTosho request exceeded redirect limit".to_string())
@@ -971,7 +985,7 @@ mod tests {
         assert_eq!(links[1].language, "pob");
         assert_eq!(
             links[2].url,
-            "https://animetosho.xyz/download/619135/subs/file/94009"
+            "https://animetosho.net/download/619135/subs/file/94009"
         );
     }
 
@@ -1015,5 +1029,105 @@ mod tests {
 
         assert!(queries.contains(&"Wistoria Wand and Sword 12".to_string()));
         assert!(queries.contains(&"Wistoria Wand and Sword S02E12".to_string()));
+    }
+}
+
+// Rewrite only the URL hostname, never credentials, paths, or lookalike domains.
+fn migrate_animetosho_url(value: &str) -> String {
+    let value = value.trim();
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return value.to_string();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host_start = authority.rfind('@').map_or(0, |index| index + 1);
+    let host_end = authority[host_start..]
+        .find(':')
+        .map_or(authority.len(), |index| host_start + index);
+    let hostname = authority[host_start..host_end]
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if hostname != "animetosho.xyz" && !hostname.ends_with(".animetosho.xyz") {
+        return value.to_string();
+    }
+    let hostname = format!("{}.net", hostname.strip_suffix(".xyz").unwrap());
+    format!(
+        "{scheme}://{}{hostname}{}{}",
+        &authority[..host_start],
+        &authority[host_end..],
+        &rest[authority_end..]
+    )
+}
+
+#[cfg(test)]
+mod legacy_url_tests {
+    use super::*;
+    #[test]
+    fn migrates_only_legacy_hostnames() {
+        for (before, after) in [
+            ("https://feed.animetosho.xyz", "https://feed.animetosho.net"),
+            (
+                " http://FEED.ANIMETOSHO.XYZ:8080/api?q=1#part ",
+                "http://feed.animetosho.net:8080/api?q=1#part",
+            ),
+            (
+                "https://animetosho.xyz./download/42",
+                "https://animetosho.net/download/42",
+            ),
+            (
+                "https://storage.animetosho.xyz/releases/42.xz",
+                "https://storage.animetosho.net/releases/42.xz",
+            ),
+            (
+                "https://user:pass@feed.animetosho.xyz/api",
+                "https://user:pass@feed.animetosho.net/api",
+            ),
+        ] {
+            assert_eq!(migrate_animetosho_url(before), after);
+        }
+        for custom in [
+            "https://feed.animetosho.xyz.example.test/path",
+            "https://notanimetosho.xyz/",
+            "https://feed.animetosho.xyz@example.test/path",
+            "https://example.test/?url=https://animetosho.xyz",
+            "https://example.test/animetosho.xyz",
+            "https://feed.animetosho.net/",
+            "http://[::1]:8080/",
+        ] {
+            assert_eq!(migrate_animetosho_url(custom), custom);
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_config_tests {
+    use super::*;
+    #[test]
+    fn saved_configuration_uses_net_for_search_and_download() {
+        let config = AnimeToshoConfig::from_config(|key| {
+            Ok(match key {
+                "base_url" => Some("https://feed.animetosho.xyz/".into()),
+                "site_url" => Some("https://animetosho.xyz".into()),
+                "api_key" => Some("test-key".into()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            api_url(&config, "/json/v1/search?q=test"),
+            "https://feed.animetosho.net/json/v1/search?q=test&apikey=test-key"
+        );
+        let links = parse_subtitle_links(
+            r#"<a href="/download/42/subs/file/7">English [eng, ASS]</a>"#,
+            42,
+            &config.site_url,
+        );
+        assert_eq!(
+            links[0].url,
+            "https://animetosho.net/download/42/subs/file/7"
+        );
     }
 }

@@ -1,9 +1,9 @@
 [package]
 name = "animetosho-xyz-subtitle-provider"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "GPL-3.0-only"
-description = "AnimeTosho.xyz subtitle provider for anime episode releases"
+description = "AnimeTosho.net subtitle provider for anime episode releases"
 
 [package.metadata.scryer]
 official = true

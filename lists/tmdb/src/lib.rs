@@ -1,10 +1,20 @@
 //! TMDb list provider.
 //!
-//! Follows four kinds of public TMDb sources with the server's TMDb API key:
+//! Every TMDb read needs a key, so every source here is a member's own: it is
+//! read through the TMDb account that member linked, with their v4 user
+//! access token. The server holds no TMDb key.
 //!
-//! - `list`: a public list by id, paged through `/4/list/{id}` when the
-//!   server key is a v4 read access token, and through `/3/list/{id}` with a
-//!   v3 API key.
+//! Sources addressed by the member's account, through TMDb's v4 account API:
+//!
+//! - `watchlist`, `favorites` and `rated`: the member's watchlist, favorites
+//!   or rated titles, movies and shows, newest first, paged.
+//! - `recommendations`: the titles TMDb recommends to the member, movies and
+//!   shows, in TMDb's order, paged.
+//!
+//! Sources addressed by a TMDb id:
+//!
+//! - `account_list` and `list`: one of the member's own lists, public or
+//!   private, or anyone's public list, paged through `/4/list/{id}`.
 //! - `person`: everything a person is credited on, from one
 //!   `/3/person/{id}?append_to_response=combined_credits` read: their cast
 //!   credits, their crew credits, or the crew credits of one department.
@@ -17,21 +27,6 @@
 //! Parameterless charts (popular, top rated, upcoming and the rest) are served
 //! by the metadata gateway and are deliberately absent here.
 //!
-//! The key is either a v3 API key (sent as `api_key`) or a v4 read access
-//! token (sent as a bearer token). It is server configuration declared in the
-//! descriptor.
-//!
-//! A member who links their own TMDb account can also follow five personal
-//! sources through TMDb's v4 account API, read with that member's v4 user
-//! access token and never with the server key:
-//!
-//! - `watchlist`, `favorites` and `rated`: the member's watchlist, favorites
-//!   or rated titles, movies and shows, newest first, paged.
-//! - `recommendations`: the titles TMDb recommends to the member, movies and
-//!   shows, in TMDb's order, paged.
-//! - `account_list`: one of the member's own lists, public or private, paged
-//!   through `/4/list/{id}`.
-//!
 //! The member's credential arrives inside the request for that call only. Its
 //! token goes in the `Authorization` header and nowhere else; its
 //! `external_user_id` is the v4 account object id the account endpoints are
@@ -39,13 +34,12 @@
 //!
 //! TMDb issues that user access token only to an application, through an
 //! approval the member gives on themoviedb.org. The application is the
-//! server's v4 read access token or, declared as `member_key`, the member's
-//! own: the host starts the approval with whichever it has, and this plugin
-//! never sees the member's application token at all.
+//! member's own API Read Access Token, declared as `member_key`: the host
+//! starts the approval with it, and this plugin never sees it.
 
 use list_provider_common::error::{
     Access, auth_failed, check_status, invalid_config, missing_param, not_found, permanent,
-    unsupported_source,
+    plugin_error, unsupported_source,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, json_body};
 use list_provider_common::ids::{
@@ -55,14 +49,13 @@ use list_provider_common::page::{numeric_cursor, single_page};
 use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::host::{PluginHttpRequest, PluginHttpResponse};
 use scryer_plugin_sdk::{
-    ConfigFieldDef, ConfigFieldType, ListAccountExchange, ListAccountFlow, ListAccountList,
-    ListAuthBadge, ListCredential, ListMediaKind, ListMemberKey, ListMemberKeyUse, ListNoteTone,
-    ListPluginAccountResponse, ListPluginFetchRequest, ListPluginFetchResponse,
-    ListPluginHealthResponse, ListPluginItem, ListProviderAuth, ListProviderCapabilities,
-    ListProviderDescriptor, ListProviderGroup, ListProviderItem, ListProviderNote,
-    ListProviderRating, ListProviderTile, ListSourceParam, ListSourceParamType, ListUrlPattern,
-    ListUrlPatternCapture, PluginDescriptor, PluginError, PluginErrorCode, PluginResult,
-    ProviderDescriptor,
+    ListAccountExchange, ListAccountFlow, ListAccountList, ListAuthBadge, ListCredential,
+    ListMediaKind, ListMemberKey, ListMemberKeyUse, ListNoteTone, ListPluginAccountResponse,
+    ListPluginFetchRequest, ListPluginFetchResponse, ListPluginHealthResponse, ListPluginItem,
+    ListProviderAuth, ListProviderCapabilities, ListProviderDescriptor, ListProviderGroup,
+    ListProviderItem, ListProviderNote, ListProviderRating, ListProviderTile, ListSourceParam,
+    ListSourceParamType, ListUrlPattern, ListUrlPatternCapture, PluginDescriptor, PluginError,
+    PluginErrorCode, PluginResult, ProviderDescriptor,
 };
 use serde_json::Value;
 
@@ -76,7 +69,6 @@ list_provider_common::list_component_main!(descriptor = descriptor, handler = ha
 
 pub const PLUGIN_ID: &str = "tmdb-list";
 pub const PROVIDER_TYPE: &str = "tmdb";
-pub const CONFIG_API_KEY: &str = "api_key";
 
 pub const SOURCE_LIST: &str = "list";
 pub const SOURCE_PERSON: &str = "person";
@@ -95,9 +87,9 @@ pub const PARAM_KEYWORD_ID: &str = "keyword_id";
 pub const PARAM_CREDIT: &str = "credit";
 pub const PARAM_KIND: &str = "kind";
 
+/// TMDb's v3 API, which serves people and discover.
 pub const API_BASE: &str = "https://api.themoviedb.org/3";
-/// TMDb's v4 API, which serves a member's account with their user access
-/// token.
+/// TMDb's v4 API, which serves a member's account and lists.
 pub const API_V4_BASE: &str = "https://api.themoviedb.org/4";
 const API_HOST: &str = "api.themoviedb.org";
 const SITE_BASE: &str = "https://www.themoviedb.org";
@@ -113,9 +105,6 @@ const PAGE_SIZE: u32 = 20;
 pub const MAX_PAGES: u32 = 99;
 /// Twelve hours, the interval the other arrs use for TMDb lists.
 const DEFAULT_INTERVAL_SECONDS: u64 = 12 * 60 * 60;
-/// TMDb status codes that mean the key itself is bad, as opposed to a
-/// resource the key may not read.
-const TMDB_INVALID_KEY_CODES: [i64; 4] = [7, 10, 30, 35];
 /// TMDb's "This resource is private" status.
 const TMDB_PRIVATE_RESOURCE_CODE: i64 = 39;
 /// Deepest page of a member's own lists the account operation reads: 200
@@ -168,16 +157,9 @@ fn source_item(
         kinds,
         source_type: source_type.to_string(),
         params,
-        personal: false,
-        default_interval_seconds: DEFAULT_INTERVAL_SECONDS,
-    }
-}
-
-/// A source read with the member's own linked account.
-fn personal(item: ListProviderItem) -> ListProviderItem {
-    ListProviderItem {
+        // Every source is read with the member's own linked account.
         personal: true,
-        ..item
+        default_interval_seconds: DEFAULT_INTERVAL_SECONDS,
     }
 }
 
@@ -208,14 +190,14 @@ pub fn descriptor() -> PluginDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: vec!["themoviedb".to_string()],
             summary: Some(
-                "Public TMDb lists, people, companies and keywords, and members' own TMDb lists"
+                "Your TMDb watchlist, favorites, ratings and lists, and TMDb lists, people, \
+                 companies and keywords, through your own TMDb account"
                     .to_string(),
             ),
             blurb: Some(
-                "Follow a public TMDb list, everything a person is credited on, or \
-                 everything from a company or keyword. Members who link their own TMDb \
-                 account can follow their watchlist, favorites, ratings, recommendations \
-                 and lists. Charts such as \
+                "Link your own TMDb account to follow your watchlist, favorites, ratings, \
+                 recommendations and lists, any public TMDb list, everything a person is \
+                 credited on, or everything from a company or keyword. Charts such as \
                  popular and top rated come from Scryer's metadata service instead."
                     .to_string(),
             ),
@@ -226,17 +208,14 @@ pub fn descriptor() -> PluginDescriptor {
             }),
             brand_url_template: None,
             coverage: both(),
-            // How a member links an account. The public sources read with the
-            // server key instead, declared below as a config field and badged
-            // on their group.
+            // How a member links the account every source is read with.
             auth: ListProviderAuth::MemberAccount {
                 flow: ListAccountFlow::TmdbApproval,
                 exchange: ListAccountExchange::Direct,
                 byo_app: false,
                 scopes: Vec::new(),
             },
-            // A member can start that approval with their own TMDb
-            // application instead of the server's.
+            // The member starts that approval with their own TMDb application.
             member_key: Some(ListMemberKey {
                 label: "Your TMDb API Read Access Token".to_string(),
                 help_text: Some(
@@ -249,13 +228,59 @@ pub fn descriptor() -> PluginDescriptor {
             }),
             groups: vec![
                 ListProviderGroup {
-                    label: "Public sources".to_string(),
-                    auth_badge: ListAuthBadge::ServerApiKey,
+                    label: "Your TMDb account".to_string(),
+                    auth_badge: ListAuthBadge::MemberAccount,
                     items: vec![
                         source_item(
-                            "public-list",
-                            "Public list",
-                            "A public TMDb list, by its id or address",
+                            "watchlist",
+                            "Watchlist",
+                            "Movies and shows on your TMDb watchlist, newest first",
+                            both(),
+                            SOURCE_WATCHLIST,
+                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
+                        ),
+                        source_item(
+                            "favorites",
+                            "Favorites",
+                            "Movies and shows you marked as favorites on TMDb, newest first",
+                            both(),
+                            SOURCE_FAVORITES,
+                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
+                        ),
+                        source_item(
+                            "rated",
+                            "Rated",
+                            "Movies and shows you rated on TMDb, newest first",
+                            both(),
+                            SOURCE_RATED,
+                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
+                        ),
+                        source_item(
+                            "recommendations",
+                            "Recommendations",
+                            "Movies and shows TMDb recommends to you",
+                            both(),
+                            SOURCE_RECOMMENDATIONS,
+                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
+                        ),
+                        source_item(
+                            "account-list",
+                            "Your list",
+                            "One of your own TMDb lists, public or private",
+                            both(),
+                            SOURCE_ACCOUNT_LIST,
+                            vec![text_param(PARAM_LIST_ID, "List id")],
+                        ),
+                    ],
+                },
+                ListProviderGroup {
+                    label: "Lists, people, companies and keywords".to_string(),
+                    auth_badge: ListAuthBadge::MemberAccount,
+                    items: vec![
+                        source_item(
+                            "list",
+                            "TMDb list",
+                            "Any public TMDb list, by its id",
                             both(),
                             SOURCE_LIST,
                             vec![text_param(PARAM_LIST_ID, "List id")],
@@ -308,52 +333,6 @@ pub fn descriptor() -> PluginDescriptor {
                         ),
                     ],
                 },
-                ListProviderGroup {
-                    label: "Your TMDb account".to_string(),
-                    auth_badge: ListAuthBadge::MemberAccount,
-                    items: vec![
-                        personal(source_item(
-                            "watchlist",
-                            "Watchlist",
-                            "Movies and shows on your TMDb watchlist, newest first",
-                            both(),
-                            SOURCE_WATCHLIST,
-                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
-                        )),
-                        personal(source_item(
-                            "favorites",
-                            "Favorites",
-                            "Movies and shows you marked as favorites on TMDb, newest first",
-                            both(),
-                            SOURCE_FAVORITES,
-                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
-                        )),
-                        personal(source_item(
-                            "rated",
-                            "Rated",
-                            "Movies and shows you rated on TMDb, newest first",
-                            both(),
-                            SOURCE_RATED,
-                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
-                        )),
-                        personal(source_item(
-                            "recommendations",
-                            "Recommendations",
-                            "Movies and shows TMDb recommends to you",
-                            both(),
-                            SOURCE_RECOMMENDATIONS,
-                            vec![enum_param(PARAM_KIND, "Media", &["all", "movie", "series"])],
-                        )),
-                        personal(source_item(
-                            "account-list",
-                            "Your list",
-                            "One of your own TMDb lists, public or private",
-                            both(),
-                            SOURCE_ACCOUNT_LIST,
-                            vec![text_param(PARAM_LIST_ID, "List id")],
-                        )),
-                    ],
-                },
             ],
             notes: vec![ListProviderNote {
                 tone: ListNoteTone::Info,
@@ -367,23 +346,11 @@ pub fn descriptor() -> PluginDescriptor {
             ],
             capabilities: ListProviderCapabilities {
                 account: true,
-                health: true,
-                requires_member_credential: false,
+                // There is no server key to check.
+                health: false,
+                requires_member_credential: true,
             },
-            config_fields: vec![ConfigFieldDef {
-                key: CONFIG_API_KEY.to_string(),
-                label: "TMDb API key or read access token".to_string(),
-                field_type: ConfigFieldType::Password,
-                required: false,
-                help_text: Some(
-                    "A v3 API key or a v4 API read access token from your TMDb account settings. \
-                     Needed for public lists, people, companies and keywords. Members link their \
-                     own TMDb accounts through it when it is the v4 read access token, or with \
-                     a read access token of their own."
-                        .to_string(),
-                ),
-                ..Default::default()
-            }],
+            config_fields: Vec::new(),
             default_base_url: None,
             allowed_hosts: vec![API_HOST.to_string()],
             rate_limit_seconds: Some(1),
@@ -392,10 +359,7 @@ pub fn descriptor() -> PluginDescriptor {
 }
 
 async fn handle_command(command: PluginListCommand) -> PluginListCommandResult {
-    let api_key = scryer_plugin_pdk::config::get(CONFIG_API_KEY)
-        .ok()
-        .flatten();
-    run(&HostHttp, api_key.as_deref(), command).await
+    run(&HostHttp, command).await
 }
 
 fn into_result<T>(result: Result<T, PluginError>) -> PluginResult<T> {
@@ -405,21 +369,17 @@ fn into_result<T>(result: Result<T, PluginError>) -> PluginResult<T> {
     }
 }
 
-pub async fn run<H: ListHttp>(
-    http: &H,
-    api_key: Option<&str>,
-    command: PluginListCommand,
-) -> PluginListCommandResult {
-    let client = Client {
-        http,
-        api_key: api_key.map(str::trim).filter(|key| !key.is_empty()),
-    };
+pub async fn run<H: ListHttp>(http: &H, command: PluginListCommand) -> PluginListCommandResult {
+    let client = Client { http };
     match command {
         PluginListCommand::Fetch(request) => {
             PluginListCommandResult::Fetch(into_result(client.fetch(&request).await))
         }
         PluginListCommand::Health(_) => {
-            PluginListCommandResult::Health(into_result(client.health().await))
+            PluginListCommandResult::Health(PluginResult::Err(plugin_error(
+                PluginErrorCode::Unsupported,
+                "TMDb lists use each member's own account; there is no server key to check",
+            )))
         }
         PluginListCommand::Account(request) => {
             PluginListCommandResult::Account(into_result(client.account(&request.credential).await))
@@ -429,7 +389,6 @@ pub async fn run<H: ListHttp>(
 
 struct Client<'a, H> {
     http: &'a H,
-    api_key: Option<&'a str>,
 }
 
 /// A member's linked TMDb account, for one call: their v4 user access token
@@ -459,8 +418,10 @@ impl<'a> Member<'a> {
         format!("/account/{}", encode_component(self.account_id))
     }
 
-    fn request(self, path_and_query: &str) -> PluginHttpRequest {
-        let mut request = get(format!("{API_V4_BASE}{path_and_query}"), USER_AGENT, ACCEPT);
+    /// A read of `base`, the v3 or the v4 API, with the member's token as
+    /// the bearer.
+    fn request(self, base: &str, path_and_query: &str) -> PluginHttpRequest {
+        let mut request = get(format!("{base}{path_and_query}"), USER_AGENT, ACCEPT);
         request.headers.insert(
             "Authorization".to_string(),
             format!("Bearer {}", self.token),
@@ -477,8 +438,9 @@ enum MemberRead {
     /// list index: any 401 or 403 means TMDb no longer accepts the linked
     /// account, and a 404 is never the collection being gone.
     Account,
-    /// A list named by id, which may be someone else's private list.
-    ListById,
+    /// Something named by its TMDb id: a person, a company, a keyword, or a
+    /// list, which may be someone else's private one.
+    ById,
 }
 
 /// Where a watchlist or favorites fetch is: which kind's endpoint, which page
@@ -550,11 +512,6 @@ fn chained_cursor(kind: ListMediaKind, page: u32, rank_base: u32) -> String {
     format!("{}:{page}:{rank_base}", kind_str(kind).unwrap_or("movie"))
 }
 
-/// A v4 read access token is a JWT: three dot-separated base64url segments.
-fn is_bearer_token(key: &str) -> bool {
-    key.starts_with("eyJ") && key.matches('.').count() == 2
-}
-
 fn required_id(request: &ListPluginFetchRequest, key: &str) -> Result<String, PluginError> {
     let value = request
         .params
@@ -605,98 +562,18 @@ impl KindFilter {
 }
 
 impl<H: ListHttp> Client<'_, H> {
-    fn key(&self) -> Result<&str, PluginError> {
-        self.api_key
-            .ok_or_else(|| invalid_config("the TMDb API key is not configured"))
-    }
-
-    /// Whether the server key is a v4 read access token, which can read the
-    /// v4 API.
-    fn has_bearer_key(&self) -> bool {
-        self.api_key.is_some_and(is_bearer_token)
-    }
-
-    fn request_at(
-        &self,
-        base: &str,
-        path_and_query: &str,
-    ) -> Result<PluginHttpRequest, PluginError> {
-        let key = self.key()?;
-        let separator = if path_and_query.contains('?') {
-            '&'
-        } else {
-            '?'
-        };
-        if is_bearer_token(key) {
-            let mut request = get(format!("{base}{path_and_query}"), USER_AGENT, ACCEPT);
-            request
-                .headers
-                .insert("Authorization".to_string(), format!("Bearer {key}"));
-            Ok(request)
-        } else {
-            Ok(get(
-                format!(
-                    "{base}{path_and_query}{separator}api_key={}",
-                    encode_component(key)
-                ),
-                USER_AGENT,
-                ACCEPT,
-            ))
-        }
-    }
-
-    async fn get_json(&self, path_and_query: &str, what: &str) -> Result<Value, PluginError> {
-        self.get_json_at(API_BASE, path_and_query, what).await
-    }
-
-    async fn get_json_at(
-        &self,
-        base: &str,
-        path_and_query: &str,
-        what: &str,
-    ) -> Result<Value, PluginError> {
-        let response = self
-            .http
-            .send(self.request_at(base, path_and_query)?)
-            .await?;
-        check_tmdb_status(&response, what)?;
-        json_body(&response)
-    }
-
-    /// A v4 read with the member's own token. The server key never goes
-    /// along.
+    /// A read with the member's own token.
     async fn get_member_json(
         &self,
         member: Member<'_>,
+        base: &str,
         path_and_query: &str,
         what: &str,
         read: MemberRead,
     ) -> Result<Value, PluginError> {
-        let response = self.http.send(member.request(path_and_query)).await?;
+        let response = self.http.send(member.request(base, path_and_query)).await?;
         check_member_status(&response, what, read)?;
         json_body(&response)
-    }
-
-    async fn health(&self) -> Result<ListPluginHealthResponse, PluginError> {
-        if self.api_key.is_none() {
-            return Ok(ListPluginHealthResponse {
-                healthy: false,
-                message: Some("the TMDb API key is not configured".to_string()),
-            });
-        }
-        match self.get_json("/configuration", "TMDb configuration").await {
-            Ok(_) => Ok(ListPluginHealthResponse {
-                healthy: true,
-                message: None,
-            }),
-            Err(error) if error.code == PluginErrorCode::AuthFailed => {
-                Ok(ListPluginHealthResponse {
-                    healthy: false,
-                    message: Some(error.public_message),
-                })
-            }
-            Err(error) => Err(error),
-        }
     }
 
     async fn fetch(
@@ -704,7 +581,7 @@ impl<H: ListHttp> Client<'_, H> {
         request: &ListPluginFetchRequest,
     ) -> Result<ListPluginFetchResponse, PluginError> {
         match request.source_type.as_str() {
-            SOURCE_LIST => self.fetch_list(request).await,
+            SOURCE_LIST | SOURCE_ACCOUNT_LIST => self.fetch_list(request).await,
             SOURCE_PERSON => self.fetch_person(request).await,
             SOURCE_COMPANY => {
                 self.fetch_discover(request, PARAM_COMPANY_ID, "with_companies", "company")
@@ -718,7 +595,6 @@ impl<H: ListHttp> Client<'_, H> {
             SOURCE_FAVORITES => self.fetch_account_titles(request, "favorites").await,
             SOURCE_RATED => self.fetch_account_titles(request, "rated").await,
             SOURCE_RECOMMENDATIONS => self.fetch_account_titles(request, "recommendations").await,
-            SOURCE_ACCOUNT_LIST => self.fetch_account_list(request).await,
             other => Err(unsupported_source(other)),
         }
     }
@@ -748,6 +624,7 @@ impl<H: ListHttp> Client<'_, H> {
         let body = self
             .get_member_json(
                 member,
+                API_V4_BASE,
                 &format!(
                     "{}/{endpoint}/{collection}?{sort}page={}",
                     member.account_path(),
@@ -824,9 +701,9 @@ impl<H: ListHttp> Client<'_, H> {
         Ok(response)
     }
 
-    /// One of the member's own lists, which may be private, read with their
-    /// token.
-    async fn fetch_account_list(
+    /// A list by its id, read with the member's token: one of their own,
+    /// which may be private, or anyone's public one.
+    async fn fetch_list(
         &self,
         request: &ListPluginFetchRequest,
     ) -> Result<ListPluginFetchResponse, PluginError> {
@@ -836,9 +713,10 @@ impl<H: ListHttp> Client<'_, H> {
         let body = self
             .get_member_json(
                 member,
+                API_V4_BASE,
                 &format!("/list/{list_id}?page={page}"),
                 &format!("TMDb list {list_id}"),
-                MemberRead::ListById,
+                MemberRead::ById,
             )
             .await?;
         let entries = body
@@ -878,6 +756,7 @@ impl<H: ListHttp> Client<'_, H> {
             let body = self
                 .get_member_json(
                     member,
+                    API_V4_BASE,
                     &format!("{}/lists?page={page}", member.account_path()),
                     "TMDb account lists",
                     MemberRead::Account,
@@ -899,9 +778,10 @@ impl<H: ListHttp> Client<'_, H> {
             Some(list) => self
                 .get_member_json(
                     member,
+                    API_V4_BASE,
                     &format!("/list/{}?page=1", list.id),
                     &format!("TMDb list {}", list.id),
-                    MemberRead::ListById,
+                    MemberRead::ById,
                 )
                 .await
                 .ok()
@@ -932,54 +812,11 @@ impl<H: ListHttp> Client<'_, H> {
         })
     }
 
-    async fn fetch_list(
-        &self,
-        request: &ListPluginFetchRequest,
-    ) -> Result<ListPluginFetchResponse, PluginError> {
-        let list_id = required_id(request, PARAM_LIST_ID)?;
-        let page = page_cursor(request.page_cursor.as_deref(), MAX_PAGES)?;
-        // TMDb documents `total_pages` for a v4 list read but not for v3, so
-        // a v4 read access token reads the list through v4, as Radarr does.
-        // A v3 API key cannot read v4 and falls back to v3, where the list's
-        // item count bounds the pages instead.
-        let base = if self.has_bearer_key() {
-            API_V4_BASE
-        } else {
-            API_BASE
-        };
-        let body = self
-            .get_json_at(
-                base,
-                &format!("/list/{list_id}?page={page}"),
-                &format!("TMDb list {list_id}"),
-            )
-            .await?;
-        let entries = body
-            .get("results")
-            .or_else(|| body.get("items"))
-            .and_then(Value::as_array)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let pages = list_total_pages(&body, page, entries.len(), &list_id)?;
-        within_cap(pages, MAX_PAGES, "TMDb list", "titles")?;
-        let items = entries
-            .iter()
-            .filter_map(|entry| to_item(entry, None))
-            .collect();
-        Ok(paged(
-            items,
-            page,
-            pages,
-            body.get("total_results").or_else(|| body.get("item_count")),
-            json_text(body.get("name")),
-            Some(format!("{SITE_BASE}/list/{list_id}")),
-        ))
-    }
-
     async fn fetch_person(
         &self,
         request: &ListPluginFetchRequest,
     ) -> Result<ListPluginFetchResponse, PluginError> {
+        let member = Member::from_credential(request.credential.as_ref())?;
         let person_id = required_id(request, PARAM_PERSON_ID)?;
         // The credit sections to read, and for crew a single department to
         // keep.
@@ -999,9 +836,12 @@ impl<H: ListHttp> Client<'_, H> {
         };
         let kinds = KindFilter::parse(request.params.get(PARAM_KIND), KindFilter::All, true)?;
         let body = self
-            .get_json(
+            .get_member_json(
+                member,
+                API_BASE,
                 &format!("/person/{person_id}?append_to_response=combined_credits"),
                 &format!("TMDb person {person_id}"),
+                MemberRead::ById,
             )
             .await?;
         let credits = body.get("combined_credits");
@@ -1046,6 +886,7 @@ impl<H: ListHttp> Client<'_, H> {
         filter: &str,
         site_path: &str,
     ) -> Result<ListPluginFetchResponse, PluginError> {
+        let member = Member::from_credential(request.credential.as_ref())?;
         let id = required_id(request, param)?;
         let kind =
             match KindFilter::parse(request.params.get(PARAM_KIND), KindFilter::Movie, false)? {
@@ -1058,9 +899,12 @@ impl<H: ListHttp> Client<'_, H> {
         };
         let page = page_cursor(request.page_cursor.as_deref(), MAX_PAGES)?;
         let body = self
-            .get_json(
+            .get_member_json(
+                member,
+                API_BASE,
                 &format!("/discover/{endpoint}?{filter}={id}&sort_by={sort}&include_adult=false&page={page}"),
                 &format!("TMDb {site_path} {id}"),
+                MemberRead::ById,
             )
             .await?;
         within_cap(
@@ -1097,25 +941,10 @@ fn tmdb_status_code(response: &PluginHttpResponse) -> Option<i64> {
         .and_then(|body| body.get("status_code").and_then(Value::as_i64))
 }
 
-/// TMDb answers 401 both for a bad key and for a private resource. Only the
-/// key codes are an authentication failure; the rest mean the resource is not
-/// visible, which the host treats as not found.
-fn check_tmdb_status(response: &PluginHttpResponse, what: &str) -> Result<(), PluginError> {
-    if response.status == 401 {
-        return Err(match tmdb_status_code(response) {
-            Some(code) if !TMDB_INVALID_KEY_CODES.contains(&code) => {
-                not_found(format!("{what} (private, HTTP 401)"))
-            }
-            _ => auth_failed("TMDb rejected the API key"),
-        });
-    }
-    check_status(response, Access::ServerKey, what)
-}
-
 /// A 401 on a member's call means TMDb no longer accepts the linked account,
 /// which the host shows as an expired account to reconnect. The one exception
-/// is a list read by id that TMDb calls private: that list is not this
-/// member's to read, and the account is fine.
+/// is a read by id that TMDb calls private: that list is not this member's to
+/// read, and the account is fine.
 ///
 /// The member's own collections are addressed by their account, so they can
 /// never be gone on their own: a 403 there is TMDb refusing the linked
@@ -1144,7 +973,7 @@ fn check_member_status(
     }
     if response.status == 401 {
         return Err(
-            if read == MemberRead::ListById
+            if read == MemberRead::ById
                 && tmdb_status_code(response) == Some(TMDB_PRIVATE_RESOURCE_CODE)
             {
                 not_found(format!("{what} (private, HTTP 401)"))
@@ -1175,8 +1004,8 @@ fn total_pages(body: &Value) -> u32 {
         .unwrap_or(1)
 }
 
-/// The pages a list read has, from its `total_pages`. TMDb does not document
-/// `total_pages` for a v3 list, so without it the list's item count decides:
+/// The pages a list read has, from its `total_pages`. Should a list come back
+/// without one, its item count decides:
 /// the list ends once every item has been read, a page that comes back empty
 /// before then fails, and a full page with no count at all fails too, since
 /// its end cannot be told. None of these guesses a shorter list.
@@ -1285,7 +1114,8 @@ fn is_appearance(entry: &Value) -> bool {
             })
 }
 
-/// Map one TMDb result. `kind` is known for discover; lists and credits carry
+/// Map one TMDb result. `kind` is known for discover and the account's
+/// collections; lists and credits carry
 /// `media_type`, and people or unknown types are skipped.
 fn to_item(entry: &Value, kind: Option<ListMediaKind>) -> Option<ListPluginItem> {
     let kind = match kind {

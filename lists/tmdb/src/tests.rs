@@ -9,18 +9,11 @@ use scryer_plugin_sdk::{
 
 use super::*;
 
-const KEY: &str = "fixturekey0123";
-const BEARER: &str = "eyJhbGciOiJIUzI1NiJ9.eyJmaXh0dXJlIjp0cnVlfQ.c2lnbmF0dXJl";
-
-fn url(path_and_query: &str) -> String {
-    let separator = if path_and_query.contains('?') {
-        '&'
-    } else {
-        '?'
-    };
-    format!("{API_BASE}{path_and_query}{separator}api_key={KEY}")
+fn v3(path_and_query: &str) -> String {
+    format!("{API_BASE}{path_and_query}")
 }
 
+/// A fetch as the host sends it: with the linked member's credential.
 fn request(
     source_type: &str,
     params: &[(&str, &str)],
@@ -32,7 +25,7 @@ fn request(
             .iter()
             .map(|(key, value)| (key.to_string(), value.to_string()))
             .collect::<BTreeMap<_, _>>(),
-        credential: None,
+        credential: Some(member()),
         page_cursor: cursor.map(str::to_string),
         since_fingerprint: None,
     }
@@ -40,10 +33,9 @@ fn request(
 
 fn fetch(
     http: &RecordedHttp,
-    key: Option<&str>,
     request: ListPluginFetchRequest,
 ) -> PluginResult<scryer_plugin_sdk::ListPluginFetchResponse> {
-    match block_on(run(http, key, PluginListCommand::Fetch(request))) {
+    match block_on(run(http, PluginListCommand::Fetch(request))) {
         PluginListCommandResult::Fetch(result) => result,
         other => panic!("unexpected {other:?}"),
     }
@@ -65,7 +57,7 @@ fn err<T: std::fmt::Debug>(result: PluginResult<T>) -> scryer_plugin_sdk::Plugin
 
 const LIST_PAGE_1: &str = r#"{
   "id": 8100001, "name": "Fixture Picks", "item_count": 23, "page": 1, "total_pages": 2, "total_results": 23,
-  "items": [
+  "results": [
     {"id": 990201, "media_type": "movie", "title": "Fixture Feature Alpha", "release_date": "2031-03-04",
      "vote_average": 7.4, "vote_count": 120, "genre_ids": [18, 53], "original_language": "en"},
     {"id": 990202, "media_type": "tv", "name": "Fixture Serial Beta", "first_air_date": "2029-10-01",
@@ -77,7 +69,7 @@ const LIST_PAGE_1: &str = r#"{
 
 const LIST_PAGE_2: &str = r#"{
   "id": 8100001, "name": "Fixture Picks", "page": 2, "total_pages": 2, "total_results": 23,
-  "items": [{"id": 990204, "media_type": "movie", "title": "Fixture Feature Gamma", "release_date": ""}]
+  "results": [{"id": 990204, "media_type": "movie", "title": "Fixture Feature Gamma", "release_date": ""}]
 }"#;
 
 #[test]
@@ -107,35 +99,24 @@ fn descriptor_round_trips_and_passes_host_checks() {
             scopes: Vec::new(),
         }
     );
-    assert!(list.capabilities.health);
-    let server_key = list
-        .config_fields
-        .iter()
-        .find(|field| field.key == CONFIG_API_KEY)
-        .unwrap();
+    assert!(!list.capabilities.health);
     assert!(
-        !server_key.required,
-        "members can link with their own token on a server that has none"
+        list.config_fields.is_empty(),
+        "the server holds no TMDb key"
     );
-    // A member's own token starts the same approval; it is never the credential.
-    let member_key = list.member_key.as_ref().expect("members can bring a token");
+    // A member's own token starts the approval; it is never the credential.
+    let member_key = list.member_key.as_ref().expect("members bring a token");
     assert_eq!(member_key.use_as, ListMemberKeyUse::AccountApp);
     assert_eq!(
         member_key.help_url.as_deref(),
         Some("https://www.themoviedb.org/settings/api")
     );
     assert_eq!(list.allowed_hosts, vec!["api.themoviedb.org".to_string()]);
-    let sources: Vec<_> = list.groups[0]
-        .items
-        .iter()
-        .map(|item| item.source_type.as_str())
-        .collect();
-    assert_eq!(sources, vec!["list", "person", "company", "keyword"]);
     // Every source a pattern produces is one the descriptor declares, and
     // every capture targets a declared parameter.
+    let items: Vec<_> = list.groups.iter().flat_map(|group| &group.items).collect();
     for pattern in &list.url_patterns {
-        let item = list.groups[0]
-            .items
+        let item = items
             .iter()
             .find(|item| item.source_type == pattern.source_type)
             .unwrap();
@@ -206,11 +187,10 @@ fn url_patterns_extract_numeric_ids_from_site_addresses() {
 #[test]
 fn list_pages_through_the_cursor_with_global_ranks() {
     let http = RecordedHttp::new()
-        .with(&url("/list/8100001?page=1"), 200, LIST_PAGE_1)
-        .with(&url("/list/8100001?page=2"), 200, LIST_PAGE_2);
+        .with(&v4("/list/8100001?page=1"), 200, LIST_PAGE_1)
+        .with(&v4("/list/8100001?page=2"), 200, LIST_PAGE_2);
     let first = ok(fetch(
         &http,
-        Some(KEY),
         request("list", &[("list_id", "8100001")], None),
     ));
     assert_eq!(first.list_name.as_deref(), Some("Fixture Picks"));
@@ -252,7 +232,6 @@ fn list_pages_through_the_cursor_with_global_ranks() {
 
     let second = ok(fetch(
         &http,
-        Some(KEY),
         request(
             "list",
             &[("list_id", "8100001")],
@@ -262,30 +241,7 @@ fn list_pages_through_the_cursor_with_global_ranks() {
     assert!(second.next_cursor.is_none());
     assert_eq!(second.items[0].rank, Some(21));
     assert_eq!(second.items[0].year, None);
-}
-
-#[test]
-fn bearer_tokens_go_in_the_header_not_the_url() {
-    // A v4 read access token reads a public list through v4, which pages
-    // with `total_pages`.
-    let http = RecordedHttp::new().with(
-        &format!("{API_V4_BASE}/list/8100001?page=1"),
-        200,
-        LIST_PAGE_1,
-    );
-    let first = ok(fetch(
-        &http,
-        Some(BEARER),
-        request("list", &[("list_id", "8100001")], None),
-    ));
-    assert_eq!(first.next_cursor.as_deref(), Some("2"));
-    let sent = &http.requests()[0];
-    assert_eq!(sent.url, format!("{API_V4_BASE}/list/8100001?page=1"));
-    assert!(!sent.url.contains("api_key"));
-    assert_eq!(
-        sent.headers.get("Authorization").map(String::as_str),
-        Some(format!("Bearer {BEARER}").as_str())
-    );
+    assert_member_call(&http.requests()[0], &v4("/list/8100001?page=1"));
 }
 
 #[test]
@@ -306,11 +262,10 @@ fn person_credits_are_filtered_sorted_and_fingerprinted() {
       }
     }"#;
     let path = "/person/4400?append_to_response=combined_credits";
-    let http = RecordedHttp::new().with(&url(path), 200, body);
+    let http = RecordedHttp::new().with(&v3(path), 200, body);
 
     let cast = ok(fetch(
         &http,
-        Some(KEY),
         request("person", &[("person_id", "4400-fixture-person")], None),
     ));
     let keys: Vec<_> = cast
@@ -331,7 +286,6 @@ fn person_credits_are_filtered_sorted_and_fingerprinted() {
 
     let all_movies = ok(fetch(
         &http,
-        Some(KEY),
         request(
             "person",
             &[("person_id", "4400"), ("credit", "all"), ("kind", "movie")],
@@ -354,9 +308,11 @@ fn person_credits_are_filtered_sorted_and_fingerprinted() {
 
     let mut again = request("person", &[("person_id", "4400")], None);
     again.since_fingerprint = cast.fingerprint.clone();
-    let unchanged = ok(fetch(&http, Some(KEY), again));
+    let unchanged = ok(fetch(&http, again));
     assert!(unchanged.unchanged);
     assert!(unchanged.items.is_empty());
+    // People are read from the v3 API, still with the member's token.
+    assert_member_call(&http.requests()[0], &v3(path));
 }
 
 #[test]
@@ -376,14 +332,13 @@ fn person_crew_narrows_to_one_department() {
       }
     }"#;
     let http = RecordedHttp::new().with(
-        &url("/person/4401?append_to_response=combined_credits"),
+        &v3("/person/4401?append_to_response=combined_credits"),
         200,
         body,
     );
     let keys = |credit: &str| -> Vec<String> {
         ok(fetch(
             &http,
-            Some(KEY),
             request("person", &[("person_id", "4401"), ("credit", credit)], None),
         ))
         .items
@@ -405,7 +360,7 @@ fn person_crew_narrows_to_one_department() {
         ],
         "crew keeps every department"
     );
-    let person = descriptor().list_provider().cloned().unwrap().groups[0].items[1].clone();
+    let person = descriptor().list_provider().cloned().unwrap().groups[1].items[1].clone();
     let credit = person
         .params
         .iter()
@@ -430,12 +385,11 @@ fn company_and_keyword_use_discover_with_a_page_cap() {
     let body = r#"{"page": 99, "total_pages": 99, "total_results": 1980,
       "results": [{"id": 990401, "name": "Fixture Company Serial", "first_air_date": "2033-01-01"}]}"#;
     let http = RecordedHttp::new()
-        .with(&url("/discover/tv?with_companies=77&sort_by=first_air_date.desc&include_adult=false&page=99"), 200, body)
-        .with(&url("/discover/movie?with_keywords=9951&sort_by=primary_release_date.desc&include_adult=false&page=1"), 200, body);
+        .with(&v3("/discover/tv?with_companies=77&sort_by=first_air_date.desc&include_adult=false&page=99"), 200, body)
+        .with(&v3("/discover/movie?with_keywords=9951&sort_by=primary_release_date.desc&include_adult=false&page=1"), 200, body);
 
     let company = ok(fetch(
         &http,
-        Some(KEY),
         request(
             "company",
             &[("company_id", "77"), ("kind", "series")],
@@ -452,7 +406,6 @@ fn company_and_keyword_use_discover_with_a_page_cap() {
 
     let keyword = ok(fetch(
         &http,
-        Some(KEY),
         request("keyword", &[("keyword_id", "9951")], None),
     ));
     assert_eq!(keyword.next_cursor.as_deref(), Some("2"));
@@ -464,18 +417,24 @@ fn company_and_keyword_use_discover_with_a_page_cap() {
         keyword.list_url.as_deref(),
         Some("https://www.themoviedb.org/keyword/9951/movie")
     );
+    assert_member_call(
+        &http.requests()[0],
+        &v3(
+            "/discover/tv?with_companies=77&sort_by=first_air_date.desc&include_adult=false&page=99",
+        ),
+    );
 }
 
 #[test]
-fn public_sources_past_the_page_cap_fail_instead_of_being_cut_short() {
+fn sources_by_id_past_the_page_cap_fail_instead_of_being_cut_short() {
     let oversized = format!(
         r#"{{"page": 1, "total_pages": {}, "total_results": 8403, "items": [], "results": []}}"#,
         MAX_PAGES + 1
     );
     let http = RecordedHttp::new()
-        .with(&url("/list/8100001?page=1"), 200, &oversized)
+        .with(&v4("/list/8100001?page=1"), 200, &oversized)
         .with(
-            &url("/discover/movie?with_keywords=9951&sort_by=primary_release_date.desc&include_adult=false&page=1"),
+            &v3("/discover/movie?with_keywords=9951&sort_by=primary_release_date.desc&include_adult=false&page=1"),
             200,
             &oversized,
         );
@@ -483,7 +442,7 @@ fn public_sources_past_the_page_cap_fail_instead_of_being_cut_short() {
         request("list", &[("list_id", "8100001")], None),
         request("keyword", &[("keyword_id", "9951")], None),
     ] {
-        let error = err(fetch(&http, Some(KEY), request));
+        let error = err(fetch(&http, request));
         assert_eq!(error.code, PluginErrorCode::Permanent);
         assert!(error.public_message.contains("1980 titles"));
     }
@@ -492,99 +451,77 @@ fn public_sources_past_the_page_cap_fail_instead_of_being_cut_short() {
 
 #[test]
 fn errors_map_to_host_failure_classes() {
-    let list = |status: u16, headers: &[(&str, &str)], body: &str| {
-        let http =
-            RecordedHttp::new().with_headers(&url("/list/8100001?page=1"), status, headers, body);
+    let person = |status: u16, headers: &[(&str, &str)], body: &str| {
+        let http = RecordedHttp::new().with_headers(
+            &v3("/person/4400?append_to_response=combined_credits"),
+            status,
+            headers,
+            body,
+        );
         err(fetch(
             &http,
-            Some(KEY),
-            request("list", &[("list_id", "8100001")], None),
+            request("person", &[("person_id", "4400")], None),
         ))
     };
-    let bad_key = list(
-        401,
-        &[],
+    // A token TMDb turns away is the member's account to reconnect.
+    for body in [
         r#"{"status_code": 7, "status_message": "Invalid API key"}"#,
-    );
-    assert_eq!(bad_key.code, PluginErrorCode::AuthFailed);
-    let bad_token = list(
-        401,
-        &[],
         r#"{"status_code": 35, "status_message": "Invalid token."}"#,
-    );
-    assert_eq!(bad_token.code, PluginErrorCode::AuthFailed);
-    let private = list(
-        401,
-        &[],
         r#"{"status_code": 3, "status_message": "Authentication failed"}"#,
-    );
-    assert_eq!(private.code, PluginErrorCode::Permanent);
-    assert!(private.public_message.contains("not found"));
-    let missing = list(404, &[], r#"{"status_code": 34}"#);
+    ] {
+        let rejected = person(401, &[], body);
+        assert_eq!(rejected.code, PluginErrorCode::AuthFailed);
+        assert_no_secrets(&rejected);
+    }
+    let missing = person(404, &[], r#"{"status_code": 34}"#);
+    assert_eq!(missing.code, PluginErrorCode::Permanent);
     assert!(missing.public_message.contains("not found"));
-    let limited = list(429, &[("Retry-After", "30")], "");
+    let limited = person(429, &[("Retry-After", "30")], "");
     assert_eq!(
         (limited.code, limited.retry_after_seconds),
         (PluginErrorCode::RateLimited, Some(30))
     );
     assert_eq!(
-        list(503, &[], "").code,
+        person(503, &[], "").code,
         PluginErrorCode::UpstreamUnavailable
     );
-    assert_eq!(list(200, &[], "not json").code, PluginErrorCode::Permanent);
+    assert_eq!(
+        person(200, &[], "not json").code,
+        PluginErrorCode::Permanent
+    );
 
     let http = RecordedHttp::new();
     assert_eq!(
         err(fetch(
             &http,
-            None,
-            request("list", &[("list_id", "1")], None)
-        ))
-        .code,
-        PluginErrorCode::InvalidConfig
-    );
-    assert_eq!(
-        err(fetch(
-            &http,
-            Some(KEY),
             request("list", &[("list_id", "fixture")], None)
         ))
         .code,
         PluginErrorCode::InvalidConfig
     );
     assert_eq!(
-        err(fetch(&http, Some(KEY), request("list", &[], None))).code,
+        err(fetch(&http, request("list", &[], None))).code,
         PluginErrorCode::InvalidConfig
     );
     assert_eq!(
-        err(fetch(&http, Some(KEY), request("collection", &[], None))).code,
+        err(fetch(&http, request("collection", &[], None))).code,
         PluginErrorCode::Unsupported
     );
     assert!(http.urls().is_empty());
 }
 
 #[test]
-fn health_reports_key_state() {
-    let health = |http: &RecordedHttp, key: Option<&str>| match block_on(run(
-        http,
-        key,
+fn health_has_no_server_key_to_check() {
+    let http = RecordedHttp::new();
+    let health = match block_on(run(
+        &http,
         PluginListCommand::Health(ListPluginHealthRequest {}),
     )) {
         PluginListCommandResult::Health(result) => result,
         other => panic!("unexpected {other:?}"),
     };
-    let good = RecordedHttp::new().with(&url("/configuration"), 200, r#"{"images": {}}"#);
-    assert!(ok(health(&good, Some(KEY))).healthy);
-    let bad = RecordedHttp::new().with(&url("/configuration"), 401, r#"{"status_code": 7}"#);
-    let unhealthy = ok(health(&bad, Some(KEY)));
-    assert!(!unhealthy.healthy);
-    assert!(unhealthy.message.is_some());
-    assert!(!ok(health(&RecordedHttp::new(), None)).healthy);
-    let down = RecordedHttp::new().with(&url("/configuration"), 502, "");
-    assert_eq!(
-        err(health(&down, Some(KEY))).code,
-        PluginErrorCode::UpstreamUnavailable
-    );
+    assert_eq!(err(health).code, PluginErrorCode::Unsupported);
+    assert!(http.urls().is_empty());
 }
 
 const MEMBER_TOKEN: &str = "eyJhbGciOiJIUzI1NiJ9.eyJtZW1iZXIiOnRydWV9.bWVtYmVyc2lnbg";
@@ -607,24 +544,12 @@ fn account_url(path_and_query: &str) -> String {
     v4(&format!("/account/{ACCOUNT_ID}{path_and_query}"))
 }
 
-fn personal_request(
-    source_type: &str,
-    params: &[(&str, &str)],
-    cursor: Option<&str>,
-) -> ListPluginFetchRequest {
-    ListPluginFetchRequest {
-        credential: Some(member()),
-        ..request(source_type, params, cursor)
-    }
-}
-
 fn account(
     http: &RecordedHttp,
     credential: ListCredential,
 ) -> PluginResult<ListPluginAccountResponse> {
     match block_on(run(
         http,
-        Some(KEY),
         PluginListCommand::Account(ListPluginAccountRequest { credential }),
     )) {
         PluginListCommandResult::Account(result) => result,
@@ -632,8 +557,8 @@ fn account(
     }
 }
 
-/// A member call goes to the v4 API with the member's token as the bearer,
-/// and neither the token nor the server key appears anywhere else.
+/// A member call carries the member's token as the bearer and nowhere else,
+/// and no key rides in the address.
 fn assert_member_call(sent: &PluginHttpRequest, expected_url: &str) {
     assert_eq!(sent.url, expected_url);
     assert_eq!(
@@ -641,35 +566,40 @@ fn assert_member_call(sent: &PluginHttpRequest, expected_url: &str) {
         Some(format!("Bearer {MEMBER_TOKEN}").as_str())
     );
     assert!(!sent.url.contains(MEMBER_TOKEN));
-    assert!(!sent.url.contains("api_key") && !sent.url.contains(KEY));
-    for value in sent.headers.values() {
-        assert!(!value.contains(KEY) && !value.contains(BEARER));
-    }
+    assert!(!sent.url.contains("api_key"));
 }
 
 fn assert_no_secrets(error: &scryer_plugin_sdk::PluginError) {
     let rendered = serde_json::to_string(error).unwrap();
-    assert!(!rendered.contains(MEMBER_TOKEN) && !rendered.contains(KEY));
+    assert!(!rendered.contains(MEMBER_TOKEN));
 }
 
 #[test]
-fn personal_sources_form_their_own_member_group() {
+fn every_source_is_a_members_own() {
     let list = descriptor().list_provider().cloned().unwrap();
-    assert_eq!(list.groups.len(), 2);
-
-    let public = &list.groups[0];
-    assert_eq!(public.auth_badge, ListAuthBadge::ServerApiKey);
-    assert!(public.items.iter().all(|item| !item.personal));
-
-    let mine = &list.groups[1];
-    assert_eq!(mine.auth_badge, ListAuthBadge::MemberAccount);
-    let sources: Vec<_> = mine
-        .items
-        .iter()
-        .map(|item| item.source_type.as_str())
-        .collect();
+    let [mine, by_id] = &list.groups[..] else {
+        panic!("the account's sources, then the sources named by id");
+    };
+    for group in &list.groups {
+        assert_eq!(group.auth_badge, ListAuthBadge::MemberAccount);
+        for item in &group.items {
+            assert!(item.personal, "{}", item.id);
+            assert_eq!(item.default_interval_seconds, 12 * 60 * 60);
+            assert_eq!(
+                item.kinds,
+                vec![ListMediaKind::Movie, ListMediaKind::Series]
+            );
+        }
+    }
+    let sources = |group: &ListProviderGroup| -> Vec<String> {
+        group
+            .items
+            .iter()
+            .map(|item| item.source_type.clone())
+            .collect()
+    };
     assert_eq!(
-        sources,
+        sources(mine),
         vec![
             "watchlist",
             "favorites",
@@ -678,14 +608,7 @@ fn personal_sources_form_their_own_member_group() {
             "account_list"
         ]
     );
-    for item in &mine.items {
-        assert!(item.personal);
-        assert_eq!(item.default_interval_seconds, 12 * 60 * 60);
-        assert_eq!(
-            item.kinds,
-            vec![ListMediaKind::Movie, ListMediaKind::Series]
-        );
-    }
+    assert_eq!(sources(by_id), vec!["list", "person", "company", "keyword"]);
     for item in &mine.items[..4] {
         let [kind] = &item.params[..] else {
             panic!("{} takes only a media kind", item.id);
@@ -701,14 +624,8 @@ fn personal_sources_form_their_own_member_group() {
     assert!(list_id.required);
 
     assert!(list.capabilities.account);
-    assert!(!list.capabilities.requires_member_credential);
-    // A pasted address always resolves to a public source.
-    assert!(list.url_patterns.iter().all(|pattern| {
-        public
-            .items
-            .iter()
-            .any(|item| item.source_type == pattern.source_type)
-    }));
+    // The host hands this plugin no fetch without a member's credential.
+    assert!(list.capabilities.requires_member_credential);
 }
 
 #[test]
@@ -735,11 +652,7 @@ fn watchlist_pages_movies_then_shows_with_the_member_token() {
         .with(&movie_page(2), 200, movies_2)
         .with(&show_page, 200, shows_1);
 
-    let first = ok(fetch(
-        &http,
-        Some(KEY),
-        personal_request("watchlist", &[], None),
-    ));
+    let first = ok(fetch(&http, request("watchlist", &[], None)));
     let keys: Vec<_> = first
         .items
         .iter()
@@ -754,8 +667,7 @@ fn watchlist_pages_movies_then_shows_with_the_member_token() {
 
     let second = ok(fetch(
         &http,
-        Some(KEY),
-        personal_request("watchlist", &[], first.next_cursor.as_deref()),
+        request("watchlist", &[], first.next_cursor.as_deref()),
     ));
     assert_eq!(second.items[0].item_key, "tmdb:movie:990503");
     assert_eq!(second.items[0].rank, Some(21));
@@ -767,8 +679,7 @@ fn watchlist_pages_movies_then_shows_with_the_member_token() {
 
     let third = ok(fetch(
         &http,
-        Some(KEY),
-        personal_request(
+        request(
             "watchlist",
             &[("kind", "all")],
             second.next_cursor.as_deref(),
@@ -783,19 +694,6 @@ fn watchlist_pages_movies_then_shows_with_the_member_token() {
     for (request, expected) in sent.iter().zip([movie_page(1), movie_page(2), show_page]) {
         assert_member_call(request, &expected);
     }
-
-    // The server key is not needed for a member's own sources.
-    let keyless = RecordedHttp::new().with(&movie_page(1), 200, movies_1);
-    assert_eq!(
-        ok(fetch(
-            &keyless,
-            None,
-            personal_request("watchlist", &[], None)
-        ))
-        .items
-        .len(),
-        2
-    );
 }
 
 #[test]
@@ -814,8 +712,7 @@ fn favorites_page_one_kind_by_number() {
 
     let first = ok(fetch(
         &http,
-        None,
-        personal_request("favorites", &[("kind", "series")], None),
+        request("favorites", &[("kind", "series")], None),
     ));
     assert_eq!(
         first.items[0].item_key, "tmdb:series:990611",
@@ -826,8 +723,7 @@ fn favorites_page_one_kind_by_number() {
 
     let last = ok(fetch(
         &http,
-        None,
-        personal_request("favorites", &[("kind", "series")], Some("99")),
+        request("favorites", &[("kind", "series")], Some("99")),
     ));
     assert!(
         last.next_cursor.is_none(),
@@ -845,8 +741,7 @@ fn favorites_page_one_kind_by_number() {
     let too_long = RecordedHttp::new().with(&page(1), 200, &oversized(MAX_PAGES + 1));
     let error = err(fetch(
         &too_long,
-        None,
-        personal_request("favorites", &[("kind", "series")], None),
+        request("favorites", &[("kind", "series")], None),
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(error.public_message.contains("1980 titles"));
@@ -856,11 +751,7 @@ fn favorites_page_one_kind_by_number() {
         200,
         &oversized(MAX_PAGES / 2 + 1),
     );
-    let error = err(fetch(
-        &too_long_for_half,
-        None,
-        personal_request("favorites", &[], None),
-    ));
+    let error = err(fetch(&too_long_for_half, request("favorites", &[], None)));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(
         error.public_message.contains("980 movies")
@@ -875,11 +766,7 @@ fn favorites_page_one_kind_by_number() {
         200,
         r#"{"page": 1, "total_pages": 0, "total_results": 0, "results": []}"#,
     );
-    let none = ok(fetch(
-        &empty,
-        None,
-        personal_request("favorites", &[], None),
-    ));
+    let none = ok(fetch(&empty, request("favorites", &[], None)));
     assert!(none.items.is_empty());
     assert_eq!(none.next_cursor.as_deref(), Some("series:1:0"));
 }
@@ -896,18 +783,13 @@ fn rated_sorts_newest_first_and_recommendations_take_tmdbs_order() {
         .with(&rated, 200, page)
         .with(&recommended, 200, page);
 
-    let shows = ok(fetch(
-        &http,
-        None,
-        personal_request("rated", &[("kind", "series")], None),
-    ));
+    let shows = ok(fetch(&http, request("rated", &[("kind", "series")], None)));
     assert_eq!(shows.items[0].item_key, "tmdb:series:990701");
     assert!(shows.next_cursor.is_none());
 
     let movies = ok(fetch(
         &http,
-        None,
-        personal_request("recommendations", &[("kind", "movie")], None),
+        request("recommendations", &[("kind", "movie")], None),
     ));
     assert_eq!(movies.items[0].item_key, "tmdb:movie:990701");
 
@@ -926,16 +808,11 @@ fn account_list_reads_the_members_list_with_their_token() {
         {"id": 990202, "media_type": "tv", "name": "Fixture Serial Beta", "first_air_date": "2029-10-01"}
       ]
     }"#;
-    let http = RecordedHttp::new()
-        .with(&v4("/list/8200001?page=1"), 200, body)
-        .with(&url("/list/8100001?page=1"), 200, LIST_PAGE_1);
+    let http = RecordedHttp::new().with(&v4("/list/8200001?page=1"), 200, body);
 
-    // The server key here is itself a bearer token; it still never stands in
-    // for the member's.
     let mine = ok(fetch(
         &http,
-        Some(BEARER),
-        personal_request("account_list", &[("list_id", "8200001")], None),
+        request("account_list", &[("list_id", "8200001")], None),
     ));
     assert_member_call(&http.requests()[0], &v4("/list/8200001?page=1"));
     assert_eq!(mine.list_name.as_deref(), Some("Fixture Private Shelf"));
@@ -946,12 +823,12 @@ fn account_list_reads_the_members_list_with_their_token() {
     assert_eq!(mine.total_hint, Some(2));
     assert!(mine.next_cursor.is_none());
 
-    // The same titles get the same keys as on a public list.
-    let public = ok(fetch(
+    // A list followed by its id is the same read.
+    let by_id = ok(fetch(
         &http,
-        Some(KEY),
-        request("list", &[("list_id", "8100001")], None),
+        request("list", &[("list_id", "8200001")], None),
     ));
+    assert_member_call(&http.requests()[1], &v4("/list/8200001?page=1"));
     let keys = |response: &scryer_plugin_sdk::ListPluginFetchResponse| {
         response
             .items
@@ -959,52 +836,7 @@ fn account_list_reads_the_members_list_with_their_token() {
             .map(|item| item.item_key.clone())
             .collect::<Vec<_>>()
     };
-    assert_eq!(keys(&mine), keys(&public));
-}
-
-#[test]
-fn public_sources_ignore_a_member_credential() {
-    let http = RecordedHttp::new()
-        .with(&url("/list/8100001?page=1"), 200, LIST_PAGE_1)
-        .with(
-            &format!("{API_V4_BASE}/list/8100001?page=1"),
-            200,
-            LIST_PAGE_1,
-        );
-    let with_member = |key| {
-        let mut public = request("list", &[("list_id", "8100001")], None);
-        public.credential = Some(member());
-        ok(fetch(&http, Some(key), public));
-    };
-
-    with_member(KEY);
-    with_member(BEARER);
-    let sent = http.requests();
-    assert_eq!(sent[0].url, url("/list/8100001?page=1"));
-    assert!(!sent[0].headers.contains_key("Authorization"));
-    assert_eq!(
-        sent[1].headers.get("Authorization").map(String::as_str),
-        Some(format!("Bearer {BEARER}").as_str())
-    );
-    for request in &sent {
-        assert!(request.url.starts_with("https://api.themoviedb.org/"));
-        assert!(!request.url.contains(MEMBER_TOKEN));
-        assert!(
-            request
-                .headers
-                .values()
-                .all(|value| !value.contains(MEMBER_TOKEN))
-        );
-    }
-
-    // Without a server key a public source still fails as unconfigured,
-    // whatever the member has linked.
-    let mut keyless = request("list", &[("list_id", "8100001")], None);
-    keyless.credential = Some(member());
-    assert_eq!(
-        err(fetch(&RecordedHttp::new(), None, keyless)).code,
-        PluginErrorCode::InvalidConfig
-    );
+    assert_eq!(keys(&mine), keys(&by_id));
 }
 
 #[test]
@@ -1106,23 +938,18 @@ fn a_rejected_member_token_is_an_expired_account() {
             headers,
             body,
         );
-        err(fetch(
-            &http,
-            Some(KEY),
-            personal_request("watchlist", &[], None),
-        ))
+        err(fetch(&http, request("watchlist", &[], None)))
     };
     let own_list = |status: u16, body: &str| {
         let http = RecordedHttp::new().with(&v4("/list/8200001?page=1"), status, body);
         err(fetch(
             &http,
-            Some(KEY),
-            personal_request("account_list", &[("list_id", "8200001")], None),
+            request("account_list", &[("list_id", "8200001")], None),
         ))
     };
 
-    // Unlike a public source, where code 3 means a private resource, any 401
-    // on the member's own account means the link no longer works.
+    // Any 401 on the member's own account means the link no longer works,
+    // whatever code TMDb gives it.
     let mut errors = vec![
         watchlist(
             401,
@@ -1167,18 +994,22 @@ fn a_rejected_member_token_is_an_expired_account() {
 }
 
 #[test]
-fn personal_sources_need_a_linked_account() {
+fn every_source_needs_a_linked_account() {
     let http = RecordedHttp::new();
     let personal_with =
         |source: &str, params: &[(&str, &str)], credential: Option<ListCredential>| {
             let mut request = request(source, params, None);
             request.credential = credential;
-            err(fetch(&http, Some(KEY), request))
+            err(fetch(&http, request))
         };
     let cases = [
         ("watchlist", &[][..]),
         ("favorites", &[("kind", "movie")][..]),
         ("account_list", &[("list_id", "8200001")][..]),
+        ("list", &[("list_id", "8100001")][..]),
+        ("person", &[("person_id", "4400")][..]),
+        ("company", &[("company_id", "77")][..]),
+        ("keyword", &[("keyword_id", "9951")][..]),
     ];
     for (source, params) in cases {
         for credential in [
@@ -1234,25 +1065,20 @@ fn both_kind_cursors_are_validated() {
         "series:1:-1",
         "2",
     ] {
-        let error = err(fetch(
-            &http,
-            None,
-            personal_request("watchlist", &[], Some(cursor)),
-        ));
+        let error = err(fetch(&http, request("watchlist", &[], Some(cursor))));
         assert_eq!(error.code, PluginErrorCode::Permanent, "{cursor}");
     }
     let error = err(fetch(
         &http,
-        None,
-        personal_request("favorites", &[("kind", "movie")], Some("series:1:0")),
+        request("favorites", &[("kind", "movie")], Some("series:1:0")),
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(http.urls().is_empty());
 }
 
-/// A v3 list page without `total_pages`, holding `count` movies whose ids
-/// start at `first_id`, with `item_count` when given.
-fn v3_list_page(first_id: u32, count: u32, item_count: Option<u32>) -> String {
+/// A list page without `total_pages`, holding `count` movies whose ids start
+/// at `first_id`, with `item_count` when given.
+fn untotalled_list_page(first_id: u32, count: u32, item_count: Option<u32>) -> String {
     let items: Vec<String> = (first_id..first_id + count)
         .map(|id| {
             format!(
@@ -1264,31 +1090,26 @@ fn v3_list_page(first_id: u32, count: u32, item_count: Option<u32>) -> String {
         .map(|count| format!(r#""item_count": {count}, "#))
         .unwrap_or_default();
     format!(
-        r#"{{"id": 8100002, "name": "Fixture Untotalled", {count_field}"items": [{}]}}"#,
+        r#"{{"id": 8100002, "name": "Fixture Untotalled", {count_field}"results": [{}]}}"#,
         items.join(",")
     )
 }
 
 #[test]
-fn a_v3_list_without_total_pages_pages_by_its_item_count() {
+fn a_list_without_total_pages_pages_by_its_item_count() {
     let http = RecordedHttp::new()
         .with(
-            &url("/list/8100002?page=1"),
+            &v4("/list/8100002?page=1"),
             200,
-            &v3_list_page(990800, 20, Some(23)),
+            &untotalled_list_page(990800, 20, Some(23)),
         )
         .with(
-            &url("/list/8100002?page=2"),
+            &v4("/list/8100002?page=2"),
             200,
-            &v3_list_page(990820, 3, Some(23)),
+            &untotalled_list_page(990820, 3, Some(23)),
         );
-    let list = |cursor: Option<&str>| {
-        fetch(
-            &http,
-            Some(KEY),
-            request("list", &[("list_id", "8100002")], cursor),
-        )
-    };
+    let list =
+        |cursor: Option<&str>| fetch(&http, request("list", &[("list_id", "8100002")], cursor));
     let first = ok(list(None));
     assert_eq!(
         first.next_cursor.as_deref(),
@@ -1303,13 +1124,12 @@ fn a_v3_list_without_total_pages_pages_by_its_item_count() {
 
     // A list served whole on its first page ends there.
     let whole = RecordedHttp::new().with(
-        &url("/list/8100002?page=1"),
+        &v4("/list/8100002?page=1"),
         200,
-        &v3_list_page(990800, 23, Some(23)),
+        &untotalled_list_page(990800, 23, Some(23)),
     );
     let response = ok(fetch(
         &whole,
-        Some(KEY),
         request("list", &[("list_id", "8100002")], None),
     ));
     assert!(response.next_cursor.is_none());
@@ -1317,13 +1137,12 @@ fn a_v3_list_without_total_pages_pages_by_its_item_count() {
 
     // A short list with no count at all is a single page.
     let short = RecordedHttp::new().with(
-        &url("/list/8100002?page=1"),
+        &v4("/list/8100002?page=1"),
         200,
-        &v3_list_page(990800, 4, None),
+        &untotalled_list_page(990800, 4, None),
     );
     let response = ok(fetch(
         &short,
-        Some(KEY),
         request("list", &[("list_id", "8100002")], None),
     ));
     assert!(response.next_cursor.is_none());
@@ -1331,13 +1150,11 @@ fn a_v3_list_without_total_pages_pages_by_its_item_count() {
 }
 
 #[test]
-fn a_v3_list_that_cannot_vouch_for_its_end_fails() {
+fn a_list_that_cannot_vouch_for_its_end_fails() {
     let fails = |cursor: Option<&str>, page: u32, body: String| {
-        let http =
-            RecordedHttp::new().with(&url(&format!("/list/8100002?page={page}")), 200, &body);
+        let http = RecordedHttp::new().with(&v4(&format!("/list/8100002?page={page}")), 200, &body);
         let error = err(fetch(
             &http,
-            Some(KEY),
             request("list", &[("list_id", "8100002")], cursor),
         ));
         assert_eq!(error.code, PluginErrorCode::Permanent);
@@ -1349,11 +1166,15 @@ fn a_v3_list_that_cannot_vouch_for_its_end_fails() {
         error
     };
     // An empty page before every item was read.
-    fails(Some("2"), 2, v3_list_page(990820, 0, Some(23)));
+    fails(Some("2"), 2, untotalled_list_page(990820, 0, Some(23)));
     // A full page with no count may have more behind it.
-    fails(None, 1, v3_list_page(990800, 20, None));
+    fails(None, 1, untotalled_list_page(990800, 20, None));
     // A count past the cap fails on the first page.
-    let error = fails(None, 1, v3_list_page(990800, 20, Some(MAX_PAGES * 20 + 1)));
+    let error = fails(
+        None,
+        1,
+        untotalled_list_page(990800, 20, Some(MAX_PAGES * 20 + 1)),
+    );
     assert!(error.public_message.contains("1980 titles"));
 }
 
@@ -1365,17 +1186,17 @@ fn cursors_past_the_page_cap_are_never_sent() {
         request("list", &[("list_id", "8100001")], Some(&past)),
         request("company", &[("company_id", "77")], Some(&past)),
         request("keyword", &[("keyword_id", "9951")], Some(&past)),
-        personal_request("favorites", &[("kind", "movie")], Some(&past)),
-        personal_request("account_list", &[("list_id", "8200001")], Some(&past)),
-        personal_request(
+        request("favorites", &[("kind", "movie")], Some(&past)),
+        request("account_list", &[("list_id", "8200001")], Some(&past)),
+        request(
             "watchlist",
             &[],
             Some(&format!("series:{}:0", MAX_PAGES / 2 + 1)),
         ),
-        personal_request("watchlist", &[], Some("movie:4294967295:4294967295")),
+        request("watchlist", &[], Some("movie:4294967295:4294967295")),
     ] {
         let source = request.source_type.clone();
-        let error = err(fetch(&http, Some(KEY), request));
+        let error = err(fetch(&http, request));
         assert_eq!(error.code, PluginErrorCode::Permanent, "{source}");
     }
     assert!(http.urls().is_empty());
@@ -1393,8 +1214,7 @@ fn cursors_past_the_page_cap_are_never_sent() {
     );
     let response = ok(fetch(
         &http,
-        None,
-        personal_request(
+        request(
             "watchlist",
             &[],
             Some(&format!("series:{}:4294967290", MAX_PAGES / 2)),
@@ -1419,8 +1239,7 @@ fn recommendations_past_the_page_cap_fail_instead_of_being_cut_short() {
     let http = RecordedHttp::new().with(&at_cap_url, 200, &at_cap);
     let response = ok(fetch(
         &http,
-        None,
-        personal_request("recommendations", &[("kind", "movie")], None),
+        request("recommendations", &[("kind", "movie")], None),
     ));
     assert_eq!(response.next_cursor.as_deref(), Some("2"));
 
@@ -1428,19 +1247,14 @@ fn recommendations_past_the_page_cap_fail_instead_of_being_cut_short() {
     let http = RecordedHttp::new().with(&past_url, 200, &past);
     let error = err(fetch(
         &http,
-        None,
-        personal_request("recommendations", &[("kind", "movie")], None),
+        request("recommendations", &[("kind", "movie")], None),
     ));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(error.public_message.contains("1980 titles"));
 
     let (half_url, half) = page("movie", MAX_PAGES / 2 + 1);
     let http = RecordedHttp::new().with(&half_url, 200, &half);
-    let error = err(fetch(
-        &http,
-        None,
-        personal_request("recommendations", &[], None),
-    ));
+    let error = err(fetch(&http, request("recommendations", &[], None)));
     assert_eq!(error.code, PluginErrorCode::Permanent);
     assert!(error.public_message.contains("980 movies"));
 }
@@ -1461,11 +1275,7 @@ fn a_refused_or_missing_account_collection_never_reads_as_gone() {
             (410, PluginErrorCode::Permanent),
         ] {
             let http = RecordedHttp::new().with(address, status, r#"{"status_code": 34}"#);
-            let error = err(fetch(
-                &http,
-                None,
-                personal_request(source, &[("kind", "movie")], None),
-            ));
+            let error = err(fetch(&http, request(source, &[("kind", "movie")], None)));
             assert_eq!(error.code, code, "{source} {status}");
             assert!(
                 !error.public_message.contains("not found"),

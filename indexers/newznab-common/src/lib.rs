@@ -2182,6 +2182,9 @@ fn looks_like_context_token(token: &str) -> bool {
     }
 
     let upper = trimmed.to_ascii_uppercase();
+    if let Some(rest) = upper.strip_prefix('E') {
+        return !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit());
+    }
     if let Some(rest) = upper.strip_prefix('S') {
         if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
             return true;
@@ -2405,7 +2408,9 @@ async fn execute_tiered_search(
         .await?;
 
         last_response = Some((status, body.clone()));
-        if !search_response_needs_fallback(status, &body) {
+        if !search_response_needs_fallback(status, &body)
+            && !movie_response_has_only_conflicts(status, &body, search_type, requested_ids)
+        {
             return Ok((status, body));
         }
     }
@@ -3140,19 +3145,32 @@ fn append_additional_query_pairs(url: &mut Url, additional_params: &str) {
 
 /// Discard explicit movie identity conflicts, while retaining releases without IDs.
 pub fn retain_movie_identity_matches(response: &mut SearchResponse, req: &SearchRequest) {
-    let is_movie = req.facet.as_deref() == Some("movie")
-        || req.category.as_deref() == Some("movie")
-        || req
-            .context
-            .as_ref()
-            .is_some_and(|context| matches!(context.subject_kind, PluginSearchSubjectKind::Movie));
-    if !is_movie {
+    let id = |key: &str| req.ids.get(key).map(|v| v.trim()).filter(|v| !v.is_empty());
+    let shape = determine_nab_search_shape(
+        req,
+        NabSearchShapeHints {
+            categories: &req.categories,
+            facet: req.facet.as_deref(),
+            category: req.category.as_deref(),
+            imdb_id: id("imdb_id"),
+            tvdb_id: id("tvdb_id"),
+            tvrage_id: id("tvrage_id"),
+            tvmaze_id: id("tvmaze_id"),
+        },
+    );
+    if shape != NabSearchShape::Movie {
         return;
     }
-    response.results.retain(|result| {
-        ["imdb_id", "tmdb_id"].iter().all(|key| {
-            let (Some(requested), Some(returned)) =
-                (req.ids.get(*key), result.external_ids.get(*key))
+    response
+        .results
+        .retain(|result| movie_identity_matches(result, id("imdb_id"), id("tmdb_id")));
+}
+
+fn movie_identity_matches(result: &SearchResult, imdb: Option<&str>, tmdb: Option<&str>) -> bool {
+    [("imdb_id", imdb), ("tmdb_id", tmdb)]
+        .iter()
+        .all(|(key, requested)| {
+            let (Some(requested), Some(returned)) = (requested, result.external_ids.get(*key))
             else {
                 return true;
             };
@@ -3162,7 +3180,35 @@ pub fn retain_movie_identity_matches(response: &mut SearchResponse, req: &Search
             let returned = returned.trim_start_matches('0');
             requested.is_empty() || returned.is_empty() || requested == returned
         })
-    });
+}
+
+fn movie_response_has_only_conflicts(
+    status: u16,
+    body: &str,
+    search_type: &str,
+    ids: NabSearchIds<'_>,
+) -> bool {
+    if search_type != "movie"
+        || !is_success_status(status)
+        || parse_error_xml(body).is_some()
+        || parse_error_json(body).is_some()
+    {
+        return false;
+    }
+    // Parse the whole feed: a match beyond the requested page size still counts.
+    // Leave malformed responses to the normal error path rather than masking them.
+    parse_newznab_feed(
+        body,
+        body.trim_start().starts_with('<'),
+        usize::MAX,
+        extract_base_metadata,
+    )
+    .is_ok_and(|(results, _, _)| {
+        !results.is_empty()
+            && results
+                .iter()
+                .all(|result| !movie_identity_matches(result, ids.imdb, ids.tmdb))
+    })
 }
 
 fn normalize_imdbid_param(raw: &str) -> String {
@@ -8375,5 +8421,99 @@ mod fallback_error_regressions {
             200,
             r#"{"channel":{"item":{"title":"1917"}}}"#
         ));
+    }
+}
+
+#[cfg(test)]
+mod review_regressions {
+    use super::*;
+
+    #[test]
+    fn split_episode_suffix_preserves_numeric_titles() {
+        for query in [
+            "Example Show S01 E02",
+            "Example Show S01E02",
+            "Example Show E02",
+        ] {
+            assert_eq!(build_query_variants(query), vec!["Example Show"]);
+        }
+        assert_eq!(build_query_variants("The 100 S01 E02"), vec!["The 100"]);
+        for title in ["1917", "E02", "S01 E02", "E"] {
+            assert_eq!(build_query_variants(title), vec![title]);
+        }
+    }
+
+    #[test]
+    fn legacy_movie_shapes_filter_conflicts_but_tv_does_not() {
+        for category in [None, Some("2000"), Some("2040"), Some("5000")] {
+            let mut req = SearchRequest::default();
+            req.ids.insert("imdb_id".into(), "tt8579674".into());
+            if let Some(category) = category {
+                req.categories.push(category.into());
+            }
+            let mut result = SearchResult::default();
+            result
+                .external_ids
+                .insert("imdb_id".into(), "0000001".into());
+            let mut response = SearchResponse::default();
+            response.results.push(result);
+            retain_movie_identity_matches(&mut response, &req);
+            assert_eq!(
+                response.results.len(),
+                usize::from(category == Some("5000"))
+            );
+        }
+        let mut req = SearchRequest::default();
+        req.categories.push("2040".into());
+        req.ids.insert("tmdb_id".into(), "530915".into());
+        let mut result = SearchResult::default();
+        result.external_ids.insert("tmdb_id".into(), "1".into());
+        let mut response = SearchResponse::default();
+        response.results.push(result);
+        retain_movie_identity_matches(&mut response, &req);
+        assert!(response.results.is_empty());
+    }
+
+    fn movie_feed(ids: &[Option<&str>]) -> String {
+        let items: String = ids.iter().map(|id| {
+            let attr = id.map(|id| format!(r#"<newznab:attr name="imdb" value="{id}"/>"#)).unwrap_or_default();
+            format!(r#"<item><title>Example</title><guid>release</guid><link>https://example.test/get</link>{attr}</item>"#)
+        }).collect();
+        format!(
+            r#"<rss xmlns:newznab="http://www.newznab.com/DTD/2010/feeds/attributes/"><channel>{items}</channel></rss>"#
+        )
+    }
+
+    #[test]
+    fn conflicting_movie_feed_triggers_fallback_only_when_all_items_conflict() {
+        let ids = NabSearchIds {
+            imdb: Some("tt8579674"),
+            ..Default::default()
+        };
+        let conflict = movie_feed(&[Some("1"), Some("2")]);
+        assert!(movie_response_has_only_conflicts(
+            200, &conflict, "movie", ids
+        ));
+        for feed in [
+            movie_feed(&[Some("1"), Some("8579674")]),
+            movie_feed(&[Some("1"), None]),
+            movie_feed(&[Some("0")]),
+        ] {
+            assert!(!movie_response_has_only_conflicts(200, &feed, "movie", ids));
+        }
+        for status in [401, 429, 500] {
+            assert!(!movie_response_has_only_conflicts(
+                status, &conflict, "movie", ids
+            ));
+        }
+        assert!(!movie_response_has_only_conflicts(
+            200, &conflict, "tvsearch", ids
+        ));
+        for body in [
+            "<rss>",
+            r#"<error code="100" description="Invalid API key"/>"#,
+        ] {
+            assert!(!movie_response_has_only_conflicts(200, body, "movie", ids));
+        }
     }
 }

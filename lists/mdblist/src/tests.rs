@@ -241,6 +241,25 @@ fn a_members_list_reads_the_items_endpoint_and_pages_on_has_more() {
 }
 
 #[test]
+fn a_members_list_past_the_page_cap_fails_instead_of_being_cut_short() {
+    let last = PAGE_LIMIT * MAX_PAGES - 2;
+    let cursor = last.to_string();
+    let http = RecordedHttp::new().with_headers(
+        &member_url("/lists/5101/items", last),
+        200,
+        &[("X-Has-More", "true")],
+        API_JSON,
+    );
+    let error = block_on(fetch(
+        &http,
+        &member_request(SOURCE_MY_LIST, &[(PARAM_LIST_ID, "5101")], Some(&cursor)),
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, PluginErrorCode::Permanent);
+    assert!(!error.public_message.contains("not found"));
+}
+
+#[test]
 fn a_numeric_id_on_the_public_source_is_refused() {
     // A list by its id is read with a member's key, so it is theirs to follow.
     let http = RecordedHttp::new();
@@ -268,8 +287,10 @@ fn errors_map_to_host_failure_classes() {
         with_key(401, &[], r#"{"error":"Invalid API key"}"#).code,
         PluginErrorCode::AuthFailed
     );
+    // A refusal on a member's own list is their key, and the list is not gone.
     let denied = with_key(403, &[], r#"{"error":"Permission denied"}"#);
-    assert!(denied.public_message.contains("not found"));
+    assert_eq!(denied.code, PluginErrorCode::AuthFailed);
+    assert!(!denied.public_message.contains("not found"));
     let missing = with_key(404, &[], r#"{"error":"Not found"}"#);
     assert_eq!(missing.code, PluginErrorCode::Permanent);
     assert!(missing.public_message.contains("not found"));

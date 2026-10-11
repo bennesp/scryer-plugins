@@ -225,15 +225,25 @@ fn member_key(credential: Option<&ListCredential>) -> Result<&str, PluginError> 
         .ok_or_else(|| auth_failed("this list needs a linked MDBList account"))
 }
 
-/// A member's own read. MDBList answers a key it does not accept with 401 or
-/// 403, and neither a refusal nor a 404 says the member's watchlist or list
-/// index is gone.
+/// MDBList answers a key it does not accept with 401 or 403. On a member's
+/// own read that is the key, never the thing being read.
+fn check_member_key(
+    response: &scryer_plugin_sdk::host::PluginHttpResponse,
+) -> Result<(), PluginError> {
+    match response.status {
+        401 | 403 => Err(auth_failed("MDBList did not accept the API key")),
+        _ => Ok(()),
+    }
+}
+
+/// A member's own account, watchlist or list index. Neither a refused key nor
+/// a 404 says one of those is gone.
 fn check_member_status(
     response: &scryer_plugin_sdk::host::PluginHttpResponse,
     what: &str,
 ) -> Result<(), PluginError> {
+    check_member_key(response)?;
     match response.status {
-        401 | 403 => Err(auth_failed("MDBList did not accept the API key")),
         404 | 410 => Err(permanent(format!(
             "MDBList has no {what} for this account (HTTP {})",
             response.status
@@ -504,6 +514,7 @@ async fn fetch_api<H: ListHttp>(
         encode_component(key)
     );
     let response = http.send(get(url, USER_AGENT, ACCEPT)).await?;
+    check_member_key(&response)?;
     check_status(&response, Access::ServerKey, &what(list))?;
     let body = json_body(&response)?;
     let raw_count = count_entries(&body);
@@ -512,7 +523,6 @@ async fn fetch_api<H: ListHttp>(
         .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
         && raw_count > 0;
     let next_offset = offset.saturating_add(raw_count as u32);
-    let within_cap = next_offset < PAGE_LIMIT * MAX_PAGES;
 
     if offset == 0 && !has_more {
         return Ok(single_page(
@@ -522,6 +532,14 @@ async fn fetch_api<H: ListHttp>(
             request.since_fingerprint.as_deref(),
         ));
     }
+    if has_more && next_offset >= PAGE_LIMIT * MAX_PAGES {
+        // Stopping here would read every later title as having left.
+        return Err(permanent(format!(
+            "{} is longer than the {} titles Scryer follows",
+            what(list),
+            PAGE_LIMIT * MAX_PAGES
+        )));
+    }
     // Ranks continue across pages when MDBList gives none of its own.
     for item in &mut items {
         if let Some(rank) = item.rank.as_mut() {
@@ -530,7 +548,7 @@ async fn fetch_api<H: ListHttp>(
     }
     Ok(ListPluginFetchResponse {
         items,
-        next_cursor: (has_more && within_cap).then(|| next_offset.to_string()),
+        next_cursor: has_more.then(|| next_offset.to_string()),
         list_name: None,
         list_url: site_url(list),
         total_hint: header(&response, "x-total-items").and_then(|value| value.trim().parse().ok()),

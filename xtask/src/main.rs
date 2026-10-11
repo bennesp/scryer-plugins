@@ -3649,10 +3649,16 @@ fn select_built_wasm(
 /// is simply not a valid plugin artifact and gets a hard error naming the
 /// section it lacks.
 fn load_descriptor_from_wasm(wasm_path: &Path) -> Result<PluginDescriptor> {
+    Ok(describe_plugin_wasm(wasm_path)?.descriptor)
+}
+
+/// [`load_descriptor_from_wasm`], keeping the document the plugin wrote beside
+/// the typed view of it.
+fn describe_plugin_wasm(wasm_path: &Path) -> Result<component_descriptor::DescribedPlugin> {
     let bytes =
         fs::read(wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
-    if let Some(descriptor) = component_descriptor::descriptor_from_component(&bytes)? {
-        return Ok(descriptor);
+    if let Some(described) = component_descriptor::describe_component(&bytes)? {
+        return Ok(described);
     }
 
     bail!(
@@ -3704,9 +3710,11 @@ fn run_plugin_validate(ctx: &TaskContext, args: PluginValidateArgs) -> Result<()
     let mut descriptor_json = None;
     for feature_set in &manifest_metadata.feature_sets {
         let wasm_path = build_plugin_wasm(ctx, &plugin_dir, feature_set)?;
-        let current_descriptor = load_descriptor_from_wasm(&wasm_path)?;
+        let component_descriptor::DescribedPlugin {
+            descriptor: current_descriptor,
+            document: current_descriptor_json,
+        } = describe_plugin_wasm(&wasm_path)?;
         validate_descriptor_contract(&current_descriptor)?;
-        let current_descriptor_json = serde_json::to_string(&current_descriptor)?;
         if let Some(expected_json) = &descriptor_json {
             if expected_json != &current_descriptor_json {
                 bail!(
@@ -4669,9 +4677,12 @@ core-module packaging path left",
             .arg(&optimized),
     )?;
     run_checked(ctx.command("wasm-tools").arg("validate").arg(&optimized))?;
-    let descriptor = load_descriptor_from_wasm(&optimized)?;
+    let component_descriptor::DescribedPlugin {
+        descriptor,
+        document,
+    } = describe_plugin_wasm(&optimized)?;
     validate_descriptor_contract(&descriptor)?;
-    embed_plugin_descriptor(&optimized, &descriptor)?;
+    embed_plugin_descriptor(&optimized, &descriptor, &document)?;
     if is_component_wasm(&fs::read(&optimized)?) {
         run_checked(ctx.command("wasm-tools").arg("validate").arg(&optimized))?;
     }
@@ -4792,7 +4803,15 @@ fn is_component_wasm(wasm: &[u8]) -> bool {
     wasm.starts_with(b"\0asm\r\0\x01\0")
 }
 
-fn embed_plugin_descriptor(wasm_path: &Path, descriptor: &PluginDescriptor) -> Result<()> {
+/// Embed the descriptor `document` a plugin's own `describe` returned.
+///
+/// The host reads this section in preference to calling `describe`, so it has
+/// to say everything the plugin said. `descriptor` only names the family here.
+fn embed_plugin_descriptor(
+    wasm_path: &Path,
+    descriptor: &PluginDescriptor,
+    document: &[u8],
+) -> Result<()> {
     let wasm =
         fs::read(wasm_path).with_context(|| format!("failed to read {}", wasm_path.display()))?;
     // Older Scryer hosts classify an artifact by scanning its bytes for the raw
@@ -4808,7 +4827,7 @@ fn embed_plugin_descriptor(wasm_path: &Path, descriptor: &PluginDescriptor) -> R
         );
     }
 
-    let descriptor_json = serialize_embedded_descriptor(descriptor)?;
+    let descriptor_json = embedded_descriptor_payload(document)?;
     let embedded = append_plugin_descriptor_custom_section(&wasm, &descriptor_json)?;
     if guard_legacy_describe_marker && contains_legacy_describe_marker(&embedded) {
         bail!(
@@ -4820,10 +4839,13 @@ fn embed_plugin_descriptor(wasm_path: &Path, descriptor: &PluginDescriptor) -> R
         .with_context(|| format!("failed to embed descriptor in {}", wasm_path.display()))
 }
 
-fn serialize_embedded_descriptor<T: Serialize>(descriptor: &T) -> Result<Vec<u8>> {
+/// The bytes of a descriptor document as the artifact carries them: the
+/// plugin's own JSON, untouched apart from escaping the legacy marker.
+fn embedded_descriptor_payload(document: &[u8]) -> Result<Vec<u8>> {
     const ESCAPED_LEGACY_DESCRIBE_MARKER: &str = r"scryer\u005fdescribe";
 
-    Ok(serde_json::to_string(descriptor)?
+    Ok(std::str::from_utf8(document)
+        .context("plugin descriptor is not UTF-8")?
         .replace(EXPORT_DESCRIBE, ESCAPED_LEGACY_DESCRIBE_MARKER)
         .into_bytes())
 }
@@ -8947,7 +8969,7 @@ mod tests {
 
     #[test]
     fn component_descriptor_reembedding_preserves_search_semantics_version() {
-        let descriptor: PluginDescriptor = serde_json::from_value(serde_json::json!({
+        let document = serde_json::to_vec(&serde_json::json!({
             "id": "test-indexer",
             "name": "Test Indexer",
             "version": "1.0.0",
@@ -8958,11 +8980,14 @@ mod tests {
                 "search_semantics_version": 7
             }
         }))
-        .expect("parse indexer descriptor");
+        .expect("write indexer descriptor");
+        let descriptor: PluginDescriptor =
+            serde_json::from_slice(&document).expect("parse indexer descriptor");
         let artifact = tempfile::NamedTempFile::new().expect("create component artifact");
         fs::write(artifact.path(), b"\0asm\r\0\x01\0").expect("write component artifact");
 
-        embed_plugin_descriptor(artifact.path(), &descriptor).expect("embed component descriptor");
+        embed_plugin_descriptor(artifact.path(), &descriptor, &document)
+            .expect("embed component descriptor");
         let embedded = fs::read(artifact.path()).expect("read embedded component artifact");
         let (_, payload) = descriptor_custom_section(&embedded)
             .expect("read descriptor custom section")
@@ -8975,6 +9000,44 @@ mod tests {
                 .indexer()
                 .and_then(|indexer| indexer.search_semantics_version),
             Some(7)
+        );
+    }
+
+    #[test]
+    fn an_embedded_descriptor_keeps_fields_this_tools_sdk_does_not_know() {
+        let written = serde_json::json!({
+            "id": "test-lists",
+            "name": "Test Lists",
+            "version": "1.0.0",
+            "sdk_version": "3.9.0",
+            "declared_by_a_newer_sdk": true,
+            "provider": {
+                "kind": "list_provider",
+                "provider_type": "test-lists",
+                "declared_by_a_newer_sdk": { "label": "Fixture key" }
+            }
+        });
+        let document = serde_json::to_vec(&written).expect("write list descriptor");
+        let descriptor: PluginDescriptor =
+            serde_json::from_slice(&document).expect("parse list descriptor");
+        let typed = serde_json::to_value(&descriptor).expect("write the typed view");
+        assert!(
+            typed.get("declared_by_a_newer_sdk").is_none(),
+            "the typed view is expected to lose the field: {typed}"
+        );
+        let artifact = tempfile::NamedTempFile::new().expect("create component artifact");
+        fs::write(artifact.path(), b"\0asm\r\0\x01\0").expect("write component artifact");
+
+        embed_plugin_descriptor(artifact.path(), &descriptor, &document)
+            .expect("embed component descriptor");
+        let embedded = fs::read(artifact.path()).expect("read embedded component artifact");
+        let (_, payload) = descriptor_custom_section(&embedded)
+            .expect("read descriptor custom section")
+            .expect("embedded descriptor custom section");
+
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(payload).expect("parse embedded JSON"),
+            written
         );
     }
 
@@ -8998,7 +9061,8 @@ mod tests {
         let descriptor = serde_json::json!({
             "description": "mentions scryer_describe without changing its value"
         });
-        let payload = serialize_embedded_descriptor(&descriptor).expect("serialize descriptor");
+        let document = serde_json::to_vec(&descriptor).expect("write descriptor");
+        let payload = embedded_descriptor_payload(&document).expect("escape descriptor");
         assert!(!contains_legacy_describe_marker(&payload));
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(&payload).expect("parse escaped JSON"),
@@ -9547,6 +9611,7 @@ support_tier = "verified_community"
             sdk_version: "1.5.0".to_string(),
             sdk_constraint: ">=1.5.0, <1.6.0".to_string(),
             socket_permissions: vec![],
+            settings: vec![],
             provider: ProviderDescriptor::Notification(NotificationDescriptor {
                 provider_type: "qbittorrent-test".to_string(),
                 provider_aliases: vec![],

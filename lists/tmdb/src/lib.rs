@@ -741,9 +741,11 @@ impl<H: ListHttp> Client<'_, H> {
 
     /// The identity behind a member's token and the lists they own.
     ///
-    /// TMDb's v4 API has no account-details read, so the name and avatar come
-    /// from the owner of the member's first list. A member without lists is
-    /// named by the credential's username, or else by the account id.
+    /// The name and avatar come from TMDb's account details, a v3 read the
+    /// member's token answers for its own account. Where TMDb does not serve
+    /// them, the owner of the member's first list stands in; a member named by
+    /// neither is named by the credential's username, or else by the account
+    /// id.
     async fn account(
         &self,
         credential: &ListCredential,
@@ -770,11 +772,27 @@ impl<H: ListHttp> Client<'_, H> {
             page += 1;
         }
 
-        // The owner is only a name and an avatar: a first list that cannot
-        // be read leaves the member unnamed by it rather than failing the
-        // link.
-        let owner = match owned_lists.first() {
-            Some(list) => self
+        // These are only a name and an avatar: a read that fails leaves the
+        // member unnamed by it rather than failing the link.
+        let details = self
+            .get_member_json(
+                member,
+                API_BASE,
+                "/account",
+                "TMDb account details",
+                MemberRead::Account,
+            )
+            .await
+            .ok()
+            .map(|body| MemberName {
+                username: json_text(body.get("username")),
+                name: json_text(body.get("name")),
+                avatar_path: json_text(body.pointer("/avatar/tmdb/avatar_path")),
+            })
+            .filter(|named| named.username.is_some());
+        let named = match (details, owned_lists.first()) {
+            (Some(named), _) => named,
+            (None, Some(list)) => self
                 .get_member_json(
                     member,
                     API_V4_BASE,
@@ -785,11 +803,17 @@ impl<H: ListHttp> Client<'_, H> {
                 .await
                 .ok()
                 .and_then(|body| body.get("created_by").cloned())
-                .filter(|owner| json_text(owner.get("id")).as_deref() == Some(member.account_id)),
-            None => None,
+                .filter(|owner| json_text(owner.get("id")).as_deref() == Some(member.account_id))
+                .map(|owner| MemberName {
+                    username: json_text(owner.get("username")),
+                    name: json_text(owner.get("name")),
+                    avatar_path: json_text(owner.get("avatar_path")),
+                })
+                .unwrap_or_default(),
+            (None, None) => MemberName::default(),
         };
-        let field = |key: &str| owner.as_ref().and_then(|owner| json_text(owner.get(key)));
-        let username = field("username")
+        let username = named
+            .username
             .or_else(|| {
                 credential
                     .username
@@ -802,8 +826,9 @@ impl<H: ListHttp> Client<'_, H> {
         Ok(ListPluginAccountResponse {
             external_user_id: member.account_id.to_string(),
             username,
-            display_name: field("name"),
-            avatar_url: field("avatar_path")
+            display_name: named.name,
+            avatar_url: named
+                .avatar_path
                 .filter(|path| path.starts_with('/'))
                 .map(|path| format!("{IMAGE_BASE}{path}")),
             owned_lists,
@@ -977,6 +1002,14 @@ fn check_member_status(
         );
     }
     check_status(response, Access::Public, what)
+}
+
+/// What TMDb says a member is called, from whichever read named them.
+#[derive(Default)]
+struct MemberName {
+    username: Option<String>,
+    name: Option<String>,
+    avatar_path: Option<String>,
 }
 
 /// One of the member's own lists, as the account operation offers it. TMDb

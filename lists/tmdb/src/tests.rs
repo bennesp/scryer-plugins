@@ -847,15 +847,13 @@ fn account_names_the_member_and_their_lists() {
     ]}"#;
     let lists_2 =
         r#"{"page": 2, "total_pages": 2, "total_results": 3, "results": [{"id": 8200003}]}"#;
-    let first_list = format!(
-        r#"{{"id": 8200001, "name": "Fixture Private Shelf", "page": 1, "total_pages": 1, "results": [],
-           "created_by": {{"id": "{ACCOUNT_ID}", "username": "fixture-member-handle",
-                           "name": "Fixture Member", "avatar_path": "/fixtureavatar.png", "gravatar_hash": ""}}}}"#
-    );
+    let details = r#"{"id": 7300001, "username": "fixture-member-handle", "name": "Fixture Member",
+       "include_adult": false, "iso_639_1": "en", "iso_3166_1": "US",
+       "avatar": {"gravatar": {"hash": ""}, "tmdb": {"avatar_path": "/fixtureavatar.png"}}}"#;
     let http = RecordedHttp::new()
         .with(&account_url("/lists?page=1"), 200, lists_1)
         .with(&account_url("/lists?page=2"), 200, lists_2)
-        .with(&v4("/list/8200001?page=1"), 200, &first_list);
+        .with(&v3("/account"), 200, details);
 
     let linked = ok(account(&http, member()));
     assert_eq!(linked.external_user_id, ACCOUNT_ID);
@@ -889,23 +887,69 @@ fn account_names_the_member_and_their_lists() {
     for (request, expected) in sent.iter().zip([
         account_url("/lists?page=1"),
         account_url("/lists?page=2"),
-        v4("/list/8200001?page=1"),
+        v3("/account"),
     ]) {
         assert_member_call(request, &expected);
     }
     assert_eq!(sent.len(), 3);
 
-    // A member without lists is named by the credential, or by the account id.
-    let no_lists = RecordedHttp::new().with(
-        &account_url("/lists?page=1"),
-        200,
-        r#"{"page": 1, "total_pages": 0, "total_results": 0, "results": []}"#,
+    // A member without lists is named by their account details all the same.
+    let empty_index = r#"{"page": 1, "total_pages": 0, "total_results": 0, "results": []}"#;
+    let listless = RecordedHttp::new()
+        .with(&account_url("/lists?page=1"), 200, empty_index)
+        .with(&v3("/account"), 200, details);
+    let named = ok(account(&listless, member()));
+    assert_eq!(named.username, "fixture-member-handle");
+    assert_eq!(named.display_name.as_deref(), Some("Fixture Member"));
+    assert!(named.owned_lists.is_empty());
+
+    // Where TMDb does not serve the details, the owner of the member's first
+    // list names them.
+    let first_list = format!(
+        r#"{{"id": 8200001, "name": "Fixture Private Shelf", "page": 1, "total_pages": 1, "results": [],
+           "created_by": {{"id": "{ACCOUNT_ID}", "username": "fixture-shelf-owner",
+                           "name": "Fixture Shelf Owner", "avatar_path": "/fixtureshelf.png", "gravatar_hash": ""}}}}"#
     );
+    for (status, body) in [
+        (401, r#"{"status_code": 3}"#),
+        (404, r#"{"status_code": 34}"#),
+        (500, ""),
+        (200, "not json"),
+        (
+            200,
+            r#"{"id": 7300001, "username": "", "name": "Fixture Nameless"}"#,
+        ),
+    ] {
+        let http = RecordedHttp::new()
+            .with(&account_url("/lists?page=1"), 200, lists_1)
+            .with(&account_url("/lists?page=2"), 200, lists_2)
+            .with(&v3("/account"), status, body)
+            .with(&v4("/list/8200001?page=1"), 200, &first_list);
+        let linked = ok(account(&http, member()));
+        assert_eq!(linked.username, "fixture-shelf-owner", "{status} {body}");
+        assert_eq!(
+            linked.display_name.as_deref(),
+            Some("Fixture Shelf Owner"),
+            "{status} {body}"
+        );
+        assert_eq!(
+            linked.avatar_url.as_deref(),
+            Some("https://image.tmdb.org/t/p/original/fixtureshelf.png")
+        );
+        assert_member_call(&http.requests()[3], &v4("/list/8200001?page=1"));
+    }
+
+    // A member named by neither is named by the credential, or by the account
+    // id.
+    let no_lists = RecordedHttp::new().with(&account_url("/lists?page=1"), 200, empty_index);
     let bare = ok(account(&no_lists, member()));
     assert_eq!(bare.username, "fixture-member");
     assert!(bare.display_name.is_none() && bare.avatar_url.is_none());
     assert!(bare.owned_lists.is_empty());
-    assert_eq!(no_lists.urls().len(), 1);
+    assert_eq!(
+        no_lists.urls(),
+        vec![account_url("/lists?page=1"), v3("/account")]
+    );
     let anonymous = ListCredential {
         username: None,
         ..member()

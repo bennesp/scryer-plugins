@@ -1,6 +1,6 @@
 [package]
 name = "newznab-indexer"
-version = "2.3.0"
+version = "2.3.1"
 edition = "2024"
 autolib = false
 license = "GPL-3.0-only"
@@ -10,7 +10,7 @@ description = "Generic Newznab protocol indexer for compatible services"
 official = true
 plugin_id = "newznab"
 catalog_versions = ["v3"]
-min_scryer_version = "0.20.0"
+min_scryer_version = "0.21.14"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers/newznab"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/indexers/newznab"
 

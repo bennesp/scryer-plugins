@@ -255,6 +255,9 @@ impl NewznabConfig {
                 }
             }
         }
+        if let Some(profile) = profile {
+            apply_response_format(&mut additional_params, &profile.allowed_response_formats);
+        }
         let additional_params = url::form_urlencoded::Serializer::new(String::new())
             .extend_pairs(additional_params)
             .finish();
@@ -320,6 +323,32 @@ fn resolved_provider_profile()
         .as_ref()
         .map(Option::as_ref)
         .map_err(|error| Error::msg(format!("invalid Newznab provider profile: {error}")))
+}
+
+fn apply_response_format(parameters: &mut BTreeMap<String, String>, allowed: &[String]) {
+    if allowed.is_empty() {
+        return;
+    }
+    if parameters.get("o").is_some_and(|requested| {
+        allowed
+            .iter()
+            .any(|format| format.eq_ignore_ascii_case(requested))
+    }) {
+        return;
+    }
+    // Hosts may inject a default format that this provider does not support.
+    // Prefer the standard XML feed when both formats are available.
+    if let Some(format) = allowed
+        .iter()
+        .find(|format| format.eq_ignore_ascii_case("xml"))
+        .or_else(|| {
+            allowed
+                .iter()
+                .find(|format| format.eq_ignore_ascii_case("json"))
+        })
+    {
+        parameters.insert("o".to_string(), format.to_ascii_lowercase());
+    }
 }
 
 fn request_interval_from_config(value: Option<&str>) -> Duration {
@@ -5025,6 +5054,35 @@ fn default_newznab_categories() -> Vec<NewznabCategoryOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_format_respects_provider_support_and_preserves_other_parameters() {
+        for (allowed, requested, expected) in [
+            (vec!["xml"], Some("json"), Some("xml")),
+            (vec!["xml"], None, Some("xml")),
+            (vec!["xml", "json"], Some("json"), Some("json")),
+            (vec!["xml", "json"], Some("xml"), Some("xml")),
+            (vec!["xml", "json"], None, Some("xml")),
+            (vec!["json"], Some("xml"), Some("json")),
+            (vec![], Some("json"), Some("json")),
+            (vec![], None, None),
+        ] {
+            let mut parameters = BTreeMap::from([("extended".into(), "1".into())]);
+            if let Some(requested) = requested {
+                parameters.insert("o".into(), requested.into());
+            }
+            apply_response_format(
+                &mut parameters,
+                &allowed.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            );
+            assert_eq!(
+                parameters.get("o").map(String::as_str),
+                expected,
+                "{allowed:?}"
+            );
+            assert_eq!(parameters.get("extended").map(String::as_str), Some("1"));
+        }
+    }
 
     #[test]
     fn large_xml_feed_keeps_item_state_local_and_bounds_retained_results() {

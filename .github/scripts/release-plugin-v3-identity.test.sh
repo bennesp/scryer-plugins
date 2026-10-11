@@ -31,3 +31,5 @@ do
     exit 1
   fi
 done
+
+python3 "${script_dir}/release-plugin-v3-catalog.test.py"

@@ -219,6 +219,12 @@ struct ReleaseOptions {
 
 #[derive(Args)]
 struct ReleasePublishTagsArgs {
+    #[arg(
+        long,
+        value_name = "BRANCH",
+        help = "Publish one plugin patch from a merged maintenance-branch PR"
+    )]
+    maintenance_branch: Option<String>,
     #[arg(long)]
     pr: u64,
     #[arg(
@@ -2976,7 +2982,7 @@ fn fetch_origin_main_and_tags(ctx: &TaskContext) -> Result<()> {
     run_checked(&mut fetch).context("fetch origin/main and release tags")
 }
 
-fn merged_pull_request_commit(ctx: &TaskContext, pr: u64) -> Result<String> {
+fn merged_pull_request_commit(ctx: &TaskContext, pr: u64, base_branch: &str) -> Result<String> {
     let pr_number = pr.to_string();
     let output = run_capture(ctx.command_in("gh", &ctx.repo_root).args([
         "pr",
@@ -2992,9 +2998,9 @@ fn merged_pull_request_commit(ctx: &TaskContext, pr: u64) -> Result<String> {
     if pull_request.state != "MERGED" {
         bail!("pull request #{pr} is not merged")
     }
-    if pull_request.base_ref_name != "main" {
+    if pull_request.base_ref_name != base_branch {
         bail!(
-            "pull request #{pr} targets {}, not main",
+            "pull request #{pr} targets {}, not {base_branch}",
             pull_request.base_ref_name
         )
     }
@@ -3007,6 +3013,7 @@ fn merged_pull_request_commit(ctx: &TaskContext, pr: u64) -> Result<String> {
 fn publishable_release_targets(
     ctx: &TaskContext,
     selected_ids: &BTreeSet<String>,
+    maintenance: bool,
 ) -> Result<Vec<ReleaseTarget>> {
     let mut targets = Vec::new();
     let mut found = BTreeSet::new();
@@ -3015,8 +3022,17 @@ fn publishable_release_targets(
             continue;
         }
         found.insert(candidate.plugin_id.clone());
-        let latest_version = latest_plugin_v3_release_tag(ctx, &candidate.plugin_id)?
-            .and_then(|tag| release_tag_version(&candidate.plugin_id, &tag));
+        let latest_version = if maintenance {
+            let tags = git_capture(ctx, &["tag"])?;
+            Some(maintenance_line_latest(
+                &candidate.plugin_id,
+                &candidate.version,
+                &tags,
+            )?)
+        } else {
+            latest_plugin_v3_release_tag(ctx, &candidate.plugin_id)?
+                .and_then(|tag| release_tag_version(&candidate.plugin_id, &tag))
+        };
         if latest_version
             .as_ref()
             .is_some_and(|latest| &candidate.version <= latest)
@@ -3159,7 +3175,45 @@ fn catalog_only_release_tag_name(ctx: &TaskContext, source_short_sha: &str) -> R
     ))
 }
 
+fn maintenance_line_latest(plugin_id: &str, candidate: &Version, tags: &str) -> Result<Version> {
+    if !candidate.pre.is_empty() || !candidate.build.is_empty() {
+        bail!("maintenance publication requires a stable patch version");
+    }
+    tags.lines()
+        .filter_map(|tag| release_tag_version(plugin_id, tag))
+        .filter(|version| {
+            version.major == candidate.major
+                && version.minor == candidate.minor
+                && version.pre.is_empty()
+                && version.build.is_empty()
+        })
+        .max()
+        .context(
+            "maintenance publication requires an existing release on the same major/minor line",
+        )
+}
+
+fn publication_base_branch(args: &ReleasePublishTagsArgs) -> Result<&str> {
+    let Some(branch) = args.maintenance_branch.as_deref() else {
+        return Ok("main");
+    };
+    if branch == "main"
+        || branch.is_empty()
+        || branch.starts_with('-')
+        || args.plugin_ids.len() != 1
+        || !args.rule_pack_ids.is_empty()
+        || args.resume
+        || args.catalog_only_from.is_some()
+    {
+        bail!(
+            "--maintenance-branch requires a non-main branch and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog"
+        );
+    }
+    Ok(branch)
+}
+
 fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> Result<()> {
+    let base_branch = publication_base_branch(&args)?.to_string();
     if args.resume && (!args.plugin_ids.is_empty() || args.rule_pack_ids.len() != 1) {
         bail!("--resume requires exactly one --rule-pack-id and no --plugin-id");
     }
@@ -3173,7 +3227,19 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     step("Checking merged release PR");
     require_clean_worktree(ctx)?;
     fetch_origin_main_and_tags(ctx)?;
-    let merge_commit = merged_pull_request_commit(ctx, args.pr)?;
+    if args.maintenance_branch.is_some() {
+        run_checked(ctx.command_in("git", &ctx.repo_root).args([
+            "check-ref-format",
+            "--branch",
+            &base_branch,
+        ]))?;
+        let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
+        run_checked(
+            ctx.command_in("git", &ctx.repo_root)
+                .args(["fetch", "origin", &refspec]),
+        )?;
+    }
+    let merge_commit = merged_pull_request_commit(ctx, args.pr, &base_branch)?;
     let head = git_capture(ctx, &["rev-parse", "HEAD"])?;
     if head.trim() != merge_commit {
         bail!(
@@ -3184,9 +3250,10 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
         )
     }
     let mut ancestor = ctx.command_in("git", &ctx.repo_root);
-    ancestor.args(["merge-base", "--is-ancestor", &merge_commit, "origin/main"]);
+    let remote_base = format!("refs/remotes/origin/{base_branch}");
+    ancestor.args(["merge-base", "--is-ancestor", &merge_commit, &remote_base]);
     if !run_status(&mut ancestor)?.success() {
-        bail!("merged pull request commit {merge_commit} is not reachable from origin/main")
+        bail!("merged pull request commit {merge_commit} is not reachable from {remote_base}")
     }
     ok(format!("PR #{} merged at {}", args.pr, merge_commit));
 
@@ -3257,7 +3324,7 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     let targets = if selected_plugin_ids.is_empty() && !selected_rule_pack_ids.is_empty() {
         Vec::new()
     } else {
-        publishable_release_targets(ctx, &selected_plugin_ids)?
+        publishable_release_targets(ctx, &selected_plugin_ids, args.maintenance_branch.is_some())?
     };
     let rule_pack_tags = selected_rule_pack_tags(ctx, &selected_rule_pack_ids)?;
     if targets.is_empty() && rule_pack_tags.is_empty() {
@@ -10609,6 +10676,76 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
             let error =
                 selected_rule_pack_tags(&ctx, &BTreeSet::from(["sea".to_string()])).unwrap_err();
             assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+    #[test]
+    fn maintenance_publication_selects_only_the_existing_patch_line() {
+        let tags =
+            "plugins-v3/newznab/v2.3.0\nplugins-v3/newznab/v3.0.0\nplugins-v3/torznab/v2.3.9";
+        let candidate = Version::parse("2.3.1").unwrap();
+        assert_eq!(
+            maintenance_line_latest("newznab", &candidate, tags).unwrap(),
+            Version::parse("2.3.0").unwrap()
+        );
+        let with_duplicate = format!("{tags}\nplugins-v3/newznab/v2.3.1");
+        assert!(
+            candidate <= maintenance_line_latest("newznab", &candidate, &with_duplicate).unwrap()
+        );
+        assert!(
+            maintenance_line_latest("newznab", &Version::parse("2.4.1").unwrap(), tags).is_err()
+        );
+        assert!(
+            maintenance_line_latest("newznab", &Version::parse("2.3.1-beta.1").unwrap(), tags)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn maintenance_publication_requires_explicit_single_plugin_scope() {
+        for (options, valid) in [
+            (
+                vec![
+                    "--maintenance-branch",
+                    "bugfix/newznab-2.3",
+                    "--plugin-id",
+                    "newznab",
+                ],
+                true,
+            ),
+            (
+                vec!["--maintenance-branch", "main", "--plugin-id", "newznab"],
+                false,
+            ),
+            (vec!["--maintenance-branch", "bugfix/newznab-2.3"], false),
+            (
+                vec![
+                    "--maintenance-branch",
+                    "bugfix/newznab-2.3",
+                    "--plugin-id",
+                    "newznab",
+                    "--plugin-id",
+                    "torznab",
+                ],
+                false,
+            ),
+            (
+                vec![
+                    "--maintenance-branch",
+                    "bugfix/newznab-2.3",
+                    "--plugin-id",
+                    "newznab",
+                    "--resume",
+                ],
+                false,
+            ),
+        ] {
+            let mut args = vec!["xtask", "release-publish-tags", "--pr", "42"];
+            args.extend(options);
+            let cli = Cli::try_parse_from(args).unwrap();
+            let Commands::ReleasePublishTags(args) = cli.command else {
+                panic!("command");
+            };
+            assert_eq!(publication_base_branch(&args).is_ok(), valid);
         }
     }
 }

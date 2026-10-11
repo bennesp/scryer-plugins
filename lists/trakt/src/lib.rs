@@ -685,6 +685,22 @@ impl<H: ListHttp> Client<'_, H> {
     ) -> Result<ListPluginAccountResponse, PluginError> {
         self.app()?;
         let token = member_token(Some(&request.credential))?;
+        // A linked account already names its member, so only its lists are
+        // read. The profile is read once, when the account is linked.
+        let known = |value: &Option<String>| value.clone().filter(|value| !value.trim().is_empty());
+        if let (Some(external_user_id), Some(username)) = (
+            known(&request.credential.external_user_id),
+            known(&request.credential.username),
+        ) {
+            return Ok(ListPluginAccountResponse {
+                external_user_id,
+                username,
+                display_name: None,
+                avatar_url: None,
+                owned_lists: self.owned_lists(&token).await?,
+                statuses: Vec::new(),
+            });
+        }
         let settings = json_body(
             &self
                 .send("/users/settings", Some(&token), "Trakt account")

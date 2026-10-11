@@ -75,12 +75,18 @@ fn account(
     http: &RecordedHttp,
     client_id: &str,
 ) -> PluginResult<scryer_plugin_sdk::ListPluginAccountResponse> {
+    account_of(http, client_id, credential())
+}
+
+fn account_of(
+    http: &RecordedHttp,
+    client_id: &str,
+    credential: ListCredential,
+) -> PluginResult<scryer_plugin_sdk::ListPluginAccountResponse> {
     match block_on(run(
         http,
         client_id,
-        PluginListCommand::Account(ListPluginAccountRequest {
-            credential: credential(),
-        }),
+        PluginListCommand::Account(ListPluginAccountRequest { credential }),
     )) {
         PluginListCommandResult::Account(result) => result,
         other => panic!("unexpected {other:?}"),
@@ -701,6 +707,48 @@ fn account_reports_the_member_and_their_own_lists() {
     let error = err(account(&lapsed, CLIENT));
     assert_eq!(error.code, PluginErrorCode::AuthFailed);
     assert!(!error.public_message.contains(TOKEN));
+}
+
+#[test]
+fn account_already_linked_reads_only_its_lists() {
+    let lists_url = api("/users/me/lists?page=1&limit=100");
+    let lists = r#"[
+      {"name": "Fixture Shelf One", "privacy": "private", "type": "personal", "item_count": 3,
+       "ids": {"trakt": 7700011, "slug": "fixture-shelf-one"}}
+    ]"#;
+    let linked = || ListCredential {
+        external_user_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
+        ..credential()
+    };
+    let http = RecordedHttp::new().with(&lists_url, 200, lists);
+    let member = ok(account_of(&http, CLIENT, linked()));
+    assert_eq!(
+        member.external_user_id,
+        "00000000-0000-4000-8000-000000000001"
+    );
+    assert_eq!(member.username, "fixture-member");
+    let names: Vec<_> = member
+        .owned_lists
+        .iter()
+        .map(|list| list.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["Fixture Shelf One"]);
+    assert_eq!(http.urls(), vec![lists_url.clone()]);
+
+    // A lapsed token is still caught by the one read that is made.
+    let lapsed = RecordedHttp::new().with(&lists_url, 401, "");
+    let error = err(account_of(&lapsed, CLIENT, linked()));
+    assert_eq!(error.code, PluginErrorCode::AuthFailed);
+    assert_eq!(lapsed.urls(), vec![lists_url.clone()]);
+
+    // A blank identity is not a known one; the profile is read.
+    let blank = RecordedHttp::new().with(&api("/users/settings"), 401, "");
+    let unnamed = ListCredential {
+        external_user_id: Some(" ".to_string()),
+        ..credential()
+    };
+    err(account_of(&blank, CLIENT, unnamed));
+    assert_eq!(blank.urls(), vec![api("/users/settings")]);
 }
 
 #[test]

@@ -714,7 +714,10 @@ fn account_already_linked_reads_only_its_lists() {
     let lists_url = api("/users/me/lists?page=1&limit=100");
     let lists = r#"[
       {"name": "Fixture Shelf One", "privacy": "private", "type": "personal", "item_count": 3,
-       "ids": {"trakt": 7700011, "slug": "fixture-shelf-one"}}
+       "ids": {"trakt": 7700011, "slug": "fixture-shelf-one"},
+       "user": {"username": "fixture-member-renamed", "private": false, "deleted": false,
+                "name": "Fixture Member", "ids": {"slug": "fixture-member-renamed", "trakt": 7700001},
+                "images": {"avatar": {"full": "https://media.example.test/avatars/fixture-member.jpg"}}}}
     ]"#;
     let linked = || ListCredential {
         external_user_id: Some("00000000-0000-4000-8000-000000000001".to_string()),
@@ -722,11 +725,18 @@ fn account_already_linked_reads_only_its_lists() {
     };
     let http = RecordedHttp::new().with(&lists_url, 200, lists);
     let member = ok(account_of(&http, CLIENT, linked()));
+    // The id the account was linked under stays; the rest is as the list's
+    // owner reads now.
     assert_eq!(
         member.external_user_id,
         "00000000-0000-4000-8000-000000000001"
     );
-    assert_eq!(member.username, "fixture-member");
+    assert_eq!(member.username, "fixture-member-renamed");
+    assert_eq!(member.display_name.as_deref(), Some("Fixture Member"));
+    assert_eq!(
+        member.avatar_url.as_deref(),
+        Some("https://media.example.test/avatars/fixture-member.jpg")
+    );
     let names: Vec<_> = member
         .owned_lists
         .iter()
@@ -734,6 +744,14 @@ fn account_already_linked_reads_only_its_lists() {
         .collect();
     assert_eq!(names, vec!["Fixture Shelf One"]);
     assert_eq!(http.urls(), vec![lists_url.clone()]);
+
+    // A member with no lists keeps the name the account was linked under.
+    let none = RecordedHttp::new().with(&lists_url, 200, "[]");
+    let member = ok(account_of(&none, CLIENT, linked()));
+    assert_eq!(member.username, "fixture-member");
+    assert_eq!(member.display_name, None);
+    assert!(member.owned_lists.is_empty());
+    assert_eq!(none.urls(), vec![lists_url.clone()]);
 
     // A lapsed token is still caught by the one read that is made.
     let lapsed = RecordedHttp::new().with(&lists_url, 401, "");

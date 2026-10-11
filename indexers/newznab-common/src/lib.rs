@@ -2375,12 +2375,8 @@ fn looks_like_context_token(token: &str) -> bool {
     }
 
     let upper = trimmed.to_ascii_uppercase();
-    if upper == "OVA" || upper == "SPECIAL" {
-        return true;
-    }
-
     if let Some(rest) = upper.strip_prefix('S') {
-        if rest.chars().all(|ch| ch.is_ascii_digit()) {
+        if !rest.is_empty() && rest.chars().all(|ch| ch.is_ascii_digit()) {
             return true;
         }
         if let Some((season_part, episode_part)) = rest.split_once('E') {
@@ -2391,7 +2387,7 @@ fn looks_like_context_token(token: &str) -> bool {
         }
     }
 
-    trimmed.chars().all(|ch| ch.is_ascii_digit())
+    false
 }
 
 fn strip_query_context(query: &str) -> &str {
@@ -2404,12 +2400,13 @@ fn strip_query_context(query: &str) -> &str {
     for index in (0..tokens.len()).rev() {
         if looks_like_context_token(tokens[index]) {
             start = index;
-        } else if start != tokens.len() {
+        } else {
             break;
         }
     }
 
-    if start == tokens.len() {
+    // A title can itself be numeric or resemble a season marker. Never erase it.
+    if start == 0 || start == tokens.len() {
         query.trim()
     } else {
         query[..query.rfind(tokens[start]).unwrap_or(query.len())].trim()
@@ -2600,24 +2597,24 @@ async fn execute_tiered_search(
         )
         .await?;
 
-        let looks_empty = is_empty_response(body.trim_start());
         last_response = Some((status, body.clone()));
-        if is_success_status(status) && !looks_empty {
+        if !search_response_needs_fallback(status, &body) {
             return Ok((status, body));
         }
     }
 
     // Tier 2: focused text fallback without IDs, only where the mode takes `q`.
-    if plan.supports_query {
+    let text_plan = plan_nab_text_search(caps, search_type, season, episode);
+    if text_plan.supports_query {
         for query_text in query_variants
             .iter()
             .map(String::as_str)
             .filter(|query| !query.is_empty())
         {
-            let query_text = plan.text_query(query_text);
+            let query_text = text_plan.text_query(query_text);
             let (status, body) = execute_search(
                 endpoint,
-                plan.search_type,
+                text_plan.search_type,
                 Some(&query_text),
                 api_key,
                 None,
@@ -2627,22 +2624,48 @@ async fn execute_tiered_search(
                 None,
                 cat,
                 limit,
-                plan.season,
-                plan.episode,
+                text_plan.season,
+                text_plan.episode,
                 additional_params,
                 behavior,
             )
             .await?;
 
-            let looks_empty = is_empty_response(body.trim_start());
             last_response = Some((status, body.clone()));
-            if is_success_status(status) && !looks_empty {
+            if !search_response_needs_fallback(status, &body) {
                 return Ok((status, body));
             }
         }
     }
 
     Ok(last_response.unwrap_or((200, r#"{"channel":{}}"#.to_string())))
+}
+
+fn search_response_needs_fallback(status: u16, body: &str) -> bool {
+    is_success_status(status)
+        && parse_error_xml(body).is_none()
+        && parse_error_json(body).is_none()
+        && is_empty_response(body.trim_start())
+}
+
+fn plan_nab_text_search(
+    caps: Option<&NewznabSearchCaps>,
+    search_type: &'static str,
+    season: Option<u32>,
+    episode: Option<u32>,
+) -> NabSearchPlan<'static> {
+    // Like Prowlarr, avoid movie-mode text searches: some Sphinx backends
+    // return unrelated releases unless that mode carries an authoritative ID.
+    let requested = if search_type == "movie" {
+        "search"
+    } else {
+        search_type
+    };
+    let mut plan = plan_nab_search(caps, requested, NabSearchIds::default(), season, episode);
+    if let Some(caps) = caps {
+        plan.supports_query = caps.mode(plan.search_type).supports("q");
+    }
+    plan
 }
 
 fn is_success_status(status: u16) -> bool {
@@ -2652,7 +2675,14 @@ fn is_success_status(status: u16) -> bool {
 fn is_empty_response(trimmed: &str) -> bool {
     // JSON: no items
     if trimmed.starts_with('{') {
-        return !trimmed.contains("\"title\"");
+        return serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|value| value.get("channel").cloned())
+            .is_some_and(|channel| match channel.get("item") {
+                None | Some(serde_json::Value::Null) => true,
+                Some(serde_json::Value::Array(items)) => items.is_empty(),
+                _ => false,
+            });
     }
     // XML: no <item> elements
     if trimmed.starts_with('<') {
@@ -3387,30 +3417,54 @@ fn append_additional_query_pairs(url: &mut Url, additional_params: &str) {
     url.set_query(Some(&query));
 }
 
+/// Discard explicit movie identity conflicts, while retaining releases without IDs.
+pub fn retain_movie_identity_matches(response: &mut SearchResponse, req: &SearchRequest) {
+    let is_movie = req.facet.as_deref() == Some("movie")
+        || req.category.as_deref() == Some("movie")
+        || req
+            .context
+            .as_ref()
+            .is_some_and(|context| matches!(context.subject_kind, PluginSearchSubjectKind::Movie));
+    if !is_movie {
+        return;
+    }
+    response.results.retain(|result| {
+        ["imdb_id", "tmdb_id"].iter().all(|key| {
+            let (Some(requested), Some(returned)) =
+                (req.ids.get(*key), result.external_ids.get(*key))
+            else {
+                return true;
+            };
+            let requested = normalize_imdbid_param_with_mode(requested, false);
+            let returned = normalize_imdbid_param_with_mode(returned, false);
+            let requested = requested.trim_start_matches('0');
+            let returned = returned.trim_start_matches('0');
+            requested.is_empty() || returned.is_empty() || requested == returned
+        })
+    });
+}
+
 fn normalize_imdbid_param(raw: &str) -> String {
     normalize_imdbid_param_with_mode(raw, use_canonical_imdb_ids())
 }
 
 fn normalize_imdbid_param_with_mode(raw: &str, canonical: bool) -> String {
     let trimmed = raw.trim();
-    if canonical {
-        if trimmed.len() > 2
-            && trimmed[..2].eq_ignore_ascii_case("tt")
-            && trimmed[2..].chars().all(|ch| ch.is_ascii_digit())
-        {
-            format!("tt{}", &trimmed[2..])
-        } else if trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-            format!("tt{trimmed}")
-        } else {
-            trimmed.to_string()
-        }
-    } else if trimmed.len() > 2
-        && trimmed[..2].eq_ignore_ascii_case("tt")
-        && trimmed[2..].chars().all(|ch| ch.is_ascii_digit())
+    let digits = if trimmed
+        .get(..2)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("tt"))
     {
-        format!("00{}", &trimmed[2..])
+        &trimmed[2..]
     } else {
-        trimmed.to_string()
+        trimmed
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return trimmed.to_string();
+    }
+    if canonical {
+        format!("tt{digits}")
+    } else {
+        digits.to_string()
     }
 }
 
@@ -5655,7 +5709,7 @@ mod tests {
 
         assert!(url.contains("t=movie"));
         assert_eq!(query_value(&url, "q").as_deref(), Some("Example Feature"));
-        assert!(url.contains("imdbid=002024544"));
+        assert!(url.contains("imdbid=2024544"));
         assert!(url.contains("limit=200"));
         assert!(url.contains("extended=1"));
         assert!(query_value(&url, "o").is_none());
@@ -5730,7 +5784,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(query_value(&url, "t").as_deref(), Some("movie"));
-        assert_eq!(query_value(&url, "imdbid").as_deref(), Some("0011032374"));
+        assert_eq!(query_value(&url, "imdbid").as_deref(), Some("11032374"));
         assert_eq!(query_value(&url, "cat").as_deref(), Some("6050,2000,5070"));
         assert!(query_value(&url, "q").is_none());
         assert_eq!(
@@ -6254,11 +6308,11 @@ mod tests {
     fn normalize_imdbid_param_defaults_to_legacy_newznab_format() {
         assert_eq!(
             normalize_imdbid_param_with_mode("tt2024544", false),
-            "002024544"
+            "2024544"
         );
         assert_eq!(
             normalize_imdbid_param_with_mode("TT1234567", false),
-            "001234567"
+            "1234567"
         );
         assert_eq!(
             normalize_imdbid_param_with_mode("1234567", false),
@@ -9383,5 +9437,127 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod search_identity_regressions {
+    use super::*;
+
+    #[test]
+    fn numeric_and_context_like_titles_survive_cleaning() {
+        for title in [
+            "1917",
+            "1984",
+            "The 100",
+            "District 9",
+            "2001 A Space Odyssey",
+            "Special",
+            "S",
+            "S1",
+            "1917 Special Edition",
+        ] {
+            assert_eq!(build_query_variants(title), vec![title], "{title}");
+        }
+        assert_eq!(build_query_variants("The 100 S02E03"), vec!["The 100"]);
+        assert_eq!(build_query_variants("1917 (2019)"), vec!["1917 2019"]);
+    }
+
+    #[test]
+    fn movie_text_fallback_uses_generic_search_even_when_movie_q_is_supported() {
+        let caps = parse_capabilities(br#"<caps><searching><search available="yes" supportedParams="q"/><movie-search available="yes" supportedParams="q,imdbid"/></searching></caps>"#);
+        let plan = plan_nab_text_search(caps.searching.as_ref(), "movie", None, None);
+        assert_eq!(plan.search_type, "search");
+        assert!(plan.supports_query);
+        assert!(!plan.ids.any());
+        assert_eq!(
+            plan_nab_text_search(None, "movie", None, None).search_type,
+            "search"
+        );
+    }
+
+    #[test]
+    fn movie_text_fallback_respects_disabled_generic_search() {
+        let caps = parse_capabilities(br#"<caps><searching><search available="no"/><movie-search available="yes" supportedParams="imdbid"/></searching></caps>"#);
+        assert!(!plan_nab_text_search(caps.searching.as_ref(), "movie", None, None).supports_query);
+    }
+
+    #[test]
+    fn imdb_format_preserves_digits_without_padding_or_unicode_panics() {
+        for raw in ["tt8579674", "TT8579674", "8579674", " tt8579674 "] {
+            assert_eq!(normalize_imdbid_param_with_mode(raw, false), "8579674");
+            assert_eq!(normalize_imdbid_param_with_mode(raw, true), "tt8579674");
+        }
+        assert_eq!(
+            normalize_imdbid_param_with_mode("tt0000001", false),
+            "0000001"
+        );
+        for raw in ["", "tt", "☃invalid", "éinvalid"] {
+            assert_eq!(normalize_imdbid_param_with_mode(raw, false), raw);
+        }
+    }
+
+    #[test]
+    fn channel_title_is_not_a_search_result() {
+        for body in [
+            r#"{"channel":{"title":"Indexer","item":[]}}"#,
+            r#"{"channel":{"title":"Indexer"}}"#,
+            r#"{"channel":{"item":null}}"#,
+        ] {
+            assert!(is_empty_response(body), "{body}");
+        }
+        assert!(!is_empty_response(
+            r#"{"channel":{"item":{"title":"1917"}}}"#
+        ));
+        assert!(!is_empty_response(r#"{"error":{"code":100}}"#));
+    }
+
+    #[test]
+    fn movie_results_with_conflicting_ids_are_not_returned() {
+        let mut req = SearchRequest::default();
+        req.facet = Some("movie".into());
+        req.ids.insert("imdb_id".into(), "tt8579674".into());
+        let mut response = SearchResponse::default();
+        for id in [Some("8579674"), Some("tt8579674"), Some("0000001"), None] {
+            let mut result = SearchResult::default();
+            if let Some(id) = id {
+                result.external_ids.insert("imdb_id".into(), id.into());
+            }
+            response.results.push(result);
+        }
+        retain_movie_identity_matches(&mut response, &req);
+        assert_eq!(response.results.len(), 3);
+        assert!(
+            response
+                .results
+                .iter()
+                .all(|r| r.external_ids.get("imdb_id").map(String::as_str) != Some("0000001"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod fallback_error_regressions {
+    use super::*;
+
+    #[test]
+    fn only_empty_successful_feeds_can_trigger_fallback() {
+        let empty = "<rss><channel/></rss>";
+        assert!(search_response_needs_fallback(200, empty));
+        for status in [301, 401, 403, 429, 500, 503] {
+            assert!(!search_response_needs_fallback(status, empty), "{status}");
+        }
+        assert!(!search_response_needs_fallback(
+            200,
+            r#"<error code="100" description="Invalid API key"/>"#
+        ));
+        assert!(!search_response_needs_fallback(
+            200,
+            r#"{"error":{"code":100,"description":"Invalid API key"}}"#
+        ));
+        assert!(!search_response_needs_fallback(
+            200,
+            r#"{"channel":{"item":{"title":"1917"}}}"#
+        ));
     }
 }

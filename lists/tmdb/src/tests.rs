@@ -979,6 +979,26 @@ fn a_rejected_member_token_is_an_expired_account() {
     let missing = own_list(404, r#"{"status_code": 34}"#);
     assert!(missing.public_message.contains("not found"));
 
+    // A suspended member is refused with a 403 whatever the read names, and
+    // nothing they follow is gone.
+    let suspended = r#"{"status_code": 45, "status_message": "This user has been suspended."}"#;
+    let person = RecordedHttp::new().with(
+        &v3("/person/4401?append_to_response=combined_credits"),
+        403,
+        suspended,
+    );
+    for error in [
+        own_list(403, suspended),
+        err(fetch(
+            &person,
+            request("person", &[("person_id", "4401")], None),
+        )),
+    ] {
+        assert_eq!(error.code, PluginErrorCode::AuthFailed);
+        assert!(!error.public_message.contains("not found"));
+        assert_no_secrets(&error);
+    }
+
     let limited = watchlist(429, &[("Retry-After", "12")], "");
     assert_eq!(
         (limited.code, limited.retry_after_seconds),

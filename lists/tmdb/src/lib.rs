@@ -430,13 +430,12 @@ impl<'a> Member<'a> {
     }
 }
 
-/// What a member call reads, which decides what a TMDb 401, 403 or 404
-/// means.
+/// What a member call reads, which decides what a TMDb 401 or 404 means.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MemberRead {
     /// The member's own watchlist, favorites, ratings, recommendations or
-    /// list index: any 401 or 403 means TMDb no longer accepts the linked
-    /// account, and a 404 is never the collection being gone.
+    /// list index: any 401 means TMDb no longer accepts the linked account,
+    /// and a 404 is never the collection being gone.
     Account,
     /// Something named by its TMDb id: a person, a company, a keyword, or a
     /// list, which may be someone else's private one.
@@ -946,30 +945,25 @@ fn tmdb_status_code(response: &PluginHttpResponse) -> Option<i64> {
 /// is a read by id that TMDb calls private: that list is not this member's to
 /// read, and the account is fine.
 ///
+/// A 403 is TMDb refusing the member as well, whatever the read names: the
+/// only one it gives a read is a suspended user.
+///
 /// The member's own collections are addressed by their account, so they can
-/// never be gone on their own: a 403 there is TMDb refusing the linked
-/// account, and a 404 a failure that must not read as the collection having
-/// been deleted.
+/// never be gone on their own: a 404 there is a failure that must not read as
+/// the collection having been deleted.
 fn check_member_status(
     response: &PluginHttpResponse,
     what: &str,
     read: MemberRead,
 ) -> Result<(), PluginError> {
-    if read == MemberRead::Account {
-        match response.status {
-            403 => {
-                return Err(auth_failed(
-                    "TMDb refused the linked account access to its own titles (HTTP 403)",
-                ));
-            }
-            404 | 410 => {
-                return Err(permanent(format!(
-                    "TMDb did not serve the {what} for the linked account (HTTP {})",
-                    response.status
-                )));
-            }
-            _ => {}
-        }
+    if response.status == 403 {
+        return Err(auth_failed("TMDb refused the linked account (HTTP 403)"));
+    }
+    if read == MemberRead::Account && matches!(response.status, 404 | 410) {
+        return Err(permanent(format!(
+            "TMDb did not serve the {what} for the linked account (HTTP {})",
+            response.status
+        )));
     }
     if response.status == 401 {
         return Err(

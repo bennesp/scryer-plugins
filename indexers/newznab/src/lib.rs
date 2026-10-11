@@ -108,7 +108,8 @@ fn build_descriptor() -> PluginDescriptor {
 
 async fn search(req: SearchRequest) -> Result<SearchResponse, Error> {
     let config = NewznabConfig::from_host()?;
-    let response = execute_full_search(&config, &req, extract_profile_metadata).await?;
+    let mut response = execute_full_search(&config, &req, extract_profile_metadata).await?;
+    newznab_common::retain_movie_identity_matches(&mut response, &req);
     Ok(response)
 }
 

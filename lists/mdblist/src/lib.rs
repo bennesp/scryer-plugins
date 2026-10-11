@@ -1,40 +1,36 @@
 //! MDBList list provider.
 //!
-//! Follows any MDBList list by its address (`mdblist.com/lists/<user>/<slug>`)
-//! or, with the server's MDBList API key, by its numeric id. Without a key the
-//! plugin reads the list's public JSON export in one request; with a key it
-//! reads the API's items endpoint, which also reaches the key owner's private
-//! lists and pages through lists longer than one response.
+//! Follows any public MDBList list by its address
+//! (`mdblist.com/lists/<user>/<slug>`), read from the list's public JSON
+//! export in one request. That needs no key, and the server holds none.
+//! MDBList's directory of top lists is not a list itself, so it is not a
+//! source here: any top list is followed by its address like every other list.
 //!
-//! That key is server configuration declared in the descriptor. MDBList's
-//! directory of top lists is not a list itself, so it is not a source here:
-//! any top list is followed by its address like every other list.
+//! Everything that needs an MDBList API key is a member's own. A member links
+//! their MDBList account with their own API key, which the host hands back as
+//! that member's credential and never as configuration. It reads two personal
+//! sources:
 //!
-//! A member who links their own MDBList account does it with their own API
-//! key, which the host hands back as that member's credential and never as
-//! configuration. It reads two personal sources, and nothing else:
-//!
-//! - `my_list`: one of the member's own lists, public or private, by its id.
+//! - `my_list`: a list by its numeric id, the member's own, public or private.
 //! - `watchlist`: the member's MDBList watchlist, movies and shows.
 //!
-//! A personal source never falls back to the server key, and the public
-//! source never reads a member's.
+//! The public source never reads a member's key.
 
 use list_provider_common::error::{
-    Access, auth_failed, check_status, invalid_config, missing_param, permanent, unsupported_source,
+    Access, auth_failed, check_status, invalid_config, missing_param, permanent, plugin_error,
+    unsupported_source,
 };
 use list_provider_common::http::{HostHttp, ListHttp, encode_component, get, header, json_body};
 use list_provider_common::ids::{Ids, build_item, dedupe_and_rank, json_id, json_text, json_year};
 use list_provider_common::page::{numeric_cursor, single_page};
 use scryer_plugin_sdk::command::{PluginListCommand, PluginListCommandResult};
 use scryer_plugin_sdk::{
-    ConfigFieldDef, ConfigFieldType, ListAccountList, ListAuthBadge, ListCredential, ListMediaKind,
-    ListMemberKey, ListMemberKeyUse, ListNoteTone, ListPluginAccountResponse,
-    ListPluginFetchRequest, ListPluginFetchResponse, ListPluginHealthResponse, ListPluginItem,
-    ListProviderAuth, ListProviderCapabilities, ListProviderDescriptor, ListProviderGroup,
-    ListProviderItem, ListProviderNote, ListProviderTile, ListSourceParam, ListSourceParamType,
-    ListUrlPattern, ListUrlPatternCapture, PluginDescriptor, PluginError, PluginResult,
-    ProviderDescriptor,
+    ListAccountList, ListAuthBadge, ListCredential, ListMediaKind, ListMemberKey, ListMemberKeyUse,
+    ListNoteTone, ListPluginAccountResponse, ListPluginFetchRequest, ListPluginFetchResponse,
+    ListPluginItem, ListProviderAuth, ListProviderCapabilities, ListProviderDescriptor,
+    ListProviderGroup, ListProviderItem, ListProviderNote, ListProviderTile, ListSourceParam,
+    ListSourceParamType, ListUrlPattern, ListUrlPatternCapture, PluginDescriptor, PluginError,
+    PluginErrorCode, PluginResult, ProviderDescriptor,
 };
 use serde_json::Value;
 
@@ -48,7 +44,6 @@ list_provider_common::list_component_main!(descriptor = descriptor, handler = ha
 
 pub const PLUGIN_ID: &str = "mdblist-list";
 pub const PROVIDER_TYPE: &str = "mdblist";
-pub const CONFIG_API_KEY: &str = "api_key";
 pub const SOURCE_LIST: &str = "list";
 pub const PARAM_LIST: &str = "list";
 /// One of the linked member's own lists, by the id their account names it by.
@@ -82,12 +77,11 @@ pub fn descriptor() -> PluginDescriptor {
         provider: ProviderDescriptor::ListProvider(ListProviderDescriptor {
             provider_type: PROVIDER_TYPE.to_string(),
             provider_aliases: Vec::new(),
-            summary: Some("Any MDBList list, static or dynamic".to_string()),
+            summary: Some("Any public MDBList list, static or dynamic".to_string()),
             blurb: Some(
-                "Paste an MDBList list address. Public lists need no key; an MDBList API \
-                 key in the provider settings also reaches that account's private lists \
-                 and numeric list ids. Members who connect their own MDBList API key can \
-                 follow their own lists and watchlist."
+                "Paste an MDBList list address to follow any public list; no key is \
+                 needed. Members who connect their own MDBList API key can follow their \
+                 own lists, private ones included, and their watchlist."
                     .to_string(),
             ),
             tile: Some(ListProviderTile {
@@ -97,9 +91,8 @@ pub fn descriptor() -> PluginDescriptor {
             }),
             brand_url_template: Some(format!("{SITE_BASE}/lists/{{{PARAM_LIST}}}")),
             coverage: both.clone(),
-            auth: ListProviderAuth::ServerApiKey {
-                config_field: CONFIG_API_KEY.to_string(),
-            },
+            // Public lists need no key, and the server holds none.
+            auth: ListProviderAuth::None,
             // How a member links an account: MDBList has no sign-in to send
             // them through, so they paste the key MDBList issues them.
             member_key: Some(ListMemberKey {
@@ -117,15 +110,12 @@ pub fn descriptor() -> PluginDescriptor {
                     items: vec![ListProviderItem {
                         id: "list".to_string(),
                         name: "List".to_string(),
-                        description: Some(
-                            "Any public list by its address, or a numeric id with the API key"
-                                .to_string(),
-                        ),
+                        description: Some("Any public list, by its address".to_string()),
                         kinds: both.clone(),
                         source_type: SOURCE_LIST.to_string(),
                         params: vec![ListSourceParam {
                             key: PARAM_LIST.to_string(),
-                            label: "List (user/slug or id)".to_string(),
+                            label: "List (address or user/slug)".to_string(),
                             param_type: ListSourceParamType::Text,
                             options: Vec::new(),
                             required: true,
@@ -186,21 +176,11 @@ pub fn descriptor() -> PluginDescriptor {
             }],
             capabilities: ListProviderCapabilities {
                 account: true,
-                health: true,
+                // There is no server key to check.
+                health: false,
                 requires_member_credential: false,
             },
-            config_fields: vec![ConfigFieldDef {
-                key: CONFIG_API_KEY.to_string(),
-                label: "MDBList API key".to_string(),
-                field_type: ConfigFieldType::Password,
-                required: false,
-                help_text: Some(
-                    "Optional. Needed for private lists and numeric list ids. Members connect \
-                     their own lists and watchlist with their own key instead."
-                        .to_string(),
-                ),
-                ..Default::default()
-            }],
+            config_fields: Vec::new(),
             default_base_url: None,
             allowed_hosts: vec!["api.mdblist.com".to_string(), "mdblist.com".to_string()],
             rate_limit_seconds: Some(1),
@@ -209,10 +189,7 @@ pub fn descriptor() -> PluginDescriptor {
 }
 
 async fn handle_command(command: PluginListCommand) -> PluginListCommandResult {
-    let api_key = scryer_plugin_pdk::config::get(CONFIG_API_KEY)
-        .ok()
-        .flatten();
-    run(&HostHttp, api_key.as_deref(), command).await
+    run(&HostHttp, command).await
 }
 
 fn into_result<T>(result: Result<T, PluginError>) -> PluginResult<T> {
@@ -222,18 +199,17 @@ fn into_result<T>(result: Result<T, PluginError>) -> PluginResult<T> {
     }
 }
 
-pub async fn run<H: ListHttp>(
-    http: &H,
-    api_key: Option<&str>,
-    command: PluginListCommand,
-) -> PluginListCommandResult {
-    let api_key = api_key.map(str::trim).filter(|key| !key.is_empty());
+pub async fn run<H: ListHttp>(http: &H, command: PluginListCommand) -> PluginListCommandResult {
     match command {
         PluginListCommand::Fetch(request) => {
-            PluginListCommandResult::Fetch(into_result(fetch(http, api_key, &request).await))
+            PluginListCommandResult::Fetch(into_result(fetch(http, &request).await))
         }
         PluginListCommand::Health(_) => {
-            PluginListCommandResult::Health(into_result(health(http, api_key).await))
+            PluginListCommandResult::Health(PluginResult::Err(plugin_error(
+                PluginErrorCode::Unsupported,
+                "MDBList's public lists need no key and members use their own; \
+                 there is no server key to check",
+            )))
         }
         PluginListCommand::Account(request) => {
             PluginListCommandResult::Account(into_result(account(http, &request.credential).await))
@@ -378,7 +354,6 @@ fn site_url(list: &ListRef) -> Option<String> {
 
 pub async fn fetch<H: ListHttp>(
     http: &H,
-    api_key: Option<&str>,
     request: &ListPluginFetchRequest,
 ) -> Result<ListPluginFetchResponse, PluginError> {
     match request.source_type.as_str() {
@@ -389,10 +364,7 @@ pub async fn fetch<H: ListHttp>(
                     .get(PARAM_LIST)
                     .ok_or_else(|| missing_param(PARAM_LIST))?,
             )?;
-            match api_key {
-                Some(key) => fetch_api(http, key, &list, request).await,
-                None => fetch_public(http, &list, request).await,
-            }
+            fetch_public(http, &list, request).await
         }
         SOURCE_MY_LIST => {
             let key = member_key(request.credential.as_ref())?;
@@ -482,7 +454,8 @@ async fn fetch_public<H: ListHttp>(
 ) -> Result<ListPluginFetchResponse, PluginError> {
     let ListRef::Slug { user, slug } = list else {
         return Err(invalid_config(
-            "a numeric MDBList id needs the MDBList API key; use the list address instead",
+            "a numeric MDBList id is read with a member's own MDBList account; \
+             use the list address, or follow it under your account",
         ));
     };
     let url = format!(
@@ -507,6 +480,8 @@ async fn fetch_public<H: ListHttp>(
     ))
 }
 
+/// A list read through the API's items endpoint with the member's key, which
+/// pages through lists longer than one response.
 async fn fetch_api<H: ListHttp>(
     http: &H,
     key: &str,
@@ -561,37 +536,6 @@ async fn fetch_api<H: ListHttp>(
         total_hint: header(&response, "x-total-items").and_then(|value| value.trim().parse().ok()),
         fingerprint: None,
         unchanged: false,
-    })
-}
-
-async fn health<H: ListHttp>(
-    http: &H,
-    api_key: Option<&str>,
-) -> Result<ListPluginHealthResponse, PluginError> {
-    let Some(key) = api_key else {
-        return Ok(ListPluginHealthResponse {
-            healthy: true,
-            message: Some("no API key set; only public lists by address are available".to_string()),
-        });
-    };
-    let url = format!("{API_BASE}/user?apikey={}", encode_component(key));
-    let response = http.send(get(url, USER_AGENT, ACCEPT)).await?;
-    if matches!(response.status, 401 | 403) {
-        return Ok(ListPluginHealthResponse {
-            healthy: false,
-            message: Some("MDBList rejected the API key".to_string()),
-        });
-    }
-    check_status(&response, Access::ServerKey, "MDBList account")?;
-    let body = json_body(&response)?;
-    let used = body.get("api_requests_count").and_then(Value::as_u64);
-    let limit = body.get("api_requests").and_then(Value::as_u64);
-    Ok(ListPluginHealthResponse {
-        healthy: true,
-        message: match (used, limit) {
-            (Some(used), Some(limit)) => Some(format!("{used} of {limit} daily API requests used")),
-            _ => None,
-        },
     })
 }
 

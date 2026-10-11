@@ -10,8 +10,7 @@ use scryer_plugin_sdk::{
 
 use super::*;
 
-const KEY: &str = "fixturemdbkey";
-/// The key a member links their own account with, never the server's.
+/// The key a member links their own account with.
 const MEMBER_KEY: &str = "fixturememberkey";
 const PUBLIC_URL: &str = "https://mdblist.com/lists/fixture-curator/fixture-picks/json";
 
@@ -77,16 +76,8 @@ fn member_url(path: &str, offset: u32) -> String {
     format!("{API_BASE}{path}?limit={PAGE_LIMIT}&offset={offset}&apikey={MEMBER_KEY}")
 }
 
-fn api_url(path: &str, offset: u32) -> String {
-    format!("{API_BASE}{path}?limit={PAGE_LIMIT}&offset={offset}&apikey={KEY}")
-}
-
-fn fetch_ok(
-    http: &RecordedHttp,
-    key: Option<&str>,
-    request: ListPluginFetchRequest,
-) -> ListPluginFetchResponse {
-    block_on(fetch(http, key, &request)).unwrap()
+fn fetch_ok(http: &RecordedHttp, request: ListPluginFetchRequest) -> ListPluginFetchResponse {
+    block_on(fetch(http, &request)).unwrap()
 }
 
 #[test]
@@ -106,16 +97,12 @@ fn descriptor_round_trips_and_passes_host_checks() {
     scryer_plugin_sdk::validate_plugin_descriptor_host_permissions(&decoded).unwrap();
     let list = decoded.list_provider().unwrap();
     assert_eq!(list.provider_type, "mdblist");
-    assert_eq!(
-        list.auth,
-        ListProviderAuth::ServerApiKey {
-            config_field: CONFIG_API_KEY.to_string()
-        }
-    );
+    assert_eq!(list.auth, ListProviderAuth::None);
     assert!(
-        !list.config_fields[0].required,
-        "public lists work without a key"
+        list.config_fields.is_empty(),
+        "the server holds no MDBList key"
     );
+    assert!(!list.capabilities.health);
     assert_eq!(
         list.allowed_hosts,
         vec!["api.mdblist.com".to_string(), "mdblist.com".to_string()]
@@ -187,11 +174,7 @@ fn url_pattern_and_list_refs_agree() {
 #[test]
 fn public_json_is_read_without_a_key_in_rank_order() {
     let http = RecordedHttp::new().with(PUBLIC_URL, 200, PUBLIC_JSON);
-    let response = fetch_ok(
-        &http,
-        None,
-        request("fixture-curator/fixture-picks", None, None),
-    );
+    let response = fetch_ok(&http, request("fixture-curator/fixture-picks", None, None));
     assert_eq!(http.urls(), vec![PUBLIC_URL.to_string()]);
     assert_eq!(
         response.list_url.as_deref(),
@@ -224,7 +207,6 @@ fn public_json_is_read_without_a_key_in_rank_order() {
 
     let again = fetch_ok(
         &http,
-        None,
         request(
             "fixture-curator/fixture-picks",
             None,
@@ -235,15 +217,14 @@ fn public_json_is_read_without_a_key_in_rank_order() {
 }
 
 #[test]
-fn api_key_reads_the_items_endpoint_and_pages_on_has_more() {
-    let path = "/lists/fixture-curator/fixture-picks/items";
+fn a_members_list_reads_the_items_endpoint_and_pages_on_has_more() {
+    let path = "/lists/5101/items";
     let http = RecordedHttp::new()
-        .with_headers(&api_url(path, 0), 200, &[("X-Has-More", "true"), ("X-Total-Items", "3")], API_JSON)
-        .with_headers(&api_url(path, 2), 200, &[("X-Has-More", "false")], r#"{"movies": [{"id": 990602, "rank": 3, "title": "Fixture Api Tail", "mediatype": "movie"}], "shows": []}"#);
+        .with_headers(&member_url(path, 0), 200, &[("X-Has-More", "true"), ("X-Total-Items", "3")], API_JSON)
+        .with_headers(&member_url(path, 2), 200, &[("X-Has-More", "false")], r#"{"movies": [{"id": 990602, "rank": 3, "title": "Fixture Api Tail", "mediatype": "movie"}], "shows": []}"#);
     let first = fetch_ok(
         &http,
-        Some(KEY),
-        request("fixture-curator/fixture-picks", None, None),
+        member_request(SOURCE_MY_LIST, &[(PARAM_LIST_ID, "5101")], None),
     );
     assert_eq!(first.next_cursor.as_deref(), Some("2"));
     assert_eq!(first.total_hint, Some(3));
@@ -253,43 +234,33 @@ fn api_key_reads_the_items_endpoint_and_pages_on_has_more() {
 
     let second = fetch_ok(
         &http,
-        Some(KEY),
-        request("fixture-curator/fixture-picks", Some("2"), None),
+        member_request(SOURCE_MY_LIST, &[(PARAM_LIST_ID, "5101")], Some("2")),
     );
     assert!(second.next_cursor.is_none());
     assert_eq!(second.items[0].rank, Some(3));
 }
 
 #[test]
-fn single_api_page_is_fingerprinted_and_numeric_ids_need_the_key() {
-    let http = RecordedHttp::new().with_headers(
-        &api_url("/lists/4242/items", 0),
-        200,
-        &[("X-Has-More", "false")],
-        API_JSON,
-    );
-    let response = fetch_ok(&http, Some(KEY), request("4242", None, None));
-    assert!(response.fingerprint.is_some());
-    assert!(response.list_url.is_none());
-
-    let error = block_on(fetch(
-        &RecordedHttp::new(),
-        None,
-        &request("4242", None, None),
-    ))
-    .unwrap_err();
+fn a_numeric_id_on_the_public_source_is_refused() {
+    // A list by its id is read with a member's key, so it is theirs to follow.
+    let http = RecordedHttp::new();
+    let error = block_on(fetch(&http, &request("4242", None, None))).unwrap_err();
     assert_eq!(error.code, PluginErrorCode::InvalidConfig);
+    assert!(http.urls().is_empty(), "nothing is asked of MDBList");
 }
 
 #[test]
 fn errors_map_to_host_failure_classes() {
-    let path = "/lists/fixture-curator/fixture-picks/items";
     let with_key = |status: u16, headers: &[(&str, &str)], body: &str| {
-        let http = RecordedHttp::new().with_headers(&api_url(path, 0), status, headers, body);
+        let http = RecordedHttp::new().with_headers(
+            &member_url("/lists/5101/items", 0),
+            status,
+            headers,
+            body,
+        );
         block_on(fetch(
             &http,
-            Some(KEY),
-            &request("fixture-curator/fixture-picks", None, None),
+            &member_request(SOURCE_MY_LIST, &[(PARAM_LIST_ID, "5101")], None),
         ))
         .unwrap_err()
     };
@@ -320,7 +291,6 @@ fn errors_map_to_host_failure_classes() {
         let http = RecordedHttp::new().with(PUBLIC_URL, status, body);
         block_on(fetch(
             &http,
-            None,
             &request("fixture-curator/fixture-picks", None, None),
         ))
         .unwrap_err()
@@ -341,7 +311,7 @@ fn errors_map_to_host_failure_classes() {
         ..request("a/b", None, None)
     };
     assert_eq!(
-        block_on(fetch(&RecordedHttp::new(), None, &unknown))
+        block_on(fetch(&RecordedHttp::new(), &unknown))
             .unwrap_err()
             .code,
         PluginErrorCode::Unsupported
@@ -349,32 +319,18 @@ fn errors_map_to_host_failure_classes() {
 }
 
 #[test]
-fn health_checks_the_key_when_one_is_set() {
-    let health = |http: &RecordedHttp, key: Option<&str>| match block_on(run(
-        http,
-        key,
+fn health_has_no_server_key_to_check() {
+    let http = RecordedHttp::new();
+    match block_on(run(
+        &http,
         PluginListCommand::Health(ListPluginHealthRequest {}),
     )) {
-        PluginListCommandResult::Health(scryer_plugin_sdk::PluginResult::Ok(health)) => health,
+        PluginListCommandResult::Health(scryer_plugin_sdk::PluginResult::Err(error)) => {
+            assert_eq!(error.code, PluginErrorCode::Unsupported);
+        }
         other => panic!("unexpected {other:?}"),
-    };
-    let user_url = format!("{API_BASE}/user?apikey={KEY}");
-    let good = RecordedHttp::new().with(
-        &user_url,
-        200,
-        r#"{"api_requests": 1000, "api_requests_count": 12, "username": "fixture"}"#,
-    );
-    let healthy = health(&good, Some(KEY));
-    assert!(healthy.healthy);
-    assert_eq!(
-        healthy.message.as_deref(),
-        Some("12 of 1000 daily API requests used")
-    );
-    let bad = RecordedHttp::new().with(&user_url, 401, r#"{"error":"Invalid API key"}"#);
-    assert!(!health(&bad, Some(KEY)).healthy);
-    let none = RecordedHttp::new();
-    assert!(health(&none, None).healthy);
-    assert!(none.urls().is_empty());
+    }
+    assert!(http.urls().is_empty());
 }
 
 const USER_JSON: &str = r#"{"api_requests": 1000, "api_requests_count": 12, "user_id": 7301,
@@ -392,12 +348,10 @@ const MY_LISTS_JSON: &str = r#"[
 
 fn account_of(
     http: &RecordedHttp,
-    server_key: Option<&str>,
     member_key: &str,
 ) -> Result<scryer_plugin_sdk::ListPluginAccountResponse, scryer_plugin_sdk::PluginError> {
     match block_on(run(
         http,
-        server_key,
         PluginListCommand::Account(ListPluginAccountRequest {
             credential: member_credential(member_key),
         }),
@@ -418,8 +372,7 @@ fn a_members_key_names_their_account_and_their_lists() {
         RecordedHttp::new()
             .with(&user_url, 200, USER_JSON)
             .with(&lists_url, 200, MY_LISTS_JSON);
-    // The server's own key is configured too, and is never the one sent.
-    let account = account_of(&http, Some(KEY), MEMBER_KEY).unwrap();
+    let account = account_of(&http, MEMBER_KEY).unwrap();
     assert_eq!(http.urls(), vec![user_url, lists_url]);
     assert_eq!(account.external_user_id, "7301");
     assert_eq!(account.username, "fixture-member");
@@ -453,7 +406,7 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
     let user_url = format!("{API_BASE}/user?apikey={MEMBER_KEY}");
     let refused = |status: u16| {
         let http = RecordedHttp::new().with(&user_url, status, r#"{"error":"Invalid API key"}"#);
-        account_of(&http, None, MEMBER_KEY).unwrap_err()
+        account_of(&http, MEMBER_KEY).unwrap_err()
     };
     assert_eq!(refused(401).code, PluginErrorCode::AuthFailed);
     assert_eq!(refused(403).code, PluginErrorCode::AuthFailed);
@@ -465,7 +418,7 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
         &[("Retry-After", "120")],
         r#"{"error":"Daily API limit exceeded!"}"#,
     );
-    let limited = account_of(&limited, None, MEMBER_KEY).unwrap_err();
+    let limited = account_of(&limited, MEMBER_KEY).unwrap_err();
     assert_eq!(
         (limited.code, limited.retry_after_seconds),
         (PluginErrorCode::RateLimited, Some(120))
@@ -474,15 +427,14 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
     // An answer that names nobody links nobody.
     let nameless = RecordedHttp::new().with(&user_url, 200, r#"{"username": "fixture-member"}"#);
     assert_eq!(
-        account_of(&nameless, None, MEMBER_KEY).unwrap_err().code,
+        account_of(&nameless, MEMBER_KEY).unwrap_err().code,
         PluginErrorCode::Permanent
     );
 
-    // A blank key is refused without asking MDBList, and the server key
-    // never stands in for it.
+    // A blank key is refused without asking MDBList.
     let silent = RecordedHttp::new();
     assert_eq!(
-        account_of(&silent, Some(KEY), "  ").unwrap_err().code,
+        account_of(&silent, "  ").unwrap_err().code,
         PluginErrorCode::AuthFailed
     );
     assert!(silent.urls().is_empty());
@@ -493,7 +445,7 @@ fn a_key_mdblist_refuses_is_an_auth_failure_and_other_trouble_is_not() {
 }
 
 #[test]
-fn a_members_own_list_is_read_with_their_key_and_never_the_servers() {
+fn a_members_own_list_is_read_with_their_key() {
     let http = RecordedHttp::new().with_headers(
         &member_url("/lists/5101/items", 0),
         200,
@@ -502,7 +454,6 @@ fn a_members_own_list_is_read_with_their_key_and_never_the_servers() {
     );
     let response = fetch_ok(
         &http,
-        Some(KEY),
         member_request(SOURCE_MY_LIST, &[(PARAM_LIST_ID, "5101")], None),
     );
     assert_eq!(http.urls(), vec![member_url("/lists/5101/items", 0)]);
@@ -511,7 +462,7 @@ fn a_members_own_list_is_read_with_their_key_and_never_the_servers() {
 
     let fails = |request: ListPluginFetchRequest| {
         let http = RecordedHttp::new();
-        let error = block_on(fetch(&http, Some(KEY), &request)).unwrap_err();
+        let error = block_on(fetch(&http, &request)).unwrap_err();
         assert!(http.urls().is_empty(), "nothing is asked of MDBList");
         error.code
     };
@@ -543,7 +494,7 @@ fn the_public_source_never_reads_a_members_key() {
         credential: Some(member_credential(MEMBER_KEY)),
         ..request("fixture-curator/fixture-picks", None, None)
     };
-    fetch_ok(&http, None, with_credential);
+    fetch_ok(&http, with_credential);
     assert_eq!(http.urls(), vec![PUBLIC_URL.to_string()]);
 }
 
@@ -562,11 +513,7 @@ const WATCHLIST_JSON: &str = r#"{
 #[test]
 fn a_members_watchlist_is_read_whole_and_paged_when_mdblist_says_more_follows() {
     let http = RecordedHttp::new().with(&member_url("/watchlist/items", 0), 200, WATCHLIST_JSON);
-    let whole = fetch_ok(
-        &http,
-        Some(KEY),
-        member_request(SOURCE_WATCHLIST, &[], None),
-    );
+    let whole = fetch_ok(&http, member_request(SOURCE_WATCHLIST, &[], None));
     assert_eq!(http.urls(), vec![member_url("/watchlist/items", 0)]);
     let keys: Vec<_> = whole
         .items
@@ -585,16 +532,12 @@ fn a_members_watchlist_is_read_whole_and_paged_when_mdblist_says_more_follows() 
             200,
             WATCHLIST_JSON,
         );
-    let first = fetch_ok(&paged, None, member_request(SOURCE_WATCHLIST, &[], None));
+    let first = fetch_ok(&paged, member_request(SOURCE_WATCHLIST, &[], None));
     assert_eq!(first.next_cursor, Some(PAGE_LIMIT.to_string()));
     assert_eq!(first.total_hint, Some(2));
     assert!(first.fingerprint.is_none());
     let cursor = PAGE_LIMIT.to_string();
-    let second = fetch_ok(
-        &paged,
-        None,
-        member_request(SOURCE_WATCHLIST, &[], Some(&cursor)),
-    );
+    let second = fetch_ok(&paged, member_request(SOURCE_WATCHLIST, &[], Some(&cursor)));
     assert!(second.next_cursor.is_none());
     assert_eq!(second.items[0].rank, Some(PAGE_LIMIT + 1));
 }
@@ -607,7 +550,6 @@ fn a_watchlist_is_never_cut_short_or_read_as_gone() {
     let endless = RecordedHttp::new().with(&member_url("/watchlist/items", last), 200, &more);
     let error = block_on(fetch(
         &endless,
-        None,
         &member_request(SOURCE_WATCHLIST, &[], Some(&cursor)),
     ))
     .unwrap_err();
@@ -616,12 +558,7 @@ fn a_watchlist_is_never_cut_short_or_read_as_gone() {
 
     let answered = |status: u16| {
         let http = RecordedHttp::new().with(&member_url("/watchlist/items", 0), status, "{}");
-        block_on(fetch(
-            &http,
-            None,
-            &member_request(SOURCE_WATCHLIST, &[], None),
-        ))
-        .unwrap_err()
+        block_on(fetch(&http, &member_request(SOURCE_WATCHLIST, &[], None))).unwrap_err()
     };
     assert_eq!(answered(401).code, PluginErrorCode::AuthFailed);
     assert_eq!(answered(403).code, PluginErrorCode::AuthFailed);

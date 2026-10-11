@@ -685,6 +685,27 @@ impl<H: ListHttp> Client<'_, H> {
     ) -> Result<ListPluginAccountResponse, PluginError> {
         self.app()?;
         let token = member_token(Some(&request.credential))?;
+        // A linked account already names its member, so only its lists are
+        // read. The profile is read once, when the account is linked.
+        let known = |value: &Option<String>| value.clone().filter(|value| !value.trim().is_empty());
+        if let (Some(external_user_id), Some(username)) = (
+            known(&request.credential.external_user_id),
+            known(&request.credential.username),
+        ) {
+            // Every list names its owner, so a member with lists is still
+            // described as Trakt has them now, a new username included. One
+            // with no lists keeps the name the account was linked under.
+            let (owned_lists, owner) = self.owned_lists(&token).await?;
+            let owner = owner.unwrap_or_default();
+            return Ok(ListPluginAccountResponse {
+                external_user_id,
+                username: owner.username.unwrap_or(username),
+                display_name: owner.display_name,
+                avatar_url: owner.avatar_url,
+                owned_lists,
+                statuses: Vec::new(),
+            });
+        }
         let settings = json_body(
             &self
                 .send("/users/settings", Some(&token), "Trakt account")
@@ -695,8 +716,9 @@ impl<H: ListHttp> Client<'_, H> {
             .ok_or_else(|| permanent("Trakt answered without the account's user"))?;
         let ids = user.get("ids");
         let slug = ids.and_then(|ids| json_text(ids.get("slug")));
-        let username = json_text(user.get("username"))
-            .or_else(|| slug.clone())
+        let profile = member_profile(user);
+        let username = profile
+            .username
             .ok_or_else(|| permanent("Trakt answered without the account's username"))?;
         // The uuid survives a username change; older payloads carry only the
         // numeric id.
@@ -707,19 +729,20 @@ impl<H: ListHttp> Client<'_, H> {
         Ok(ListPluginAccountResponse {
             external_user_id,
             username,
-            display_name: json_text(user.get("name")),
-            avatar_url: json_text(
-                user.get("images")
-                    .and_then(|images| images.get("avatar"))
-                    .and_then(|avatar| avatar.get("full")),
-            ),
-            owned_lists: self.owned_lists(&token).await?,
+            display_name: profile.display_name,
+            avatar_url: profile.avatar_url,
+            owned_lists: self.owned_lists(&token).await?.0,
             statuses: Vec::new(),
         })
     }
 
-    async fn owned_lists(&self, token: &str) -> Result<Vec<ListAccountList>, PluginError> {
+    /// The member's own lists, and the member as the first list names them.
+    async fn owned_lists(
+        &self,
+        token: &str,
+    ) -> Result<(Vec<ListAccountList>, Option<MemberProfile>), PluginError> {
         let mut lists = Vec::new();
+        let mut owner = None;
         let mut page = 1;
         loop {
             let response = self
@@ -736,6 +759,9 @@ impl<H: ListHttp> Client<'_, H> {
                 }) else {
                     continue;
                 };
+                if owner.is_none() {
+                    owner = entry.get("user").map(member_profile);
+                }
                 lists.push(ListAccountList {
                     name: json_text(entry.get("name")).unwrap_or_else(|| id.clone()),
                     id,
@@ -744,10 +770,31 @@ impl<H: ListHttp> Client<'_, H> {
             }
             let page_count = header_number(&response, "x-pagination-page-count").unwrap_or(page);
             if page >= page_count.min(MAX_ACCOUNT_LIST_PAGES) {
-                return Ok(lists);
+                return Ok((lists, owner));
             }
             page += 1;
         }
+    }
+}
+
+/// What a Trakt user object says the member is called.
+#[derive(Default)]
+struct MemberProfile {
+    username: Option<String>,
+    display_name: Option<String>,
+    avatar_url: Option<String>,
+}
+
+fn member_profile(user: &Value) -> MemberProfile {
+    MemberProfile {
+        username: json_text(user.get("username"))
+            .or_else(|| json_text(user.get("ids").and_then(|ids| ids.get("slug")))),
+        display_name: json_text(user.get("name")),
+        avatar_url: json_text(
+            user.get("images")
+                .and_then(|images| images.get("avatar"))
+                .and_then(|avatar| avatar.get("full")),
+        ),
     }
 }
 

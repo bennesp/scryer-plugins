@@ -4415,6 +4415,11 @@ async fn newznab_categories() -> serde_json::Value {
     })
 }
 
+/// Fetch category options using the owning plugin's normalized configuration.
+pub async fn newznab_categories_with_config(config: &NewznabConfig) -> serde_json::Value {
+    serde_json::json!({ "options": category_options(fetch_categories(config).await.ok()) })
+}
+
 async fn fetch_categories(config: &NewznabConfig) -> Result<Vec<NewznabCategoryOption>, Error> {
     let endpoint = build_endpoint(&config.base_url, &config.api_path)?;
     let caps = fetch_capabilities(config, &endpoint).await?;

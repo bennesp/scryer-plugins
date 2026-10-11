@@ -219,7 +219,7 @@ dependencies = [
 
 [[package]]
 name = "mdblist-list-provider"
-version = "2.0.0"
+version = "2.0.1"
 dependencies = [
  "list-provider-common",
  "regex",

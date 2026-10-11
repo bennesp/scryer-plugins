@@ -395,7 +395,18 @@ impl contract_v1_1::scryer::indexer::host::HostWithStore<DescriptorCtx> for HasS
     }
 }
 
-pub(crate) fn descriptor_from_component(wasm: &[u8]) -> Result<Option<PluginDescriptor>> {
+/// A plugin's descriptor, read from its `describe` export.
+pub(crate) struct DescribedPlugin {
+    /// The descriptor as far as the SDK this tool is built against reads it.
+    /// A plugin built against a newer SDK can declare fields this view lacks.
+    pub(crate) descriptor: PluginDescriptor,
+    /// The document exactly as the plugin wrote it. This, not `descriptor`, is
+    /// what a packaged artifact carries: writing the typed view back out would
+    /// drop every field this tool's SDK does not know.
+    pub(crate) document: Vec<u8>,
+}
+
+pub(crate) fn describe_component(wasm: &[u8]) -> Result<Option<DescribedPlugin>> {
     if !wasm.starts_with(b"\0asm\r\0\x01\0") {
         return Ok(None);
     }
@@ -481,7 +492,10 @@ pub(crate) fn descriptor_from_component(wasm: &[u8]) -> Result<Option<PluginDesc
     if encoded.is_empty() {
         bail!("plugin component describe returned an empty descriptor")
     }
-    Ok(Some(descriptor))
+    Ok(Some(DescribedPlugin {
+        descriptor,
+        document: encoded,
+    }))
 }
 
 #[cfg(test)]

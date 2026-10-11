@@ -1,4 +1,4 @@
-//! AnimeTosho.xyz subtitles, as a WASI Preview 2 component.
+//! AnimeTosho.net subtitles, as a WASI Preview 2 component.
 //!
 //! The plugin implements `scryer:subtitle/subtitle-provider@1.1.0`: two
 //! exports carrying UTF-8 JSON (`describe` returns a `PluginDescriptor`,
@@ -73,9 +73,9 @@ scryer_plugin_pdk::scryer_subtitle_component_main!(
     handler = handle_subtitle_command,
 );
 
-const DEFAULT_BASE_URL: &str = "https://feed.animetosho.xyz";
-const DEFAULT_SITE_URL: &str = "https://animetosho.xyz";
-const STORAGE_BASE_URL: &str = "https://storage.animetosho.xyz";
+const DEFAULT_BASE_URL: &str = "https://feed.animetosho.net";
+const DEFAULT_SITE_URL: &str = "https://animetosho.net";
+const STORAGE_BASE_URL: &str = "https://storage.animetosho.net";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), " v", env!("CARGO_PKG_VERSION"));
 const DEFAULT_SEARCH_THRESHOLD: usize = 6;
 const MAX_SEARCH_THRESHOLD: usize = 15;
@@ -152,7 +152,7 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         PluginSubtitleCommand::Generate(_) => {
             PluginSubtitleCommandResult::Generate(PluginResult::Err(PluginError {
                 code: PluginErrorCode::Unsupported,
-                public_message: "AnimeTosho.xyz is a catalog subtitle provider and cannot \
+                public_message: "AnimeTosho.net is a catalog subtitle provider and cannot \
                                  generate subtitles"
                     .to_string(),
                 debug_message: Some(
@@ -164,13 +164,13 @@ async fn handle_subtitle_command(command: PluginSubtitleCommand) -> PluginSubtit
         }
         // Alignment moved into this envelope when the subtitle-sync plugin
         // migrated off its own transport, so every subtitle provider now sees
-        // the operation whether or not it can serve one. AnimeTosho.xyz cannot: it has
+        // the operation whether or not it can serve one. AnimeTosho.net cannot: it has
         // no audio decoder and advertises no `sync` capability. Same in-band
         // refusal as `Generate`, for the same reason.
         PluginSubtitleCommand::Sync(_) => {
             PluginSubtitleCommandResult::Sync(PluginResult::Err(PluginError {
                 code: PluginErrorCode::Unsupported,
-                public_message: "AnimeTosho.xyz cannot align subtitles".to_string(),
+                public_message: "AnimeTosho.net cannot align subtitles".to_string(),
                 debug_message: Some(
                     "SubtitleCapabilities::sync is None for this provider".to_string(),
                 ),
@@ -289,7 +289,7 @@ impl AnimeToshoConfig {
 fn descriptor() -> PluginDescriptor {
     PluginDescriptor {
         id: "animetosho-xyz-subtitles".to_string(),
-        name: "AnimeTosho.xyz Subtitles".to_string(),
+        name: "AnimeTosho.net Subtitles".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
@@ -300,9 +300,9 @@ fn descriptor() -> PluginDescriptor {
             config_fields: config_fields(),
             default_base_url: Some(DEFAULT_BASE_URL.to_string()),
             allowed_hosts: vec![
-                "feed.animetosho.xyz".to_string(),
-                "animetosho.xyz".to_string(),
-                "storage.animetosho.xyz".to_string(),
+                "feed.animetosho.net".to_string(),
+                "animetosho.net".to_string(),
+                "storage.animetosho.net".to_string(),
             ],
             capabilities: SubtitleCapabilities {
                 mode: SubtitleProviderMode::Catalog,
@@ -344,7 +344,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             role: Some(ConfigFieldRole::ConnectionUrl),
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.xyz JSON API base URL".to_string()),
+            help_text: Some("AnimeTosho.net JSON API base URL".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -357,7 +357,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             role: Some(ConfigFieldRole::ConnectionUrl),
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.xyz web site URL used for subtitle links".to_string()),
+            help_text: Some("AnimeTosho.net web site URL used for subtitle links".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -370,7 +370,7 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             role: None,
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.xyz API key".to_string()),
+            help_text: Some("AnimeTosho.net API key".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -971,7 +971,7 @@ mod tests {
         assert_eq!(links[1].language, "pob");
         assert_eq!(
             links[2].url,
-            "https://animetosho.xyz/download/619135/subs/file/94009"
+            "https://animetosho.net/download/619135/subs/file/94009"
         );
     }
 

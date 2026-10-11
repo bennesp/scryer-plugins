@@ -221,10 +221,10 @@ struct ReleaseOptions {
 struct ReleasePublishTagsArgs {
     #[arg(
         long,
-        value_name = "BRANCH",
-        help = "Publish one plugin patch from a merged maintenance-branch PR"
+        value_name = "REF",
+        help = "Publish one plugin patch from a signed ancestor included in the merged main PR"
     )]
-    maintenance_branch: Option<String>,
+    maintenance_ref: Option<String>,
     #[arg(long)]
     pr: u64,
     #[arg(
@@ -3193,27 +3193,53 @@ fn maintenance_line_latest(plugin_id: &str, candidate: &Version, tags: &str) -> 
         )
 }
 
-fn publication_base_branch(args: &ReleasePublishTagsArgs) -> Result<&str> {
-    let Some(branch) = args.maintenance_branch.as_deref() else {
-        return Ok("main");
+fn validate_maintenance_publication(args: &ReleasePublishTagsArgs) -> Result<()> {
+    let Some(source) = args.maintenance_ref.as_deref() else {
+        return Ok(());
     };
-    if branch == "main"
-        || branch.is_empty()
-        || branch.starts_with('-')
+    if source.is_empty()
+        || source.starts_with('-')
         || args.plugin_ids.len() != 1
         || !args.rule_pack_ids.is_empty()
         || args.resume
         || args.catalog_only_from.is_some()
     {
         bail!(
-            "--maintenance-branch requires a non-main branch and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog"
+            "--maintenance-ref requires a source ref and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog"
         );
     }
-    Ok(branch)
+    Ok(())
+}
+
+fn publication_source_commit(
+    ctx: &TaskContext,
+    source_ref: Option<&str>,
+    merge_commit: &str,
+) -> Result<String> {
+    let Some(source_ref) = source_ref else {
+        return Ok(merge_commit.to_string());
+    };
+    let source = git_capture(
+        ctx,
+        &["rev-parse", "--verify", &format!("{source_ref}^{{commit}}")],
+    )?
+    .trim()
+    .to_string();
+    run_checked(
+        ctx.command_in("git", &ctx.repo_root)
+            .args(["verify-commit", &source]),
+    )
+    .context("maintenance source commit must have a valid signature")?;
+    let mut ancestor = ctx.command_in("git", &ctx.repo_root);
+    ancestor.args(["merge-base", "--is-ancestor", &source, merge_commit]);
+    if !run_status(&mut ancestor)?.success() {
+        bail!("maintenance source {source} is not included in merged PR commit {merge_commit}");
+    }
+    Ok(source)
 }
 
 fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> Result<()> {
-    let base_branch = publication_base_branch(&args)?.to_string();
+    validate_maintenance_publication(&args)?;
     if args.resume && (!args.plugin_ids.is_empty() || args.rule_pack_ids.len() != 1) {
         bail!("--resume requires exactly one --rule-pack-id and no --plugin-id");
     }
@@ -3227,31 +3253,20 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     step("Checking merged release PR");
     require_clean_worktree(ctx)?;
     fetch_origin_main_and_tags(ctx)?;
-    if args.maintenance_branch.is_some() {
-        run_checked(ctx.command_in("git", &ctx.repo_root).args([
-            "check-ref-format",
-            "--branch",
-            &base_branch,
-        ]))?;
-        let refspec = format!("refs/heads/{base_branch}:refs/remotes/origin/{base_branch}");
-        run_checked(
-            ctx.command_in("git", &ctx.repo_root)
-                .args(["fetch", "origin", &refspec]),
-        )?;
-    }
-    let merge_commit = merged_pull_request_commit(ctx, args.pr, &base_branch)?;
+    let merge_commit = merged_pull_request_commit(ctx, args.pr, "main")?;
+    let source_commit =
+        publication_source_commit(ctx, args.maintenance_ref.as_deref(), &merge_commit)?;
     let head = git_capture(ctx, &["rev-parse", "HEAD"])?;
-    if head.trim() != merge_commit {
+    if head.trim() != source_commit {
         bail!(
-            "local HEAD {} does not match merged pull request #{} commit {}",
+            "local HEAD {} does not match the selected publication source {source_commit} from PR #{}",
             head.trim(),
-            args.pr,
-            merge_commit
-        )
+            args.pr
+        );
     }
     let mut ancestor = ctx.command_in("git", &ctx.repo_root);
-    let remote_base = format!("refs/remotes/origin/{base_branch}");
-    ancestor.args(["merge-base", "--is-ancestor", &merge_commit, &remote_base]);
+    let remote_base = "refs/remotes/origin/main";
+    ancestor.args(["merge-base", "--is-ancestor", &merge_commit, remote_base]);
     if !run_status(&mut ancestor)?.success() {
         bail!("merged pull request commit {merge_commit} is not reachable from {remote_base}")
     }
@@ -3324,7 +3339,7 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     let targets = if selected_plugin_ids.is_empty() && !selected_rule_pack_ids.is_empty() {
         Vec::new()
     } else {
-        publishable_release_targets(ctx, &selected_plugin_ids, args.maintenance_branch.is_some())?
+        publishable_release_targets(ctx, &selected_plugin_ids, args.maintenance_ref.is_some())?
     };
     let rule_pack_tags = selected_rule_pack_tags(ctx, &selected_rule_pack_ids)?;
     if targets.is_empty() && rule_pack_tags.is_empty() {
@@ -10705,7 +10720,7 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
         for (options, valid) in [
             (
                 vec![
-                    "--maintenance-branch",
+                    "--maintenance-ref",
                     "bugfix/newznab-2.3",
                     "--plugin-id",
                     "newznab",
@@ -10713,13 +10728,13 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
                 true,
             ),
             (
-                vec!["--maintenance-branch", "main", "--plugin-id", "newznab"],
+                vec!["--maintenance-ref", "", "--plugin-id", "newznab"],
                 false,
             ),
-            (vec!["--maintenance-branch", "bugfix/newznab-2.3"], false),
+            (vec!["--maintenance-ref", "bugfix/newznab-2.3"], false),
             (
                 vec![
-                    "--maintenance-branch",
+                    "--maintenance-ref",
                     "bugfix/newznab-2.3",
                     "--plugin-id",
                     "newznab",
@@ -10730,7 +10745,7 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
             ),
             (
                 vec![
-                    "--maintenance-branch",
+                    "--maintenance-ref",
                     "bugfix/newznab-2.3",
                     "--plugin-id",
                     "newznab",
@@ -10745,7 +10760,7 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
             let Commands::ReleasePublishTags(args) = cli.command else {
                 panic!("command");
             };
-            assert_eq!(publication_base_branch(&args).is_ok(), valid);
+            assert_eq!(validate_maintenance_publication(&args).is_ok(), valid);
         }
     }
 }

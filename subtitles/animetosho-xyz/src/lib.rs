@@ -273,12 +273,25 @@ fn retry_after_from_message(error: &str) -> Option<i64> {
 
 impl AnimeToshoConfig {
     fn from_host() -> Result<Self, String> {
+        Self::from_config(config_string)
+    }
+
+    fn from_config(
+        mut read: impl FnMut(&str) -> Result<Option<String>, String>,
+    ) -> Result<Self, String> {
         Ok(Self {
-            base_url: config_string("base_url")?.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
-            site_url: config_string("site_url")?.unwrap_or_else(|| DEFAULT_SITE_URL.to_string()),
-            api_key: config_string("api_key")?
-                .ok_or_else(|| "api_key is not configured".to_string())?,
-            search_threshold: config_string("search_threshold")?
+            base_url: migrate_animetosho_url(
+                &read("base_url")?
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            ),
+            site_url: migrate_animetosho_url(
+                &read("site_url")?
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or_else(|| DEFAULT_SITE_URL.to_string()),
+            ),
+            api_key: read("api_key")?.ok_or_else(|| "api_key is not configured".to_string())?,
+            search_threshold: read("search_threshold")?
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SEARCH_THRESHOLD)
                 .clamp(1, MAX_SEARCH_THRESHOLD),
@@ -534,13 +547,14 @@ fn download_subtitle_impl(
     config: &AnimeToshoConfig,
     reference: &AnimeToshoDownloadRef,
 ) -> Result<SubtitlePluginDownloadResponse, String> {
+    let url = migrate_animetosho_url(&reference.url);
     let site_prefix = format!("{}/download/", config.site_url.trim_end_matches('/'));
     let storage_prefix = format!("{STORAGE_BASE_URL}/releases/");
-    if !reference.url.starts_with(&site_prefix) && !reference.url.starts_with(&storage_prefix) {
+    if !url.starts_with(&site_prefix) && !url.starts_with(&storage_prefix) {
         return Err("invalid AnimeTosho subtitle download URL".to_string());
     }
 
-    let response = http_get_follow(&reference.url, "application/octet-stream, */*")?;
+    let response = http_get_follow(&url, "application/octet-stream, */*")?;
     if response.status_code() >= 400 {
         return Err(http_error("AnimeTosho subtitle", &response));
     }
@@ -593,7 +607,7 @@ fn api_url(config: &AnimeToshoConfig, path: &str) -> String {
 }
 
 fn http_get_follow(url: &str, accept: &str) -> Result<HttpResponse, String> {
-    let mut current = url.to_string();
+    let mut current = migrate_animetosho_url(url);
     for _ in 0..=MAX_REDIRECTS {
         let response = http_get_with_rate_limit_retry(&current, accept)?;
         if !matches!(response.status_code(), 300..=399) {
@@ -606,7 +620,7 @@ fn http_get_follow(url: &str, accept: &str) -> Result<HttpResponse, String> {
         else {
             return Ok(response);
         };
-        current = resolve_location(&current, location)?;
+        current = migrate_animetosho_url(&resolve_location(&current, location)?);
         std::thread::sleep(Duration::from_millis(100));
     }
     Err("AnimeTosho request exceeded redirect limit".to_string())
@@ -1015,5 +1029,105 @@ mod tests {
 
         assert!(queries.contains(&"Wistoria Wand and Sword 12".to_string()));
         assert!(queries.contains(&"Wistoria Wand and Sword S02E12".to_string()));
+    }
+}
+
+// Rewrite only the URL hostname, never credentials, paths, or lookalike domains.
+fn migrate_animetosho_url(value: &str) -> String {
+    let value = value.trim();
+    let Some((scheme, rest)) = value.split_once("://") else {
+        return value.to_string();
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return value.to_string();
+    }
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let host_start = authority.rfind('@').map_or(0, |index| index + 1);
+    let host_end = authority[host_start..]
+        .find(':')
+        .map_or(authority.len(), |index| host_start + index);
+    let hostname = authority[host_start..host_end]
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if hostname != "animetosho.xyz" && !hostname.ends_with(".animetosho.xyz") {
+        return value.to_string();
+    }
+    let hostname = format!("{}.net", hostname.strip_suffix(".xyz").unwrap());
+    format!(
+        "{scheme}://{}{hostname}{}{}",
+        &authority[..host_start],
+        &authority[host_end..],
+        &rest[authority_end..]
+    )
+}
+
+#[cfg(test)]
+mod legacy_url_tests {
+    use super::*;
+    #[test]
+    fn migrates_only_legacy_hostnames() {
+        for (before, after) in [
+            ("https://feed.animetosho.xyz", "https://feed.animetosho.net"),
+            (
+                " http://FEED.ANIMETOSHO.XYZ:8080/api?q=1#part ",
+                "http://feed.animetosho.net:8080/api?q=1#part",
+            ),
+            (
+                "https://animetosho.xyz./download/42",
+                "https://animetosho.net/download/42",
+            ),
+            (
+                "https://storage.animetosho.xyz/releases/42.xz",
+                "https://storage.animetosho.net/releases/42.xz",
+            ),
+            (
+                "https://user:pass@feed.animetosho.xyz/api",
+                "https://user:pass@feed.animetosho.net/api",
+            ),
+        ] {
+            assert_eq!(migrate_animetosho_url(before), after);
+        }
+        for custom in [
+            "https://feed.animetosho.xyz.example.test/path",
+            "https://notanimetosho.xyz/",
+            "https://feed.animetosho.xyz@example.test/path",
+            "https://example.test/?url=https://animetosho.xyz",
+            "https://example.test/animetosho.xyz",
+            "https://feed.animetosho.net/",
+            "http://[::1]:8080/",
+        ] {
+            assert_eq!(migrate_animetosho_url(custom), custom);
+        }
+    }
+}
+
+#[cfg(test)]
+mod legacy_config_tests {
+    use super::*;
+    #[test]
+    fn saved_configuration_uses_net_for_search_and_download() {
+        let config = AnimeToshoConfig::from_config(|key| {
+            Ok(match key {
+                "base_url" => Some("https://feed.animetosho.xyz/".into()),
+                "site_url" => Some("https://animetosho.xyz".into()),
+                "api_key" => Some("test-key".into()),
+                _ => None,
+            })
+        })
+        .unwrap();
+        assert_eq!(
+            api_url(&config, "/json/v1/search?q=test"),
+            "https://feed.animetosho.net/json/v1/search?q=test&apikey=test-key"
+        );
+        let links = parse_subtitle_links(
+            r#"<a href="/download/42/subs/file/7">English [eng, ASS]</a>"#,
+            42,
+            &config.site_url,
+        );
+        assert_eq!(
+            links[0].url,
+            "https://animetosho.net/download/42/subs/file/7"
+        );
     }
 }

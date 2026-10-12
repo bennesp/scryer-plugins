@@ -188,6 +188,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::ArchiveExtractor(ArchiveExtractorDescriptor {
             provider_type: "archive-extraction".to_string(),
             provider_aliases: vec![],
@@ -195,6 +196,7 @@ fn build_descriptor() -> PluginDescriptor {
             default_base_url: None,
             allowed_hosts: vec![],
             capabilities: ArchiveExtractorCapabilities {
+                enforced_limits: false,
                 formats: vec![
                     ArchivePluginFormat::Rar,
                     ArchivePluginFormat::Zip,
@@ -1323,6 +1325,8 @@ fn sevenz_error_from_message(message: Option<&str>) -> sevenz_turbo::Error {
 pub(crate) fn empty_response() -> ArchivePluginProcessResponse {
     ArchivePluginProcessResponse {
         status: ArchivePluginStatus::Failed,
+        replaced_source_paths: vec![],
+        processed_recovery_paths: vec![],
         files: vec![],
         expanded_bytes: None,
         copied_bytes: None,

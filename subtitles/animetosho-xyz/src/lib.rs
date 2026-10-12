@@ -312,11 +312,9 @@ fn descriptor() -> PluginDescriptor {
             provider_aliases: vec![],
             config_fields: config_fields(),
             default_base_url: Some(DEFAULT_BASE_URL.to_string()),
-            allowed_hosts: vec![
-                "feed.animetosho.net".to_string(),
-                "animetosho.net".to_string(),
-                "storage.animetosho.net".to_string(),
-            ],
+            // Match every official subdomain accepted by legacy URL migration,
+            // including stored attachment URLs and redirect destinations.
+            allowed_hosts: vec!["animetosho.net".into(), "*.animetosho.net".into()],
             capabilities: SubtitleCapabilities {
                 mode: SubtitleProviderMode::Catalog,
                 supported_media_kinds: vec![SubtitleQueryMediaKind::Episode],
@@ -1065,6 +1063,15 @@ fn migrate_animetosho_url(value: &str) -> String {
 #[cfg(test)]
 mod legacy_url_tests {
     use super::*;
+    #[test]
+    fn descriptor_authorizes_the_migration_domain() {
+        let descriptor = descriptor();
+        let hosts = descriptor.allowed_hosts();
+        assert!(hosts.iter().any(|host| host == "animetosho.net"));
+        assert!(hosts.iter().any(|host| host == "*.animetosho.net"));
+        assert!(!hosts.iter().any(|host| host == "*"));
+    }
+
     #[test]
     fn migrates_only_legacy_hostnames() {
         for (before, after) in [

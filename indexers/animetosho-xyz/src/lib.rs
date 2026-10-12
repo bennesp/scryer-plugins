@@ -158,7 +158,9 @@ fn build_descriptor() -> PluginDescriptor {
             },
             scoring_policies: vec![],
             config_fields: config_fields(),
-            allowed_hosts: vec![],
+            // Saved .xyz URLs are migrated before HTTP; the host must also
+            // authorize the destination independently of the saved base URL.
+            allowed_hosts: vec!["animetosho.net".into(), "*.animetosho.net".into()],
             rate_limit_seconds: Some(2),
         }),
     }
@@ -997,6 +999,15 @@ fn migrate_animetosho_url(value: &str) -> String {
 #[cfg(test)]
 mod legacy_url_tests {
     use super::*;
+    #[test]
+    fn descriptor_authorizes_the_migration_domain() {
+        let descriptor = build_descriptor();
+        let hosts = descriptor.allowed_hosts();
+        assert!(hosts.iter().any(|host| host == "animetosho.net"));
+        assert!(hosts.iter().any(|host| host == "*.animetosho.net"));
+        assert!(!hosts.iter().any(|host| host == "*"));
+    }
+
     #[test]
     fn migrates_only_legacy_hostnames() {
         for (before, after) in [

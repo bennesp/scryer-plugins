@@ -23,7 +23,7 @@ fn build_descriptor() -> PluginDescriptor {
             provider_type: "torznab".to_string(),
             provider_aliases: vec!["jackett".to_string()],
             provider_profiles: vec![],
-            search_semantics_version: Some(2),
+            search_semantics_version: Some(3),
             strategy_plan: Some(scryer_plugin_sdk::IndexerStrategyPlanCapability {
                 version: 1,
                 max_parallel_strategies: 4,

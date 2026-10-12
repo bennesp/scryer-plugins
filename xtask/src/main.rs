@@ -3715,6 +3715,37 @@ fn run_plugin_validate(ctx: &TaskContext, args: PluginValidateArgs) -> Result<()
             document: current_descriptor_json,
         } = describe_plugin_wasm(&wasm_path)?;
         validate_descriptor_contract(&current_descriptor)?;
+        let (packaged, compressed, compressed_br, _) = optimize_and_compress_wasm(
+            ctx,
+            &wasm_path,
+            &plugin_dir.join("target/validated-package"),
+            feature_set,
+            PluginArtifactLane::V3,
+        )?;
+        let expected: serde_json::Value = serde_json::from_slice(&current_descriptor_json)?;
+        let packaged_bytes = fs::read(&packaged)?;
+        let (_, embedded) = descriptor_custom_section(&packaged_bytes)?
+            .ok_or_else(|| anyhow!("packaged plugin is missing its descriptor"))?;
+        let actual: serde_json::Value = serde_json::from_slice(embedded)?;
+        if actual != expected {
+            bail!(
+                "packaging changed the plugin's descriptor: {}",
+                packaged.display()
+            );
+        }
+        let decoded_zstd = zstd::decode_all(fs::File::open(&compressed)?)?;
+        let mut decoded_br = Vec::new();
+        std::io::Read::read_to_end(
+            &mut brotli::Decompressor::new(fs::File::open(&compressed_br)?, 4096),
+            &mut decoded_br,
+        )?;
+        if decoded_zstd != packaged_bytes || decoded_br != packaged_bytes {
+            bail!("compressed plugin differs from the validated package");
+        }
+        ok(format!(
+            "Validated packaged artifact {}",
+            packaged.display()
+        ));
         if let Some(expected_json) = &descriptor_json {
             if expected_json != &current_descriptor_json {
                 bail!(

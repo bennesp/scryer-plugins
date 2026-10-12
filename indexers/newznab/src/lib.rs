@@ -38,7 +38,7 @@ fn build_descriptor() -> PluginDescriptor {
             provider_type: "newznab".to_string(),
             provider_aliases: vec!["nzbgeek".to_string(), "dognzb".to_string()],
             provider_profiles,
-            search_semantics_version: Some(2),
+            search_semantics_version: Some(3),
             strategy_plan: Some(scryer_plugin_sdk::IndexerStrategyPlanCapability {
                 version: 1,
                 max_parallel_strategies: 4,

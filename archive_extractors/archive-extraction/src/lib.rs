@@ -27,7 +27,7 @@
 //! handled data-driven inside [`par2`]: when the source directory has one it is
 //! verified, placed, and repaired before extraction starts.
 
-use lzma_turbo::hooks::{HostHashHooks, HostSha256Handle, install_host_hash_hooks};
+use lzma_turbo::hooks::{HostHashHooks, install_host_hash_hooks};
 use lzma_turbo::xz::{XzError, XzErrorKind, XzReader};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -45,6 +45,7 @@ use std::path::{Component, Path, PathBuf};
 use unrar_rs::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
 use unrar_rs::{RarArchive, RarError};
 
+mod guest_sha256;
 mod par2;
 mod split_volumes;
 
@@ -107,8 +108,9 @@ export!(ArchiveExtractorComponent);
 /// AES-CBC decrypt, and lzma-turbo's bulk CRC-32 and CRC-64/XZ at the world's
 /// `crypto` import.
 ///
-/// lzma-turbo's SHA-256 hooks are never called: `crypto-host` is off, and the
-/// xz SHA-256 check stays on the in-guest RustCrypto backend.
+/// sevenz-turbo enables lzma-turbo's SHA-256 hooks transitively. The archive
+/// world has no SHA-256 import, so those hooks retain the guest RustCrypto
+/// backend through a streaming handle adapter.
 ///
 /// All three crates are transport-agnostic — they hold plain `fn` pointers and know
 /// nothing about WIT — so this adapter is the whole seam between them and the
@@ -166,17 +168,14 @@ fn install_crypto_hooks() {
         aes_cbc_decrypt: sevenz_aes_cbc_decrypt,
     });
 
-    fn sha256_not_delegated() -> ! {
-        unreachable!("lzma-turbo `crypto-host` is off; SHA-256 is computed in the guest")
-    }
     install_host_hash_hooks(HostHashHooks::new(
         crc32,
         crc64_xz,
-        || sha256_not_delegated(),
-        |_: HostSha256Handle| sha256_not_delegated(),
-        |_: HostSha256Handle, _: &[u8]| sha256_not_delegated(),
-        |_: HostSha256Handle| sha256_not_delegated(),
-        |_: HostSha256Handle| sha256_not_delegated(),
+        guest_sha256::init,
+        guest_sha256::clone,
+        guest_sha256::update,
+        guest_sha256::finalize,
+        guest_sha256::release,
     ));
 }
 

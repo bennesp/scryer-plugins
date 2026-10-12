@@ -57,7 +57,7 @@ pub(super) fn finalize(handle: HostSha256Handle) -> [u8; 32] {
 }
 
 pub(super) fn release(handle: HostSha256Handle) {
-    drop(take(handle));
+    let _ = take(handle);
 }
 
 #[cfg(test)]

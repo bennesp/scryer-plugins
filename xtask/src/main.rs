@@ -247,6 +247,12 @@ struct ReleasePublishTagsArgs {
     )]
     plugin_ids: Vec<String>,
     #[arg(
+        long = "plugin-source",
+        value_name = "PLUGIN_ID=REF",
+        help = "Publish this plugin's manifest version from REF, a signed commit included in the merged main PR, with the trigger's own xtask; repeat per line to publish, and combine with --plugin-id to publish the HEAD line of the same plugin in the same trigger"
+    )]
+    plugin_sources: Vec<String>,
+    #[arg(
         long = "rule-pack-id",
         help = "Publish only this rule-pack id; repeat for multiple packs"
     )]
@@ -3021,7 +3027,6 @@ fn merged_pull_request_commit(ctx: &TaskContext, pr: u64, base_branch: &str) -> 
 fn publishable_release_targets(
     ctx: &TaskContext,
     selected_ids: &BTreeSet<String>,
-    maintenance: bool,
 ) -> Result<Vec<ReleaseTarget>> {
     let mut targets = Vec::new();
     let mut found = BTreeSet::new();
@@ -3030,17 +3035,8 @@ fn publishable_release_targets(
             continue;
         }
         found.insert(candidate.plugin_id.clone());
-        let latest_version = if maintenance {
-            let tags = git_capture(ctx, &["tag"])?;
-            Some(maintenance_line_latest(
-                &candidate.plugin_id,
-                &candidate.version,
-                &tags,
-            )?)
-        } else {
-            latest_plugin_v3_release_tag(ctx, &candidate.plugin_id)?
-                .and_then(|tag| release_tag_version(&candidate.plugin_id, &tag))
-        };
+        let latest_version = latest_plugin_v3_release_tag(ctx, &candidate.plugin_id)?
+            .and_then(|tag| release_tag_version(&candidate.plugin_id, &tag));
         if latest_version
             .as_ref()
             .is_some_and(|latest| &candidate.version <= latest)
@@ -3134,8 +3130,17 @@ fn verify_tag_absent_locally_and_remotely(ctx: &TaskContext, tag: &str) -> Resul
 }
 
 fn create_and_verify_signed_tag(ctx: &TaskContext, tag: &str, message: &str) -> Result<()> {
+    create_and_verify_signed_tag_at(ctx, tag, message, "HEAD")
+}
+
+fn create_and_verify_signed_tag_at(
+    ctx: &TaskContext,
+    tag: &str,
+    message: &str,
+    commit: &str,
+) -> Result<()> {
     let mut create_tag = ctx.command_in("git", &ctx.repo_root);
-    create_tag.args(["tag", "-s", tag, "-m", message, "HEAD"]);
+    create_tag.args(["tag", "-s", tag, "-m", message, commit]);
     run_checked(&mut create_tag)?;
 
     let mut verify_tag = ctx.command_in("git", &ctx.repo_root);
@@ -3202,21 +3207,168 @@ fn maintenance_line_latest(plugin_id: &str, candidate: &Version, tags: &str) -> 
 }
 
 fn validate_maintenance_publication(args: &ReleasePublishTagsArgs) -> Result<()> {
-    let Some(source) = args.maintenance_ref.as_deref() else {
-        return Ok(());
-    };
-    if source.is_empty()
-        || source.starts_with('-')
-        || args.plugin_ids.len() != 1
-        || !args.rule_pack_ids.is_empty()
-        || args.resume
-        || args.catalog_only_from.is_some()
-    {
+    if let Some(source) = args.maintenance_ref.as_deref() {
+        if source.is_empty()
+            || source.starts_with('-')
+            || args.plugin_ids.len() != 1
+            || !args.plugin_sources.is_empty()
+            || !args.rule_pack_ids.is_empty()
+            || args.resume
+            || args.catalog_only_from.is_some()
+        {
+            bail!(
+                "--maintenance-ref requires a source ref and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog (use --plugin-source to combine lines)"
+            );
+        }
+    }
+    if !args.plugin_sources.is_empty() && (args.resume || args.catalog_only_from.is_some()) {
         bail!(
-            "--maintenance-ref requires a source ref and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog"
+            "--plugin-source publishes from a signed ancestor; it cannot resume or republish a catalog"
         );
     }
+    let mut seen = BTreeSet::new();
+    for spec in &args.plugin_sources {
+        if !seen.insert(parse_plugin_source(spec)?) {
+            bail!("--plugin-source {spec} is given twice");
+        }
+    }
     Ok(())
+}
+
+fn parse_plugin_source(spec: &str) -> Result<(String, String)> {
+    let parsed = spec.split_once('=').and_then(|(plugin_id, reference)| {
+        let plugin_id = plugin_id.trim();
+        let reference = reference.trim();
+        (!plugin_id.is_empty()
+            && !plugin_id.contains('/')
+            && !reference.is_empty()
+            && !reference.starts_with('-'))
+        .then(|| (plugin_id.to_string(), reference.to_string()))
+    });
+    parsed.ok_or_else(|| anyhow!("--plugin-source takes PLUGIN_ID=REF; got {spec:?}"))
+}
+
+/// Every plugin published from a commit other than HEAD, as (plugin id,
+/// ref). `--maintenance-ref` is the single-plugin spelling of the same thing.
+fn plugin_sources(args: &ReleasePublishTagsArgs) -> Result<Vec<(String, String)>> {
+    if let Some(reference) = args.maintenance_ref.as_deref() {
+        return Ok(vec![(args.plugin_ids[0].clone(), reference.to_string())]);
+    }
+    args.plugin_sources
+        .iter()
+        .map(|spec| parse_plugin_source(spec))
+        .collect()
+}
+
+/// One plugin version a trigger publishes, pinned to the commit it is built
+/// from. The trigger tag's body lists these so the workflow builds each one
+/// from its own commit (its own lockfile and SDK) with the trigger's xtask.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReleaseComponent {
+    plugin_id: String,
+    version: Version,
+    commit: String,
+    tag_name: String,
+}
+
+/// Official plugin crate manifests tracked at `commit`, as
+/// (repo-relative Cargo.toml path, manifest text), without checking out.
+fn plugin_manifests_at_commit(ctx: &TaskContext, commit: &str) -> Result<Vec<(String, String)>> {
+    let roots = plugin_inventory_roots();
+    let mut args = vec!["ls-tree", "-r", "--name-only", commit, "--"];
+    args.extend(roots.iter().copied());
+    let listing = git_capture(ctx, &args)?;
+    let mut manifests = Vec::new();
+    for path in listing
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts.len() != 3 || parts[2] != "Cargo.toml" || !roots.contains(&parts[0]) {
+            continue;
+        }
+        let text = git_capture(ctx, &["show", &format!("{commit}:{path}")])?;
+        manifests.push((path.to_string(), text));
+    }
+    Ok(manifests)
+}
+
+fn release_component_at_commit(
+    ctx: &TaskContext,
+    plugin_id: &str,
+    commit: &str,
+) -> Result<ReleaseComponent> {
+    let temp = tempfile::tempdir()?;
+    let manifest = temp.path().join("Cargo.toml");
+    for (path, text) in plugin_manifests_at_commit(ctx, commit)? {
+        fs::write(&manifest, &text)?;
+        if !is_plugin_crate(&manifest)? {
+            continue;
+        }
+        let metadata =
+            plugin_manifest_metadata(&manifest).with_context(|| format!("{path} at {commit}"))?;
+        if !metadata.official || metadata.plugin_id.as_deref() != Some(plugin_id) {
+            continue;
+        }
+        let version =
+            version_from_manifest(&manifest).with_context(|| format!("{path} at {commit}"))?;
+        return Ok(ReleaseComponent {
+            plugin_id: plugin_id.to_string(),
+            tag_name: official_plugin_release_tag(plugin_id, &version.to_string()),
+            version,
+            commit: commit.to_string(),
+        });
+    }
+    bail!("{plugin_id} is not an official plugin crate at {commit}")
+}
+
+/// A sourced component is either newer than everything published for the
+/// plugin (an ordinary release built from a non-HEAD commit) or a stable
+/// patch on an already released major/minor line (maintenance).
+fn sourced_component_is_publishable(
+    plugin_id: &str,
+    candidate: &Version,
+    tags: &str,
+) -> Result<()> {
+    let latest = tags
+        .lines()
+        .filter_map(|tag| release_tag_version(plugin_id, tag))
+        .max();
+    match latest {
+        Some(latest) if candidate <= &latest => {
+            let line_latest = maintenance_line_latest(plugin_id, candidate, tags)?;
+            if candidate <= &line_latest {
+                bail!(
+                    "{plugin_id} {candidate} is not newer than {line_latest}, the latest release on its line"
+                );
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Subject plus, when plugins are published, one `component <tag> <commit>`
+/// body line per plugin component. The workflow reads these lines from the
+/// signed trigger instead of looking for tags at the trigger commit.
+fn release_trigger_message(components: &[ReleaseComponent], rule_pack_tags: &[String]) -> String {
+    let names = components
+        .iter()
+        .map(|component| component.tag_name.as_str())
+        .chain(rule_pack_tags.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    let mut message = format!("Release trigger for {}\n", names.join(", "));
+    if !components.is_empty() {
+        message.push('\n');
+        for component in components {
+            message.push_str(&format!(
+                "component {} {}\n",
+                component.tag_name, component.commit
+            ));
+        }
+    }
+    message
 }
 
 fn publication_source_commit(
@@ -3262,12 +3414,10 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     require_clean_worktree(ctx)?;
     fetch_origin_main_and_tags(ctx)?;
     let merge_commit = merged_pull_request_commit(ctx, args.pr, "main")?;
-    let source_commit =
-        publication_source_commit(ctx, args.maintenance_ref.as_deref(), &merge_commit)?;
     let head = git_capture(ctx, &["rev-parse", "HEAD"])?;
-    if head.trim() != source_commit {
+    if head.trim() != merge_commit {
         bail!(
-            "local HEAD {} does not match the selected publication source {source_commit} from PR #{}",
+            "local HEAD {} does not match the merged PR #{} commit {merge_commit}; the trigger is always created there, and --plugin-source names the commits other lines build from",
             head.trim(),
             args.pr
         );
@@ -3342,33 +3492,82 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     }
 
     step("Selecting manifest versions to publish");
-    let selected_plugin_ids = args.plugin_ids.into_iter().collect::<BTreeSet<_>>();
+    let sources = plugin_sources(&args)?;
+    let selected_plugin_ids = if args.maintenance_ref.is_some() {
+        BTreeSet::new()
+    } else {
+        args.plugin_ids.iter().cloned().collect::<BTreeSet<_>>()
+    };
     let selected_rule_pack_ids = args.rule_pack_ids.into_iter().collect::<BTreeSet<_>>();
-    let targets = if selected_plugin_ids.is_empty() && !selected_rule_pack_ids.is_empty() {
+    let head_targets = if selected_plugin_ids.is_empty()
+        && (!selected_rule_pack_ids.is_empty() || !sources.is_empty())
+    {
         Vec::new()
     } else {
-        publishable_release_targets(ctx, &selected_plugin_ids, args.maintenance_ref.is_some())?
+        publishable_release_targets(ctx, &selected_plugin_ids)?
     };
+    let mut components = head_targets
+        .iter()
+        .map(|target| ReleaseComponent {
+            plugin_id: target.plugin_id.clone(),
+            version: target.current_version.clone(),
+            commit: merge_commit.clone(),
+            tag_name: target.tag_name.clone(),
+        })
+        .collect::<Vec<_>>();
+    let published_tags = git_capture(ctx, &["tag"])?;
+    for (plugin_id, reference) in &sources {
+        let commit = publication_source_commit(ctx, Some(reference), &merge_commit)?;
+        let component = release_component_at_commit(ctx, plugin_id, &commit)?;
+        sourced_component_is_publishable(plugin_id, &component.version, &published_tags)?;
+        components.push(component);
+    }
+    let mut selected_tags = BTreeSet::new();
+    for component in &components {
+        if !selected_tags.insert(component.tag_name.clone()) {
+            bail!(
+                "{} is selected from more than one source",
+                component.tag_name
+            );
+        }
+    }
     let rule_pack_tags = selected_rule_pack_tags(ctx, &selected_rule_pack_ids)?;
-    if targets.is_empty() && rule_pack_tags.is_empty() {
+    if components.is_empty() && rule_pack_tags.is_empty() {
         bail!("no selected plugin or rule-pack versions are publishable");
     }
-    let mut component_tags = targets
-        .iter()
-        .map(|target| target.tag_name.clone())
-        .collect::<Vec<_>>();
-    component_tags.extend(rule_pack_tags);
     if args.resume {
-        return resume_rule_pack_tags(ctx, &component_tags[0], &merge_commit);
+        return resume_rule_pack_tags(ctx, &rule_pack_tags[0], &merge_commit);
+    }
+    let mut component_tags = components
+        .iter()
+        .map(|component| component.tag_name.clone())
+        .collect::<Vec<_>>();
+    component_tags.extend(rule_pack_tags.iter().cloned());
+    for component in &components {
+        println!("   {} at {}", component.tag_name, component.commit);
+    }
+    for tag in &rule_pack_tags {
+        println!("   {tag} at {merge_commit}");
     }
     for tag in &component_tags {
-        println!("   {tag}");
         verify_tag_absent_locally_and_remotely(ctx, tag)?;
     }
     let release_tag = repo_release_tag_name(ctx)?;
     verify_tag_absent_locally_and_remotely(ctx, &release_tag)?;
 
-    for tag in &component_tags {
+    for component in &components {
+        step(format!(
+            "Creating signed tag {} at {}",
+            component.tag_name, component.commit
+        ));
+        create_and_verify_signed_tag_at(
+            ctx,
+            &component.tag_name,
+            &format!("Release {}", component.tag_name),
+            &component.commit,
+        )?;
+    }
+    for tag in &rule_pack_tags {
         step(format!("Creating signed tag {tag}"));
         create_and_verify_signed_tag(ctx, tag, &format!("Release {tag}"))?;
     }
@@ -3384,7 +3583,7 @@ fn run_release_publish_tags(ctx: &TaskContext, args: ReleasePublishTagsArgs) -> 
     create_and_verify_signed_tag(
         ctx,
         &release_tag,
-        &format!("Release trigger for {}", component_tags.join(", ")),
+        &release_trigger_message(&components, &rule_pack_tags),
     )?;
     step("Pushing release trigger tag");
     let mut push_trigger = ctx.command_in("git", &ctx.repo_root);
@@ -5268,6 +5467,34 @@ fn read_prepared_catalog_v3_snippet(dir: &Path) -> Result<CatalogV3PluginEntry> 
     read_catalog_v3_snippet_from_path(&path)
 }
 
+/// Every prepared snippet under one plugin's prepared directory: the
+/// directory itself when it holds a snippet, otherwise one `<version>/`
+/// subdirectory per version the run built (a trigger may publish several
+/// lines of one plugin at once).
+fn read_prepared_catalog_v3_entries(dir: &Path) -> Result<Vec<CatalogV3PluginEntry>> {
+    if catalog_v3_snippet_path(dir).is_file() {
+        return Ok(vec![read_prepared_catalog_v3_snippet(dir)?]);
+    }
+    let mut version_dirs = fs::read_dir(dir)
+        .with_context(|| format!("failed to read prepared plugin directory {}", dir.display()))?
+        .map(|entry| Ok(entry?.path()))
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    version_dirs.sort();
+    if version_dirs.is_empty() {
+        bail!(
+            "prepared plugin directory {} holds neither a catalog-v3 snippet nor version subdirectories",
+            dir.display()
+        );
+    }
+    version_dirs
+        .iter()
+        .map(|version_dir| read_prepared_catalog_v3_snippet(version_dir))
+        .collect()
+}
+
 fn read_published_official_catalog(ctx: &TaskContext) -> Result<CatalogV2> {
     let temp = tempfile::tempdir()?;
     let central_path = github_release_download(
@@ -6704,7 +6931,7 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
             if let Some(root) = args.prepared_plugin_root.as_deref() {
                 let prepared_dir = root.join(&plugin.plugin_id);
                 if prepared_dir.is_dir() {
-                    entries.push(read_prepared_catalog_v3_snippet(&prepared_dir)?);
+                    entries.extend(read_prepared_catalog_v3_entries(&prepared_dir)?);
                     continue;
                 }
             }
@@ -6736,7 +6963,7 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
                 {
                     continue;
                 }
-                updates.push(read_prepared_catalog_v3_snippet(&root.join(plugin_id))?);
+                updates.extend(read_prepared_catalog_v3_entries(&root.join(plugin_id))?);
             } else {
                 let plugin = discover_local_official_plugin(ctx, plugin_id)?;
                 if !plugin_publishes_catalog(&plugin, CatalogVersion::V3) {
@@ -10736,6 +10963,157 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
     }
 
     #[test]
+    fn sourced_components_publish_new_versions_or_patches_on_released_lines() {
+        let tags =
+            "plugins-v3/newznab/v2.3.0\nplugins-v3/newznab/v3.0.0\nplugins-v3/torznab/v2.3.9";
+        let version = |text: &str| Version::parse(text).unwrap();
+        sourced_component_is_publishable("newznab", &version("2.3.1"), tags).unwrap();
+        sourced_component_is_publishable("newznab", &version("3.1.0-rc.1"), tags).unwrap();
+        sourced_component_is_publishable("never-published", &version("0.1.0"), tags).unwrap();
+        for rejected in ["2.3.0", "2.4.0", "3.0.0", "2.3.1-beta.1"] {
+            assert!(
+                sourced_component_is_publishable("newznab", &version(rejected), tags).is_err(),
+                "{rejected} must not be publishable"
+            );
+        }
+    }
+
+    #[test]
+    fn release_trigger_message_lists_each_component_with_its_commit() {
+        let components = vec![
+            ReleaseComponent {
+                plugin_id: "newznab".to_string(),
+                version: Version::parse("3.1.0").unwrap(),
+                commit: "a".repeat(40),
+                tag_name: "plugins-v3/newznab/v3.1.0".to_string(),
+            },
+            ReleaseComponent {
+                plugin_id: "newznab".to_string(),
+                version: Version::parse("2.3.3").unwrap(),
+                commit: "b".repeat(40),
+                tag_name: "plugins-v3/newznab/v2.3.3".to_string(),
+            },
+        ];
+        let packs = vec!["rule-packs/trash/v1.2.0".to_string()];
+        assert_eq!(
+            release_trigger_message(&components, &packs),
+            format!(
+                "Release trigger for plugins-v3/newznab/v3.1.0, plugins-v3/newznab/v2.3.3, rule-packs/trash/v1.2.0\n\ncomponent plugins-v3/newznab/v3.1.0 {}\ncomponent plugins-v3/newznab/v2.3.3 {}\n",
+                "a".repeat(40),
+                "b".repeat(40)
+            )
+        );
+        assert_eq!(
+            release_trigger_message(&[], &packs),
+            "Release trigger for rule-packs/trash/v1.2.0\n"
+        );
+    }
+
+    #[test]
+    fn plugin_source_specs_parse_strictly() {
+        assert_eq!(
+            parse_plugin_source("newznab=bugfix/newznab-2.3").unwrap(),
+            ("newznab".to_string(), "bugfix/newznab-2.3".to_string())
+        );
+        for invalid in ["newznab", "=ref", "newznab=", "newznab=-rf", "a/b=ref"] {
+            assert!(parse_plugin_source(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn release_component_is_read_from_the_manifest_at_the_named_commit() {
+        let (_dir, ctx) = temp_task_context();
+        let repo = ctx.repo_root.clone();
+        git_in(&repo, &["init", "-q"]);
+        let manifest = |version: &str| {
+            format!(
+                "[package]\nname = \"scryer-plugin-foo\"\nversion = \"{version}\"\nedition = \"2021\"\nlicense = \"GPL-3.0-only\"\ndescription = \"Foo\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[package.metadata.scryer]\nofficial = true\nplugin_id = \"foo\"\ncatalog_versions = [\"v3\"]\ndocs_url = \"https://example.test/foo\"\nsource_repo = \"https://example.test/foo\"\n"
+            )
+        };
+        fs::create_dir_all(repo.join("indexers/foo")).unwrap();
+        fs::write(repo.join("indexers/foo/Cargo.toml"), manifest("1.0.1")).unwrap();
+        let commit = |message: &str| {
+            git_in(&repo, &["add", "."]);
+            git_in(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@example.test",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-q",
+                    "-m",
+                    message,
+                ],
+            );
+            git_in(&repo, &["rev-parse", "HEAD"]).trim().to_string()
+        };
+        let old = commit("1.0.1");
+        fs::write(repo.join("indexers/foo/Cargo.toml"), manifest("2.0.0")).unwrap();
+        let new = commit("2.0.0");
+
+        let component = release_component_at_commit(&ctx, "foo", &old).unwrap();
+        assert_eq!(component.version, Version::parse("1.0.1").unwrap());
+        assert_eq!(component.commit, old);
+        assert_eq!(component.tag_name, "plugins-v3/foo/v1.0.1");
+        assert_eq!(
+            release_component_at_commit(&ctx, "foo", &new)
+                .unwrap()
+                .version,
+            Version::parse("2.0.0").unwrap()
+        );
+        assert!(release_component_at_commit(&ctx, "bar", &new).is_err());
+    }
+
+    #[test]
+    fn prepared_plugin_entries_are_read_per_version_directory() {
+        let (dir, _ctx) = temp_task_context();
+        let entry = |version: &str| {
+            serde_json::to_value(catalog_v3_test_entry(
+                "foo",
+                PluginCatalogStatus::Active,
+                vec![CatalogV3Release {
+                    version: version.to_string(),
+                    sdk_constraint: "^3".to_string(),
+                    min_scryer_version: None,
+                    max_scryer_version: None,
+                    artifacts: Vec::new(),
+                }],
+            ))
+            .unwrap()
+        };
+        let plugin_dir = dir.path().join("foo");
+        for version in ["1.0.1", "2.0.0"] {
+            fs::create_dir_all(plugin_dir.join(version)).unwrap();
+            fs::write(
+                plugin_dir.join(version).join(CATALOG_V3_SNIPPET_JSON),
+                entry(version).to_string(),
+            )
+            .unwrap();
+        }
+        let entries = read_prepared_catalog_v3_entries(&plugin_dir).unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.releases[0].version.clone())
+                .collect::<Vec<_>>(),
+            vec!["1.0.1".to_string(), "2.0.0".to_string()]
+        );
+        fs::write(
+            plugin_dir.join(CATALOG_V3_SNIPPET_JSON),
+            entry("3.0.0").to_string(),
+        )
+        .unwrap();
+        let direct = read_prepared_catalog_v3_entries(&plugin_dir).unwrap();
+        assert_eq!(direct.len(), 1);
+        assert_eq!(direct[0].releases[0].version, "3.0.0");
+        assert!(read_prepared_catalog_v3_entries(&dir.path().join("missing")).is_err());
+    }
+
+    #[test]
     fn maintenance_publication_requires_explicit_single_plugin_scope() {
         for (options, valid) in [
             (
@@ -10746,6 +11124,46 @@ distribution_base_url = "https://cdn.scryer.media/scryer/plugins-v3/email"
                     "newznab",
                 ],
                 true,
+            ),
+            (vec!["--plugin-source", "newznab=bugfix/newznab-2.3"], true),
+            (
+                vec![
+                    "--plugin-source",
+                    "newznab=bugfix/newznab-2.3",
+                    "--plugin-source",
+                    "animetosho=bugfix/animetosho-2.4",
+                    "--plugin-id",
+                    "newznab",
+                    "--rule-pack-id",
+                    "trash",
+                ],
+                true,
+            ),
+            (vec!["--plugin-source", "newznab"], false),
+            (
+                vec![
+                    "--plugin-source",
+                    "newznab=x",
+                    "--plugin-source",
+                    "newznab=x",
+                ],
+                false,
+            ),
+            (vec!["--plugin-source", "newznab=x", "--resume"], false),
+            (
+                vec!["--plugin-source", "newznab=x", "--catalog-only-from", "y"],
+                false,
+            ),
+            (
+                vec![
+                    "--maintenance-ref",
+                    "x",
+                    "--plugin-id",
+                    "newznab",
+                    "--plugin-source",
+                    "torznab=y",
+                ],
+                false,
             ),
             (
                 vec!["--maintenance-ref", "", "--plugin-id", "newznab"],

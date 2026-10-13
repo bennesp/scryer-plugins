@@ -62,6 +62,7 @@ jobs:
       CARGO_HOME: /home/runner/.cargo
       CARGO_INCREMENTAL: "0"
       CARGO_TERM_COLOR: always
+      GH_TOKEN: ${{ github.token }}
       RUSTC_WRAPPER: sccache
       SCCACHE_BASEDIRS: /home/runner/work/scryer-plugins/scryer-plugins
       SCCACHE_CACHE_SIZE: 10G
@@ -164,7 +165,8 @@ jobs:
                 echo "No plugin ids were provided" >&2
                 exit 1
               fi
-              ./xtask/target/xtask-release/xtask official plan-current "${plugin_ids[@]}" > release-plugin-plan.tsv
+              ./xtask/target/xtask-release/xtask official plan-current "${plugin_ids[@]}" \
+                | awk -v commit="$(git rev-parse HEAD)" 'BEGIN { OFS = "\t" } NF { print $1, $2, commit }' > release-plugin-plan.tsv
             fi
             if [ -n "${RULE_PACK_IDS_INPUT//[[:space:],]/}" ]; then
               mapfile -t rule_pack_ids < <(printf '%s\n' "${RULE_PACK_IDS_INPUT}" | tr ',[:space:]' '\n' | awk 'NF' | sort -u)
@@ -190,11 +192,20 @@ jobs:
               RELEASE_SHA="${{ github.event_name == 'workflow_dispatch' && inputs.release_commit || '' }}"
             fi
             if [ -z "${RELEASE_SHA:-}" ]; then RELEASE_SHA="$(git rev-parse HEAD)"; fi
-            mapfile -t plugin_tags < <(git tag --points-at "${RELEASE_SHA}" | sort | grep -E '^plugins-v3/[^/]+/v.+$' || true)
-            for tag in "${plugin_tags[@]}"; do
-              plugin_spec="${tag#plugins-v3/}"
-              printf '%s\t%s\n' "${plugin_spec%/v*}" "${tag##*/v}" >> release-plugin-plan.tsv
-            done
+            # A push trigger lists its plugin components (tag and source commit)
+            # in its signed body; older triggers and catalog-only or manual runs
+            # fall back to the plugin tags at the release commit. Pushed tags are
+            # additionally checked as GitHub-verified signatures.
+            trigger_tag=""
+            verify_components=false
+            if [ "${GITHUB_EVENT_NAME}" = "push" ]; then
+              verify_components=true
+              if [ "${catalog_only}" != "true" ]; then
+                trigger_tag="${GITHUB_REF_NAME}"
+              fi
+            fi
+            source .github/scripts/release-plugin-v3-components.sh
+            release_plugin_components "${trigger_tag}" "${RELEASE_SHA}" "${GITHUB_REPOSITORY}" "${verify_components}" >> release-plugin-plan.tsv
             mapfile -t rule_pack_tags < <(git tag --points-at "${RELEASE_SHA}" | sort | grep -E '^rule-packs/[^/]+/v.+$' || true)
             if [ "${catalog_only}" = "true" ] && (( ${#rule_pack_tags[@]} > 0 )); then
               echo "Catalog-only release covers plugin components only, but ${RELEASE_SHA} also carries rule-pack tags: ${rule_pack_tags[*]}" >&2
@@ -323,7 +334,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /home/runner/.cache/sccache
-          key: gha-sccache-v2-${{ env.RELEASE_PLUGIN_CACHE_SCOPE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_LANE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_BUILD_FLAVOR }}-${{ matrix.plugin_id }}-${{ github.run_id }}
+          key: gha-sccache-v2-${{ env.RELEASE_PLUGIN_CACHE_SCOPE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_LANE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_BUILD_FLAVOR }}-${{ matrix.plugin_id }}-${{ matrix.version }}-${{ github.run_id }}
           restore-keys: |
             gha-sccache-v2-${{ env.RELEASE_PLUGIN_CACHE_SCOPE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_LANE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_BUILD_FLAVOR }}-
             gha-sccache-v2-${{ env.RELEASE_PLUGIN_CACHE_SCOPE }}-${{ env.RELEASE_PLUGIN_BUILD_SCCACHE_LANE }}-
@@ -441,13 +452,39 @@ jobs:
           install -d xtask/target/xtask-release
           install -m 0755 xtask-artifact/xtask xtask/target/xtask-release/xtask
 
+      # The plugin is built from the commit its component tag names, which the
+      # plan job verified is a signed ancestor of the trigger. A component from
+      # an earlier commit is built from a detached worktree of that commit (its
+      # own Cargo.lock and SDK) by the trigger's xtask, so an older line never
+      # goes through an older release pipeline.
+      - name: Select release source
+        env:
+          SOURCE_COMMIT: ${{ matrix.source_commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "Matrix entry carries an invalid source commit: ${SOURCE_COMMIT}" >&2
+            exit 1
+          fi
+          if [ "${SOURCE_COMMIT}" = "$(git rev-parse HEAD)" ]; then
+            echo "Building from the trigger commit ${SOURCE_COMMIT}"
+            exit 0
+          fi
+          git merge-base --is-ancestor "${SOURCE_COMMIT}" HEAD
+          source_root="${RUNNER_TEMP}/release-source"
+          git worktree add --detach "${source_root}" "${SOURCE_COMMIT}"
+          echo "Building from ${SOURCE_COMMIT} checked out at ${source_root}"
+          echo "SCRYER_PLUGIN_RELEASE_SOURCE_ROOT=${source_root}" >> "${GITHUB_ENV}"
+
       - name: Verify release toolchain and Wasm tooling
         run: ./xtask/target/xtask-release/xtask doctor
 
       - name: Restore single-plugin release plan
+        env:
+          SOURCE_COMMIT: ${{ matrix.source_commit }}
         run: |
           set -euo pipefail
-          printf '%s\t%s\n' "${{ matrix.plugin_id }}" "${{ matrix.version }}" > release-plan.tsv
+          printf '%s\t%s\t%s\n' "${{ matrix.plugin_id }}" "${{ matrix.version }}" "${SOURCE_COMMIT}" > release-plan.tsv
 
       - name: Prefetch selected plugin dependencies
         run: |
@@ -463,9 +500,9 @@ jobs:
           shopt -s nullglob
           source .github/scripts/release-plugin-v3-identity.sh
           require_release_publish_context "${GITHUB_EVENT_NAME}" "${GITHUB_REF}"
-          while IFS=$'\t' read -r plugin_id version; do
+          while IFS=$'\t' read -r plugin_id version source_commit; do
             tag="plugins-v3/${plugin_id}/v${version}"
-            prepared_dir="dist/prepared/${plugin_id}"
+            prepared_dir="dist/prepared/${plugin_id}/${version}"
 
             ./xtask/target/xtask-release/xtask official prepare "${plugin_id}" \
               --version "${version}" \
@@ -534,7 +571,7 @@ jobs:
               gh release create "${tag}" \
                 --repo "${GITHUB_REPOSITORY}" \
                 --title "${plugin_id} ${version}" \
-                --target "$(git rev-parse HEAD)" \
+                --target "${source_commit}" \
                 --notes "Scryer plugin distribution assets for the catalog-v3 lane."
             gh release upload "${tag}" \
               "${release_assets[@]}" \
@@ -546,8 +583,8 @@ jobs:
         run: |
           set -euo pipefail
           rm -rf prepared-plugins
-          mkdir -p prepared-plugins
-          cp -R "dist/prepared/${{ matrix.plugin_id }}" "prepared-plugins/${{ matrix.plugin_id }}"
+          mkdir -p "prepared-plugins/${{ matrix.plugin_id }}"
+          cp -R "dist/prepared/${{ matrix.plugin_id }}/${{ matrix.version }}" "prepared-plugins/${{ matrix.plugin_id }}/${{ matrix.version }}"
 
       - name: Show sccache stats
         if: always()
@@ -562,7 +599,7 @@ jobs:
       - name: Upload prepared plugin artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-plugin-v3-prepared-${{ github.run_id }}-${{ matrix.plugin_id }}
+          name: release-plugin-v3-prepared-${{ github.run_id }}-${{ matrix.plugin_id }}-${{ matrix.version }}
           path: prepared-plugins
           if-no-files-found: error
           retention-days: 7
@@ -571,7 +608,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-plugin-v3-artifacts-${{ github.run_id }}-${{ matrix.plugin_id }}
+          name: release-plugin-v3-artifacts-${{ github.run_id }}-${{ matrix.plugin_id }}-${{ matrix.version }}
           path: prepare-sccache-stats.txt
           if-no-files-found: error
           retention-days: 7
@@ -798,10 +835,10 @@ jobs:
           set -euo pipefail
           source .github/scripts/release-plugin-v3-identity.sh
           require_release_publish_context "${GITHUB_EVENT_NAME}" "${GITHUB_REF}"
-          while IFS=$'\t' read -r plugin_id version; do
+          while IFS=$'\t' read -r plugin_id version _source_commit; do
             [ -n "${plugin_id}" ] || continue
             tag="plugins-v3/${plugin_id}/v${version}"
-            prepared_dir="prepared-plugins/${plugin_id}"
+            prepared_dir="prepared-plugins/${plugin_id}/${version}"
             mkdir -p "${prepared_dir}"
             gh release download "${tag}" \
               --repo "${GITHUB_REPOSITORY}" \
@@ -839,17 +876,18 @@ jobs:
             done
           }
 
-          while IFS= read -r plugin_id; do
+          while IFS=$'\t' read -r plugin_id version _source_commit; do
+            [ -n "${plugin_id}" ] || continue
             wait_for_slot
             if (( failed )); then
               break
             fi
             (
-              echo "Verifying prepared artifacts for ${plugin_id}"
-              ./xtask/target/xtask-release/xtask official verify-prepared "prepared-plugins/${plugin_id}"
+              echo "Verifying prepared artifacts for ${plugin_id} ${version}"
+              ./xtask/target/xtask-release/xtask official verify-prepared "prepared-plugins/${plugin_id}/${version}"
             ) &
             active_pids+=("$!")
-          done < <(cut -f1 release-plugin-plan.tsv | sort -u)
+          done < release-plugin-plan.tsv
 
           for pid in "${active_pids[@]}"; do
             if ! wait "${pid}"; then
@@ -864,8 +902,9 @@ jobs:
           set -euo pipefail
           source .github/scripts/release-plugin-v3-identity.sh
           require_release_publish_context "${GITHUB_EVENT_NAME}" "${GITHUB_REF}"
-          while IFS= read -r plugin_id; do
-            prepared_dir="prepared-plugins/${plugin_id}"
+          while IFS=$'\t' read -r plugin_id version _source_commit; do
+            [ -n "${plugin_id}" ] || continue
+            prepared_dir="prepared-plugins/${plugin_id}/${version}"
             while IFS= read -r artifact_name; do
               [ -n "${artifact_name}" ] || continue
               zstd -dc \
@@ -885,7 +924,7 @@ jobs:
                 "${GITHUB_REPOSITORY}" \
                 "${GITHUB_REF}"
             fi
-          done < <(cut -f1 release-plugin-plan.tsv | sort -u)
+          done < release-plugin-plan.tsv
 
       - name: Prepare and sign central catalog
         if: steps.catalog-preparation.outputs.restored != 'true'

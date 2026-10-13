@@ -7,7 +7,7 @@ mod plugin_new;
 mod rule_pack_publication_tests;
 #[cfg(test)]
 mod rule_pack_upload_tests;
-use client_strata::{TARGET_WASIP1, TARGET_WASIP2, build_publication_strata, parse_stratum_drops};
+use client_strata::{TARGET_WASIP1, TARGET_WASIP2};
 use scryer_plugin_sdk::{
     EXPORT_DESCRIBE, PluginDescriptor, ProviderDescriptor, SDK_VERSION,
     host_version_matches_constraint, plugin_descriptor_sdk_constraint,
@@ -40,7 +40,7 @@ const COMPONENT_WASM_TARGET: &str = TARGET_WASIP2;
 /// `wasm32-wasip1` is here as a *historical wire value*, not a build target:
 /// releases published before the component cut (and the retired plugins capped
 /// at Scryer 0.18.21) still carry those rows, and validating the master catalog
-/// has to keep accepting them. See [`client_strata`] for who reads them.
+/// has to keep accepting them.
 const CATALOG_ARTIFACT_RUNTIMES: [&str; 2] = [TARGET_WASIP1, TARGET_WASIP2];
 #[allow(dead_code)]
 const CATALOG_V2_SCHEMA: &str = "scryer.plugin.catalog.v2";
@@ -71,6 +71,13 @@ const SDK_LOCAL_OVERRIDE_ENV: &str = "SCRYER_PLUGIN_SDK_LOCAL_PATH";
 const CENTRAL_CATALOG_RELEASE_TAG: &str = "catalog/v2";
 const DEFAULT_CENTRAL_CATALOG_V3_RELEASE_TAG: &str = "catalog/v3";
 const CENTRAL_CATALOG_V3_RELEASE_TAG_ENV: &str = "SCRYER_CATALOG_V3_RELEASE_TAG";
+/// Prefix of the per-generation release that mirrors one generation's hashed
+/// assets on GitHub. Defaults to `<redirect release tag>-g`, so the tag for
+/// generation 812 is `catalog/v3-g812`. It cannot nest under the redirect tag
+/// (`catalog/v3/g812`): git refuses a ref below an existing ref of the same
+/// name.
+const CENTRAL_CATALOG_V3_GENERATION_TAG_PREFIX_ENV: &str =
+    "SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX";
 const DEFAULT_CENTRAL_CATALOG_V3_PATH_PREFIX: &str = "catalog/v3";
 const CENTRAL_CATALOG_V3_PATH_PREFIX_ENV: &str = "SCRYER_CATALOG_V3_PATH_PREFIX";
 const CATALOG_V2_BASE_SDK_VERSION: &str = "1.5.0";
@@ -84,15 +91,8 @@ const CATALOG_V3_MINIFIED_JSON: &str = "catalog-v3.min.json";
 const CATALOG_V3_MINIFIED_ZST: &str = "catalog-v3.min.json.zst";
 const CATALOG_V3_RELEASE_CONSTRAINTS: &str = "catalog-v3-release-constraints.json";
 const PREPARED_RULE_PACK_ARTIFACTS: &str = "prepared-rule-pack-artifacts.json";
-const CATALOG_V3_REDIRECT_JSON: &str = "catalog-v3.redirect.json";
-/// The redirect capability-aware clients (Scryer 0.19.7+) read.
-///
-/// It is a separate file rather than another rung on `catalog-v3.redirect.json`
-/// because every shipped client from 0.18.12 to 0.19.6 takes that ladder's
-/// *last* rung by position: appending an entry silently re-points all of them
-/// at once, and anything beyond the 0.19.x tolerance (a wasip3 runtime, a new
-/// feature token, a new field) makes the whole document unparseable for that
-/// band. See `client_strata`.
+/// The only redirect supported clients read. The legacy positional ladder
+/// (`catalog-v3.redirect.json`) is no longer published; see `client_strata`.
 const CATALOG_V3_MODERN_REDIRECT_JSON: &str = "catalog-v3.modern.redirect.json";
 const R2_ACCOUNT_ID_ENV: &str = "CF_ACCOUNT_ID";
 const R2_ACCOUNT_ID_ENV_LEGACY: &str = "CF_R2_ACCOUNT_ID";
@@ -505,12 +505,6 @@ struct CatalogRenderV3Args {
         help = "Permit an intentional catalog-v3 release removal when comparing against --existing-catalog"
     )]
     allow_release_removals: Vec<String>,
-    #[arg(
-        long = "allow-stratum-drop",
-        value_name = "PLUGIN_ID@STRATUM_ID",
-        help = "Permit a plugin to disappear for one shipped client stratum (see xtask/src/client_strata.rs)"
-    )]
-    allow_stratum_drops: Vec<String>,
 }
 
 #[derive(Args)]
@@ -543,12 +537,6 @@ struct CatalogPrepareV3Args {
         help = "Permit an intentional catalog-v3 release removal when comparing against --existing-catalog"
     )]
     allow_release_removals: Vec<String>,
-    #[arg(
-        long = "allow-stratum-drop",
-        value_name = "PLUGIN_ID@STRATUM_ID",
-        help = "Permit a plugin to disappear for one shipped client stratum (see xtask/src/client_strata.rs)"
-    )]
-    allow_stratum_drops: Vec<String>,
     #[arg(long, hide = true)]
     allow_selected_rebuild: bool,
 }
@@ -708,7 +696,6 @@ struct CatalogV3AssetPaths {
     pretty_json: PathBuf,
     minified_json: PathBuf,
     minified_zst: PathBuf,
-    redirect_json: PathBuf,
 }
 
 #[derive(Clone, Debug)]
@@ -4501,6 +4488,21 @@ fn central_catalog_v3_release_tag() -> String {
     )
 }
 
+fn central_catalog_v3_generation_tag_prefix() -> String {
+    env_override_or_default(
+        CENTRAL_CATALOG_V3_GENERATION_TAG_PREFIX_ENV,
+        &format!("{}-g", central_catalog_v3_release_tag()),
+    )
+}
+
+/// The GitHub release that mirrors the hashed assets of `catalog_version`.
+fn central_catalog_v3_generation_tag(catalog_version: u64) -> String {
+    format!(
+        "{}{catalog_version}",
+        central_catalog_v3_generation_tag_prefix()
+    )
+}
+
 fn central_catalog_v3_path_prefix() -> String {
     env_override_or_default(
         CENTRAL_CATALOG_V3_PATH_PREFIX_ENV,
@@ -4976,7 +4978,6 @@ fn catalog_v3_asset_paths(dir: &Path) -> CatalogV3AssetPaths {
         pretty_json: dir.join(CATALOG_V3_SNIPPET_JSON),
         minified_json: dir.join(CATALOG_V3_MINIFIED_JSON),
         minified_zst: dir.join(CATALOG_V3_MINIFIED_ZST),
-        redirect_json: dir.join(CATALOG_V3_REDIRECT_JSON),
     }
 }
 
@@ -5130,13 +5131,6 @@ fn write_catalog_v3_redirect(locator: &CatalogV3Redirect, path: &Path) -> Result
     Ok(path.to_path_buf())
 }
 
-fn write_catalog_v3_redirects(
-    redirect: &CatalogV3Redirect,
-    paths: &CatalogV3AssetPaths,
-) -> Result<PathBuf> {
-    write_catalog_v3_redirect(redirect, &paths.redirect_json)
-}
-
 fn stage_hashed_central_catalog_v3_artifacts(
     paths: &CatalogV3AssetPaths,
     dir: &Path,
@@ -5175,13 +5169,13 @@ fn stage_hashed_central_catalog_v3_artifacts(
             url: format!("{base}/{file_name}"),
             mirror_urls: vec![github_release_asset_url(
                 OFFICIAL_GITHUB_REPO,
-                &central_catalog_v3_release_tag(),
+                &central_catalog_v3_generation_tag(catalog_version),
                 &file_name,
             )],
             signature_url: format!("{base}/{signature_name}"),
             signature_mirror_urls: vec![github_release_asset_url(
                 OFFICIAL_GITHUB_REPO,
-                &central_catalog_v3_release_tag(),
+                &central_catalog_v3_generation_tag(catalog_version),
                 &signature_name,
             )],
             digests,
@@ -6379,7 +6373,9 @@ fn prepare_rule_pack_v3_entries(
     ctx: &TaskContext,
     output_dir: &Path,
     selected_ids: &BTreeSet<String>,
+    catalog_version: u64,
 ) -> Result<Vec<PreparedRulePackV3>> {
+    let generation_tag = central_catalog_v3_generation_tag(catalog_version);
     fs::create_dir_all(output_dir)?;
     let manifest_path = ctx.repo_root.join(RULE_PACK_SOURCE_MANIFEST);
     let source: RulePackSourceManifest = serde_json::from_slice(&fs::read(&manifest_path)?)
@@ -6468,7 +6464,7 @@ fn prepare_rule_pack_v3_entries(
                             url: versioned_distribution_url(&primary_base, &version, &zst_name),
                             mirror_urls: vec![github_release_asset_url(
                                 OFFICIAL_GITHUB_REPO,
-                                &central_catalog_v3_release_tag(),
+                                &generation_tag,
                                 &zst_name,
                             )],
                             signature_url: versioned_distribution_url(
@@ -6478,7 +6474,7 @@ fn prepare_rule_pack_v3_entries(
                             ),
                             signature_mirror_urls: vec![github_release_asset_url(
                                 OFFICIAL_GITHUB_REPO,
-                                &central_catalog_v3_release_tag(),
+                                &generation_tag,
                                 &signature_bundle_file_name(&zst_name),
                             )],
                             digests: zst_digests,
@@ -6487,7 +6483,7 @@ fn prepare_rule_pack_v3_entries(
                             url: versioned_distribution_url(&primary_base, &version, &br_name),
                             mirror_urls: vec![github_release_asset_url(
                                 OFFICIAL_GITHUB_REPO,
-                                &central_catalog_v3_release_tag(),
+                                &generation_tag,
                                 &br_name,
                             )],
                             signature_url: versioned_distribution_url(
@@ -6497,7 +6493,7 @@ fn prepare_rule_pack_v3_entries(
                             ),
                             signature_mirror_urls: vec![github_release_asset_url(
                                 OFFICIAL_GITHUB_REPO,
-                                &central_catalog_v3_release_tag(),
+                                &generation_tag,
                                 &signature_bundle_file_name(&br_name),
                             )],
                             digests: br_digests,
@@ -6523,6 +6519,17 @@ fn prepare_rule_pack_v3_entries(
     Ok(prepared)
 }
 
+/// A rule-pack release with its GitHub mirror URLs removed: what must match
+/// between a published release and a re-prepared one of the same version.
+fn rule_pack_release_identity(release: &CatalogV3RulePackRelease) -> Result<serde_json::Value> {
+    let mut release = release.clone();
+    for artifact in &mut release.artifacts {
+        artifact.mirror_urls.clear();
+        artifact.signature_mirror_urls.clear();
+    }
+    Ok(serde_json::to_value(release)?)
+}
+
 fn merge_catalog_v3_rule_pack_entries(
     mut existing: Vec<CatalogV3RulePackEntry>,
     updates: Vec<CatalogV3RulePackEntry>,
@@ -6535,7 +6542,11 @@ fn merge_catalog_v3_rule_pack_entries(
                     .iter()
                     .find(|previous| previous.version == release.version)
                 {
-                    if serde_json::to_value(previous)? != serde_json::to_value(&release)? {
+                    // Mirrors name the generation that first published the
+                    // release; a re-prepare in a later generation keeps them.
+                    if rule_pack_release_identity(previous)?
+                        != rule_pack_release_identity(&release)?
+                    {
                         bail!(
                             "rule pack '{}' release {} differs from published history; publish a new immutable version",
                             update.id,
@@ -6602,7 +6613,6 @@ fn run_catalog_render_v3(ctx: &TaskContext, args: CatalogRenderV3Args) -> Result
             existing_catalog: args.existing_catalog,
             prepared_plugin_root: None,
             allow_release_removals: args.allow_release_removals,
-            allow_stratum_drops: args.allow_stratum_drops,
             allow_selected_rebuild: false,
         },
     )
@@ -6642,15 +6652,17 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
     if args.prepared_plugin_root.is_none() && (!has_rule_pack_selection || has_plugin_selection) {
         ensure_current_sdk_dependency_is_published(ctx)?;
     }
-    let prepared_rule_packs = if has_plugin_selection && !has_rule_pack_selection {
-        Vec::new()
-    } else {
-        prepare_rule_pack_v3_entries(ctx, &dist, &selected_rule_pack_ids)?
-    };
+    // One number names the generation everywhere: the hashed asset names, the
+    // R2 path, and the GitHub generation release the mirrors point at.
     let catalog_version = existing_catalog
         .as_ref()
         .map(|catalog| catalog.catalog_version.max(1) + 1)
         .unwrap_or(1);
+    let prepared_rule_packs = if has_plugin_selection && !has_rule_pack_selection {
+        Vec::new()
+    } else {
+        prepare_rule_pack_v3_entries(ctx, &dist, &selected_rule_pack_ids, catalog_version)?
+    };
     let mut plugins = if args.plugin_ids.is_empty() && has_rule_pack_selection {
         existing_catalog
             .as_ref()
@@ -6744,11 +6756,26 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
             &allowed_release_removals,
         )?;
     }
-    let staged_pack_artifacts = prepared_rule_packs
+    // A re-prepared release that is already published keeps its published
+    // artifacts (see `merge_catalog_v3_rule_pack_entries`); only artifacts the
+    // merged catalog actually references are staged for upload.
+    let catalog_pack_artifacts = catalog
+        .rule_packs
+        .iter()
+        .flat_map(|pack| &pack.releases)
+        .flat_map(|release| &release.artifacts)
+        .map(serde_json::to_value)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut staged_pack_artifacts = Vec::new();
+    for artifact in prepared_rule_packs
         .iter()
         .flat_map(|pack| &pack.entry.releases)
         .flat_map(|release| &release.artifacts)
-        .collect::<Vec<_>>();
+    {
+        if catalog_pack_artifacts.contains(&serde_json::to_value(artifact)?) {
+            staged_pack_artifacts.push(artifact);
+        }
+    }
     fs::create_dir_all(&dist)?;
     fs::write(
         dist.join(PREPARED_RULE_PACK_ARTIFACTS),
@@ -6756,57 +6783,18 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
     )?;
     let central_paths = write_catalog_v3_assets(ctx, &catalog, &dist)?;
 
-    // One projection per shipped client stratum, each checked with a pinned
-    // copy of that stratum's shipped validator and against what it can install
-    // today. See `client_strata` for why this is not optional.
-    let projections = build_publication_strata(
-        &catalog,
-        existing_catalog.as_ref(),
-        &parse_stratum_drops(&args.allow_stratum_drops)?,
-    )?;
-
-    let mut legacy_ladder = Vec::new();
-    let mut modern_ladder = Vec::new();
-    for projection in &projections {
-        let paths = if projection.stratum.takes_master_catalog() {
-            central_paths.clone()
-        } else {
-            let projection_dir = dist.join("projections").join(projection.stratum.id);
-            validate_catalog_v3(&projection.catalog)?;
-            write_catalog_v3_assets(ctx, &projection.catalog, &projection_dir)?
-        };
-        let staged = stage_hashed_central_catalog_v3_artifacts(&paths, &dist, catalog_version)?;
-        let rungs = staged
-            .iter()
-            .map(|(_, artifact)| CatalogV3RedirectArtifact {
-                url: artifact.url.clone(),
-                mirror_urls: artifact.mirror_urls.clone(),
-                signature_url: artifact.signature_url.clone(),
-                signature_mirror_urls: artifact.signature_mirror_urls.clone(),
-            })
-            .collect::<Vec<_>>();
-        if projection.stratum.slot.is_legacy() {
-            legacy_ladder.extend(rungs);
-        } else {
-            modern_ladder.extend(rungs);
-        }
-        ok(format!(
-            "projected catalog for stratum '{}' ({})",
-            projection.stratum.id, projection.stratum.label
-        ));
-    }
-
-    // The legacy ladder is frozen in shape: shipped clients index it by
-    // position, so nothing may be appended to it. Capability-aware clients read
-    // their own redirect and walk it back, so that one can grow.
-    let redirect_path = write_catalog_v3_redirects(
-        &CatalogV3Redirect {
-            schema_version: CATALOG_V3_REDIRECT_SCHEMA.to_string(),
-            catalog_version,
-            artifacts: legacy_ladder,
-        },
-        &central_paths,
-    )?;
+    // Supported clients read only the modern redirect and take the master
+    // catalog unfiltered, so the master is the one rung.
+    let staged = stage_hashed_central_catalog_v3_artifacts(&central_paths, &dist, catalog_version)?;
+    let modern_ladder = staged
+        .iter()
+        .map(|(_, artifact)| CatalogV3RedirectArtifact {
+            url: artifact.url.clone(),
+            mirror_urls: artifact.mirror_urls.clone(),
+            signature_url: artifact.signature_url.clone(),
+            signature_mirror_urls: artifact.signature_mirror_urls.clone(),
+        })
+        .collect::<Vec<_>>();
     let modern_redirect_path = write_catalog_v3_redirect(
         &CatalogV3Redirect {
             schema_version: CATALOG_V3_REDIRECT_SCHEMA.to_string(),
@@ -6816,7 +6804,6 @@ fn run_catalog_prepare_v3(ctx: &TaskContext, args: CatalogPrepareV3Args) -> Resu
         &dist.join(CATALOG_V3_MODERN_REDIRECT_JSON),
     )?;
     ok(format!("wrote {}", central_paths.minified_zst.display()));
-    ok(format!("wrote {}", redirect_path.display()));
     ok(format!("wrote {}", modern_redirect_path.display()));
     Ok(())
 }
@@ -7087,11 +7074,7 @@ fn run_catalog_upload_v3_r2(ctx: &TaskContext, dir: &Path) -> Result<()> {
         uploaded_rule_pack_artifacts += 1;
     }
 
-    // Both redirects publish together: the legacy ladder for shipped clients
-    // and the modern redirect for capability-aware ones. Their rung sets are
-    // disjoint hashed files (per-stratum projections vs the master catalog),
-    // so each redirect's rungs upload from its own artifact list.
-    for redirect_name in [CATALOG_V3_REDIRECT_JSON, CATALOG_V3_MODERN_REDIRECT_JSON] {
+    for redirect_name in [CATALOG_V3_MODERN_REDIRECT_JSON] {
         let redirect_path = dir.join(redirect_name);
         let redirect: CatalogV3Redirect = serde_json::from_slice(&fs::read(&redirect_path)?)
             .with_context(|| format!("failed to parse {}", redirect_path.display()))?;
@@ -9114,12 +9097,8 @@ mod tests {
         assert!(error.to_string().contains("reserved custom section"));
     }
 
-    /// A release as the *published* catalog carries it.
-    ///
-    /// The runtime is deliberately `wasm32-wasip1`: the stratum projections
-    /// exercised below are about what shipped Scryers can parse, and the
-    /// ≤ 0.18.11 band accepts nothing else. It is a historical wire value, not
-    /// something this repository still builds.
+    /// A release as the *published* catalog carries it. The `wasm32-wasip1`
+    /// runtime is a historical wire value older releases still carry.
     fn catalog_v3_test_release(
         plugin_id: &str,
         version: &str,
@@ -9833,34 +9812,6 @@ support_tier = "verified_community"
 
         assert_eq!(
             plugins[0].releases[0].max_scryer_version.as_deref(),
-            Some("0.18.11")
-        );
-    }
-
-    /// The field-stripping half of what `legacy_catalog_v3_projection` used to
-    /// do, now one case of the general per-stratum projection.
-    #[test]
-    fn the_pre_ceiling_stratum_projection_strips_only_release_ceilings() {
-        let mut release =
-            catalog_v3_test_release("mediabrowser", "0.1.2", ">=3.0.0, <4.0.0", Some("0.17.0"));
-        release.max_scryer_version = Some("0.18.11".to_string());
-        let catalog = catalog_v3_test_catalog(vec![catalog_v3_test_entry(
-            "mediabrowser",
-            PluginCatalogStatus::Beta,
-            vec![release],
-        )]);
-        let stratum =
-            client_strata::stratum_by_id("legacy-no-release-ceiling").expect("pre-ceiling stratum");
-
-        let legacy = client_strata::project_catalog_for_stratum(&catalog, stratum);
-
-        assert_eq!(
-            legacy.plugins[0].releases[0].min_scryer_version.as_deref(),
-            Some("0.17.0")
-        );
-        assert_eq!(legacy.plugins[0].releases[0].max_scryer_version, None);
-        assert_eq!(
-            catalog.plugins[0].releases[0].max_scryer_version.as_deref(),
             Some("0.18.11")
         );
     }

@@ -10,7 +10,6 @@ use scryer_plugin_conformance::subtitle::SubtitleConformance;
 
 const TEST_BASE_URL: &str = "https://feed.animetosho.invalid";
 const TEST_SITE_URL: &str = "https://animetosho.invalid";
-const TEST_API_KEY: &str = "test-api-key";
 const SUBTITLE_DOWNLOAD_URL: &str = "https://animetosho.invalid/download/619135/subs/file/94001";
 
 #[test]
@@ -20,15 +19,11 @@ fn animetosho_release_wasm_conforms_to_the_subtitle_host_contract() {
         .descriptor_id("animetosho-xyz-subtitles")
         .config("base_url", TEST_BASE_URL)
         .config("site_url", TEST_SITE_URL)
-        .config("api_key", TEST_API_KEY)
-        // The API key it read is appended to the *configured* base URL rather
-        // than to a compiled-in default.
+        // The packaged provider must validate without an API key.
         .validate_route("", 200, br#"{"data":[]}"#.to_vec())
         .validate_reads_config("base_url")
         .validate_reads_config("api_key")
-        .validate_url(&format!(
-            "{TEST_BASE_URL}/json/v1/search?q=naruto&limit=1&apikey={TEST_API_KEY}"
-        ))
+        .validate_url(&format!("{TEST_BASE_URL}/json/v1/search?q=naruto&limit=1"))
         // Unlike the tsukihime pilot, this provider never opens the container:
         // it checks the XZ magic and hands the compressed attachment to Scryer
         // as `application/x-xz`.

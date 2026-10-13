@@ -1,5 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+mod catalog_publish;
+#[cfg(test)]
+mod catalog_publish_tests;
 mod client_strata;
 mod component_descriptor;
 mod plugin_new;
@@ -475,6 +478,13 @@ enum CatalogCommand {
     #[command(hide = true)]
     PublishV2,
     PublishV3,
+    /// Publish a prepared catalog generation: hashed assets to R2 and to the
+    /// generation's GitHub release, verify both, then move the modern redirect
+    /// on R2 and on the stable redirect release.
+    PublishV3Generation(CatalogPublishV3GenerationArgs),
+    /// R2-only upload of a prepared catalog (no GitHub, no idempotency
+    /// checks). Superseded by publish-v3-generation.
+    #[command(hide = true)]
     UploadV3R2(CatalogUploadV3R2Args),
     #[command(hide = true)]
     ValidateV2,
@@ -544,6 +554,18 @@ struct CatalogPrepareV3Args {
 #[derive(Args)]
 struct CatalogUploadV3R2Args {
     dir: PathBuf,
+}
+
+#[derive(Args)]
+struct CatalogPublishV3GenerationArgs {
+    /// Output directory of `catalog prepare-v3`, signed.
+    #[arg(long)]
+    dist: PathBuf,
+    /// File name of the master catalog this generation was merged onto (the
+    /// last artifact of the modern redirect at prepare time). The redirect
+    /// only moves while the live one still points at it.
+    #[arg(long, value_name = "ASSET_FILE_NAME")]
+    expected_merge_base: Option<String>,
 }
 
 #[derive(Args)]
@@ -1323,6 +1345,9 @@ fn main() -> Result<()> {
             CatalogCommand::PrepareV3(args) => run_catalog_prepare_v3(&ctx, args),
             CatalogCommand::PublishV2 => run_catalog_publish_v2(&ctx),
             CatalogCommand::PublishV3 => run_catalog_publish_v3(&ctx),
+            CatalogCommand::PublishV3Generation(args) => {
+                run_catalog_publish_v3_generation(&ctx, args)
+            }
             CatalogCommand::UploadV3R2(args) => run_catalog_upload_v3_r2(&ctx, &args.dir),
             CatalogCommand::ValidateV2 => run_catalog_validate_v2(&ctx),
         },
@@ -7109,6 +7134,50 @@ fn run_catalog_upload_v3_r2(ctx: &TaskContext, dir: &Path) -> Result<()> {
 
     ok(format!(
         "uploaded catalog redirects and {uploaded_rule_pack_artifacts} rule-pack artifact(s) to R2"
+    ));
+    Ok(())
+}
+
+fn run_catalog_publish_v3_generation(
+    ctx: &TaskContext,
+    args: CatalogPublishV3GenerationArgs,
+) -> Result<()> {
+    step(format!(
+        "Publishing catalog-v3 generation from {}",
+        args.dist.display()
+    ));
+    let plan = catalog_publish::plan_generation(ctx, &args.dist)?;
+    let target_commit = run_capture(
+        ctx.command_in("git", &ctx.repo_root)
+            .args(["rev-parse", "HEAD"]),
+    )?
+    .trim()
+    .to_string();
+    let r2 = catalog_publish::AwsR2Store {
+        ctx,
+        config: r2_config_from_env()?,
+    };
+    let releases = catalog_publish::GhReleaseStore {
+        ctx,
+        repo: OFFICIAL_GITHUB_REPO.to_string(),
+    };
+    let report = catalog_publish::publish_generation(
+        &plan,
+        &r2,
+        &releases,
+        &catalog_publish::PublishOptions {
+            expected_merge_base: args.expected_merge_base,
+            target_commit,
+        },
+    )?;
+    ok(format!(
+        "published generation {}: R2 {} uploaded / {} already present, GitHub {} uploaded / {} \
+         already present",
+        plan.generation,
+        report.r2_uploaded.len(),
+        report.r2_skipped.len(),
+        report.github_uploaded.len(),
+        report.github_skipped.len()
     ));
     Ok(())
 }

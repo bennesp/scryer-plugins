@@ -256,6 +256,7 @@ fn extract_archive(
             let mut response =
                 extract_prepared_archive(&inputs.archive_path, output_root, format, password);
             if response.status == ArchivePluginStatus::Ok {
+                response.replaced_source_paths = inputs.replaced_source_paths.clone();
                 response.processed_recovery_paths = inputs.processed_recovery_paths.clone();
             }
             // The staged copy duplicates inputs the host still owns; drop it

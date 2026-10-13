@@ -290,7 +290,7 @@ impl AnimeToshoConfig {
                     .filter(|v| !v.trim().is_empty())
                     .unwrap_or_else(|| DEFAULT_SITE_URL.to_string()),
             ),
-            api_key: read("api_key")?.ok_or_else(|| "api_key is not configured".to_string())?,
+            api_key: read("api_key")?.unwrap_or_default().trim().to_string(),
             search_threshold: read("search_threshold")?
                 .and_then(|value| value.parse::<usize>().ok())
                 .unwrap_or(DEFAULT_SEARCH_THRESHOLD)
@@ -312,11 +312,9 @@ fn descriptor() -> PluginDescriptor {
             provider_aliases: vec![],
             config_fields: config_fields(),
             default_base_url: Some(DEFAULT_BASE_URL.to_string()),
-            allowed_hosts: vec![
-                "feed.animetosho.net".to_string(),
-                "animetosho.net".to_string(),
-                "storage.animetosho.net".to_string(),
-            ],
+            // Match every official subdomain accepted by legacy URL migration,
+            // including stored attachment URLs and redirect destinations.
+            allowed_hosts: vec!["animetosho.net".into(), "*.animetosho.net".into()],
             capabilities: SubtitleCapabilities {
                 mode: SubtitleProviderMode::Catalog,
                 supported_media_kinds: vec![SubtitleQueryMediaKind::Episode],
@@ -377,13 +375,13 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             key: "api_key".to_string(),
             label: "API Key".to_string(),
             field_type: ConfigFieldType::Password,
-            required: true,
+            required: false,
             default_value: None,
             value_source: ConfigFieldValueSource::User,
             role: None,
             host_binding: None,
             options: vec![],
-            help_text: Some("AnimeTosho.net API key".to_string()),
+            help_text: Some("Leave empty for AnimeTosho.net".to_string()),
             ..Default::default()
         },
         ConfigFieldDef {
@@ -596,13 +594,15 @@ fn api_url(config: &AnimeToshoConfig, path: &str) -> String {
         config.base_url.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    if url.contains('?') {
-        url.push('&');
-    } else {
-        url.push('?');
+    if !config.api_key.is_empty() {
+        if url.contains('?') {
+            url.push('&');
+        } else {
+            url.push('?');
+        }
+        url.push_str("apikey=");
+        url.push_str(&url_encode(&config.api_key));
     }
-    url.push_str("apikey=");
-    url.push_str(&url_encode(&config.api_key));
     url
 }
 
@@ -953,7 +953,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn descriptor_requires_api_key() {
+    fn descriptor_allows_empty_api_key() {
         let descriptor = descriptor();
         let ProviderDescriptor::Subtitle(provider) = descriptor.provider else {
             panic!("expected subtitle provider");
@@ -963,8 +963,26 @@ mod tests {
             .iter()
             .find(|field| field.key == "api_key")
             .expect("api key field");
-        assert!(api_key.required);
+        assert!(!api_key.required);
         assert_eq!(provider.provider_type, "animetosho-xyz");
+    }
+
+    #[test]
+    fn configuration_accepts_missing_and_blank_api_keys() {
+        for key in [None, Some(""), Some("   ")] {
+            let config = AnimeToshoConfig::from_config(|name| {
+                Ok(if name == "api_key" {
+                    key.map(str::to_string)
+                } else {
+                    None
+                })
+            })
+            .expect("API key is optional");
+            assert!(config.api_key.is_empty());
+            for path in ["/json/v1/search?q=test", "/json/v1/torrent/42"] {
+                assert_eq!(api_url(&config, path), format!("{DEFAULT_BASE_URL}{path}"));
+            }
+        }
     }
 
     #[test]
@@ -1065,6 +1083,15 @@ fn migrate_animetosho_url(value: &str) -> String {
 #[cfg(test)]
 mod legacy_url_tests {
     use super::*;
+    #[test]
+    fn descriptor_authorizes_the_migration_domain() {
+        let descriptor = descriptor();
+        let hosts = descriptor.allowed_hosts();
+        assert!(hosts.iter().any(|host| host == "animetosho.net"));
+        assert!(hosts.iter().any(|host| host == "*.animetosho.net"));
+        assert!(!hosts.iter().any(|host| host == "*"));
+    }
+
     #[test]
     fn migrates_only_legacy_hostnames() {
         for (before, after) in [

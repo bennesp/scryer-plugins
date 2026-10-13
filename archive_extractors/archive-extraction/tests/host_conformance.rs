@@ -80,6 +80,12 @@ fn archive_extraction_release_wasm_conforms_to_host_contract() {
     assert_split_archives_are_joined(&wasm_path);
     assert_par2_repairs_a_damaged_archive_before_extracting(&wasm_path);
     assert_par2_emits_repaired_plain_files(&wasm_path);
+    assert_par2_reports_misnamed_plain_sources(&wasm_path);
+    assert_par2_reports_misnamed_archive_sources(&wasm_path);
+    #[cfg(unix)]
+    assert_par2_rejects_ambiguous_recovery_names(&wasm_path);
+    #[cfg(unix)]
+    assert_par2_rejects_recovery_symlinks(&wasm_path);
     assert_par2_unrepairable_damage_fails(&wasm_path);
     assert_inspect_without_a_recovery_set_is_unsupported(&wasm_path);
     assert_request_path_escape_is_rejected(&wasm_path);
@@ -135,6 +141,13 @@ fn assert_describe_returns_descriptor(wasm_path: &Path) {
         descriptor.get("id").and_then(|id| id.as_str()),
         Some("archive-extraction"),
         "unexpected descriptor id: {descriptor}"
+    );
+    assert_eq!(
+        descriptor
+            .pointer("/provider/capabilities/enforced_limits")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "extractor must advertise its resource ceilings"
     );
     let formats = descriptor
         .pointer("/provider/capabilities/formats")
@@ -937,6 +950,7 @@ fn assert_par2_repairs_a_damaged_archive_before_extracting(wasm_path: &Path) {
         "damaged-but-repairable archive did not extract: {:?}",
         response.message
     );
+    assert_source_consumption(&response, source.path(), &["payload.zip"]);
     assert_eq!(
         fs::read(output.path().join("media/episode.bin")).expect("read repaired member"),
         contents,
@@ -975,6 +989,7 @@ fn assert_par2_emits_repaired_plain_files(wasm_path: &Path) {
         "plain-file recovery set did not emit: {:?}",
         response.message
     );
+    assert_source_consumption(&response, source.path(), &["episode.mkv"]);
     assert_eq!(
         response
             .files
@@ -987,6 +1002,147 @@ fn assert_par2_emits_repaired_plain_files(wasm_path: &Path) {
         fs::read(output.path().join("episode.mkv")).expect("read emitted file"),
         contents
     );
+}
+
+fn assert_source_consumption(
+    response: &ArchivePluginProcessResponse,
+    source: &Path,
+    replaced: &[&str],
+) {
+    assert_eq!(response.replaced_source_paths, replaced);
+    let mut recovery = fs::read_dir(source)
+        .expect("read recovery fixture")
+        .map(|entry| entry.expect("fixture entry").path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "par2")
+        })
+        .map(|path| path.file_name().unwrap().to_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    recovery.sort();
+    assert!(!recovery.is_empty(), "fixture has recovery volumes");
+    assert_eq!(response.processed_recovery_paths, recovery);
+}
+
+fn assert_par2_reports_misnamed_archive_sources(wasm_path: &Path) {
+    let source = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let contents = deterministic_bytes(0xC0DE_0005, 32 * 1024);
+    let archive = source.path().join("payload.zip");
+    create_zip_fixture_with_contents(&archive, "episode.bin", &contents);
+    create_recovery_set(source.path(), std::slice::from_ref(&archive), 2);
+    let actual = source.path().join("obfuscated.mkv");
+    fs::rename(archive, &actual).unwrap();
+    let original = fs::read(&actual).unwrap();
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "obfuscated.mkv",
+        ArchivePluginFormat::Zip,
+        None,
+    );
+    assert_eq!(
+        response.status,
+        ArchivePluginStatus::Ok,
+        "{:?}",
+        response.message
+    );
+    assert_source_consumption(&response, source.path(), &["obfuscated.mkv"]);
+    assert_eq!(
+        fs::read(output.path().join("episode.bin")).unwrap(),
+        contents
+    );
+    assert_eq!(fs::read(actual).unwrap(), original);
+}
+
+#[cfg(unix)]
+fn assert_par2_rejects_ambiguous_recovery_names(wasm_path: &Path) {
+    let source = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let actual = source.path().join(r"set\vol.par2");
+    let nested = source.path().join("set/vol.par2");
+    fs::write(&actual, b"ambiguous recovery input").unwrap();
+    fs::create_dir_all(nested.parent().unwrap()).unwrap();
+    fs::write(&nested, b"unrelated recovery file").unwrap();
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "payload.zip",
+        ArchivePluginFormat::Zip,
+        None,
+    );
+    assert_eq!(response.status, ArchivePluginStatus::Failed);
+    assert_eq!(
+        response.error_code.as_deref(),
+        Some("par2_unsafe_source_path")
+    );
+    assert!(response.replaced_source_paths.is_empty());
+    assert!(response.processed_recovery_paths.is_empty());
+    assert_eq!(fs::read(actual).unwrap(), b"ambiguous recovery input");
+    assert_eq!(fs::read(nested).unwrap(), b"unrelated recovery file");
+    assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+fn assert_par2_rejects_recovery_symlinks(wasm_path: &Path) {
+    let source = tempfile::tempdir().unwrap();
+    let output = tempfile::tempdir().unwrap();
+    let target = source.path().join("recovery.bin");
+    fs::write(&target, b"original recovery input").unwrap();
+    let link = source.path().join("recovery.par2");
+    std::os::unix::fs::symlink("recovery.bin", &link).unwrap();
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "payload.zip",
+        ArchivePluginFormat::Zip,
+        None,
+    );
+    assert_eq!(response.status, ArchivePluginStatus::Failed);
+    assert_eq!(response.error_code.as_deref(), Some("par2_symlink_input"));
+    assert!(response.replaced_source_paths.is_empty());
+    assert!(response.processed_recovery_paths.is_empty());
+    assert_eq!(fs::read(target).unwrap(), b"original recovery input");
+    assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read_dir(output.path()).unwrap().count(), 0);
+}
+
+fn assert_par2_reports_misnamed_plain_sources(wasm_path: &Path) {
+    let source = tempfile::tempdir().expect("misnamed source");
+    let output = tempfile::tempdir().expect("misnamed output");
+    let contents = deterministic_bytes(0xC0DE_0004, 32 * 1024);
+    let canonical = source.path().join("episode.mkv");
+    fs::write(&canonical, &contents).expect("write protected media");
+    create_recovery_set(source.path(), std::slice::from_ref(&canonical), 2);
+    let actual = source.path().join("obfuscated.bin");
+    fs::rename(&canonical, &actual).expect("misname fixture");
+    let unrelated = source.path().join("unrelated.mkv");
+    fs::write(&unrelated, b"unrelated media").expect("write unrelated sibling");
+
+    let response = extract_archive(
+        wasm_path,
+        source.path(),
+        output.path(),
+        "obfuscated.bin",
+        ArchivePluginFormat::Rar,
+        None,
+    );
+    assert_eq!(
+        response.status,
+        ArchivePluginStatus::Ok,
+        "{:?}",
+        response.message
+    );
+    assert_source_consumption(&response, source.path(), &["obfuscated.bin"]);
+    assert_eq!(
+        fs::read(output.path().join("episode.mkv")).unwrap(),
+        contents
+    );
+    assert_eq!(fs::read(&actual).unwrap(), contents, "source is preserved");
+    assert_eq!(fs::read(&unrelated).unwrap(), b"unrelated media");
 }
 
 fn assert_par2_unrepairable_damage_fails(wasm_path: &Path) {
@@ -1008,6 +1164,8 @@ fn assert_par2_unrepairable_damage_fails(wasm_path: &Path) {
     );
 
     assert_eq!(response.status, ArchivePluginStatus::Failed);
+    assert!(response.replaced_source_paths.is_empty());
+    assert!(response.processed_recovery_paths.is_empty());
     assert_eq!(
         response.error_code.as_deref(),
         Some("par2_insufficient_recovery"),

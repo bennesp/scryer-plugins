@@ -25,11 +25,16 @@ const catalogOnlyTriggerPrefix = releaseTriggerPrefix + "catalog-"
 type releaseComponent struct {
 	ID      string
 	Version string
+	// Commit is the source commit a plugin component is built from; one
+	// trigger may build several versions of one plugin, each from its own
+	// commit. Rule packs are always read from the trigger commit.
+	Commit string
 }
 
 type pluginMatrixEntry struct {
-	PluginID string `json:"plugin_id"`
-	Version  string `json:"version"`
+	PluginID     string `json:"plugin_id"`
+	Version      string `json:"version"`
+	SourceCommit string `json:"source_commit"`
 }
 
 type rulePackMatrixEntry struct {
@@ -48,6 +53,7 @@ type rulePackManifest struct {
 }
 
 var componentID = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+var componentCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var componentVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
 
 func validComponentVersion(value string) bool {
@@ -68,30 +74,30 @@ func validComponentVersion(value string) bool {
 	return true
 }
 
-// centralAssets lists only artifacts staged by this catalog preparation.
-// Historical releases remain referenced remotely and are not uploaded again.
+// centralAssets lists only artifacts staged by this catalog preparation, so
+// the workflow can sign them before publication. Historical releases remain
+// referenced remotely and are not signed or uploaded again. Only the modern
+// redirect is read: the legacy redirect ladder is frozen and no longer staged.
 func centralAssets(directory string) ([]string, error) {
 	type artifact struct {
 		URL string `json:"url"`
 	}
-	var artifacts []artifact
-	for _, name := range []string{"catalog-v3.redirect.json", "catalog-v3.modern.redirect.json"} {
-		content, err := os.ReadFile(filepath.Join(directory, name))
-		if err != nil {
-			return nil, err
-		}
-		var redirect struct {
-			Artifacts []artifact `json:"artifacts"`
-		}
-		if err := json.Unmarshal(content, &redirect); err != nil {
-			return nil, err
-		}
-		if len(redirect.Artifacts) == 0 {
-			return nil, fmt.Errorf("%s has no catalog artifacts", name)
-		}
-		artifacts = append(artifacts, redirect.Artifacts...)
+	const redirectName = "catalog-v3.modern.redirect.json"
+	content, err := os.ReadFile(filepath.Join(directory, redirectName))
+	if err != nil {
+		return nil, err
 	}
-	content, err := os.ReadFile(filepath.Join(directory, "prepared-rule-pack-artifacts.json"))
+	var redirect struct {
+		Artifacts []artifact `json:"artifacts"`
+	}
+	if err := json.Unmarshal(content, &redirect); err != nil {
+		return nil, err
+	}
+	if len(redirect.Artifacts) == 0 {
+		return nil, fmt.Errorf("%s has no catalog artifacts", redirectName)
+	}
+	artifacts := append([]artifact(nil), redirect.Artifacts...)
+	content, err = os.ReadFile(filepath.Join(directory, "prepared-rule-pack-artifacts.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -129,7 +135,11 @@ func centralAssets(directory string) ([]string, error) {
 	return result, nil
 }
 
-func readReleasePlan(path string) ([]releaseComponent, error) {
+// readReleasePlan reads `id<TAB>version` rows, or `id<TAB>version<TAB>commit`
+// rows when withCommit is set. Plugin rows carry their source commit and may
+// repeat an id across versions; rule-pack rows carry no commit and one
+// version per id.
+func readReleasePlan(path string, withCommit bool) ([]releaseComponent, error) {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -141,24 +151,37 @@ func readReleasePlan(path string) ([]releaseComponent, error) {
 			continue
 		}
 		fields := strings.Split(line, "\t")
-		if len(fields) != 2 || !componentID.MatchString(fields[0]) || !validComponentVersion(fields[1]) {
-			return nil, fmt.Errorf("%s:%d: expected a safe id and version separated by one tab", path, lineNumber+1)
+		expected := 2
+		if withCommit {
+			expected = 3
 		}
-		if seen[fields[0]] {
-			return nil, fmt.Errorf("%s:%d: duplicate component id %q", path, lineNumber+1, fields[0])
+		if len(fields) != expected || !componentID.MatchString(fields[0]) || !validComponentVersion(fields[1]) {
+			return nil, fmt.Errorf("%s:%d: expected a safe id and version%s separated by single tabs", path, lineNumber+1, map[bool]string{true: " and commit", false: ""}[withCommit])
 		}
-		seen[fields[0]] = true
-		plan = append(plan, releaseComponent{ID: fields[0], Version: fields[1]})
+		component := releaseComponent{ID: fields[0], Version: fields[1]}
+		key := fields[0]
+		if withCommit {
+			if !componentCommit.MatchString(fields[2]) {
+				return nil, fmt.Errorf("%s:%d: expected a full commit sha", path, lineNumber+1)
+			}
+			component.Commit = fields[2]
+			key = fields[0] + "\t" + fields[1]
+		}
+		if seen[key] {
+			return nil, fmt.Errorf("%s:%d: duplicate component %q", path, lineNumber+1, strings.ReplaceAll(key, "\t", " "))
+		}
+		seen[key] = true
+		plan = append(plan, component)
 	}
 	return plan, nil
 }
 
 func loadReleasePlan(pluginPath, rulePackPath string) (releasePlan, error) {
-	plugins, err := readReleasePlan(pluginPath)
+	plugins, err := readReleasePlan(pluginPath, true)
 	if err != nil {
 		return releasePlan{}, fmt.Errorf("read plugin plan: %w", err)
 	}
-	rulePacks, err := readReleasePlan(rulePackPath)
+	rulePacks, err := readReleasePlan(rulePackPath, false)
 	if err != nil {
 		return releasePlan{}, fmt.Errorf("read rule-pack plan: %w", err)
 	}
@@ -222,7 +245,7 @@ func appendOutput(path string, plan releasePlan) error {
 	}
 	plugins := make([]pluginMatrixEntry, 0, len(plan.Plugins))
 	for _, component := range plan.Plugins {
-		plugins = append(plugins, pluginMatrixEntry{PluginID: component.ID, Version: component.Version})
+		plugins = append(plugins, pluginMatrixEntry{PluginID: component.ID, Version: component.Version, SourceCommit: component.Commit})
 	}
 	rulePacks := make([]rulePackMatrixEntry, 0, len(plan.RulePacks))
 	for _, component := range plan.RulePacks {
@@ -264,7 +287,7 @@ func appendFile(path, content string) error {
 }
 
 func main() {
-	pluginPlan := flag.String("plugin-plan", "", "tab-separated plugin id/version plan")
+	pluginPlan := flag.String("plugin-plan", "", "tab-separated plugin id/version/commit plan")
 	rulePackPlan := flag.String("rule-pack-plan", "", "tab-separated rule-pack id/version plan")
 	githubOutput := flag.String("github-output", os.Getenv("GITHUB_OUTPUT"), "GitHub Actions output file")
 	checkCentralGate := flag.Bool("check-central-gate", false, "exit successfully only when central publishing is allowed")
@@ -279,7 +302,7 @@ func main() {
 	rulePackID := flag.String("rule-pack-id", "", "rule-pack id for manifest validation")
 	tagVersion := flag.String("tag-version", "", "component tag version for manifest validation")
 	manifestPath := flag.String("manifest", "", "rule-pack manifest path for version validation")
-	centralAssetsDir := flag.String("central-assets-dir", "", "list files staged for central catalog publication")
+	centralAssetsDir := flag.String("central-assets-dir", "", "list hashed files staged for central catalog publication")
 	flag.Parse()
 	if *centralAssetsDir != "" {
 		assets, err := centralAssets(*centralAssetsDir)

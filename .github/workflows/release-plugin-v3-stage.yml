@@ -33,6 +33,10 @@ env:
   SCRYER_OFFICIAL_PLUGIN_RELEASE_TAG_PREFIX: plugins-stage
   SCRYER_CATALOG_V3_RELEASE_TAG: catalog/v3-stage
   SCRYER_CATALOG_V3_PATH_PREFIX: catalog/v3-stage
+  # A manual rehearsal must name an existing signed release tag: the publisher
+  # refuses a branch or commit SHA here because a generation release can only
+  # hang off a verified annotated tag.
+  SCRYER_CATALOG_V3_GENERATION_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.ref_name }}
 
 jobs:
   plan-release:
@@ -172,7 +176,7 @@ jobs:
           name: release-plugin-v3-stage-xtask-${{ github.run_id }}
           path: xtask/target/xtask-release/xtask
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90  # a rerun that restores the saved signed preparation needs these too
 
       - name: Upload release plan
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -181,7 +185,7 @@ jobs:
           path: |
             release-plan.tsv
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90  # a rerun that restores the saved signed preparation needs these too
 
       - name: Upload validate stats
         if: always()
@@ -564,6 +568,11 @@ jobs:
   publish-central-catalog:
     needs: [plan-release, build-sign-release-plugin, publish-release-provenance]
     runs-on: ubuntu-latest
+    # See release-plugin-v3.yml: a third queued run is cancelled by GitHub
+    # and is simply rerun once the others finish.
+    concurrency:
+      group: central-catalog-v3-stage
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
@@ -607,7 +616,16 @@ jobs:
           name: release-plugin-v3-stage-plan-${{ github.run_id }}
           path: release-plan-artifact
 
+      # Before any input is fetched: a rerun that finds the signed preparation
+      # republishes exactly those bytes and needs none of the inputs.
+      - name: Restore signed catalog preparation
+        id: catalog-preparation
+        run: |
+          set -euo pipefail
+          bash .github/scripts/catalog-v3-preparation.sh restore dist/catalog-v3-stage
+
       - name: Download prepared plugin artifacts
+        if: steps.catalog-preparation.outputs.restored != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-plugin-v3-stage-prepared-${{ github.run_id }}-*
@@ -630,13 +648,15 @@ jobs:
           fi
 
       - name: Verify prepared plugin artifacts
+        if: steps.catalog-preparation.outputs.restored != 'true'
         run: |
           set -euo pipefail
           while IFS=$'\t' read -r plugin_id _; do
             ./xtask/target/xtask-release/xtask official verify-prepared "prepared-plugins/${plugin_id}"
           done < release-plan.tsv
 
-      - name: Prepare sign and publish central catalog v3 stage
+      - name: Prepare and sign central catalog
+        if: steps.catalog-preparation.outputs.restored != 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -655,17 +675,17 @@ jobs:
               --bundle "dist/catalog-v3-stage/${asset}.bundle" \
               "dist/catalog-v3-stage/${asset}"
           done
-          for redirect_name in catalog-v3.redirect catalog-v3.modern.redirect; do
-            cosign sign-blob \
-              --yes \
-              --bundle "dist/catalog-v3-stage/${redirect_name}.bundle.json" \
-              "dist/catalog-v3-stage/${redirect_name}.json"
-            cp "dist/catalog-v3-stage/${redirect_name}.bundle.json" \
-              "dist/catalog-v3-stage/${redirect_name}.sigstore.json"
-          done
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/catalog-v3-stage/catalog-v3.modern.redirect.bundle.json" \
+            "dist/catalog-v3-stage/catalog-v3.modern.redirect.json"
+          cp "dist/catalog-v3-stage/catalog-v3.modern.redirect.bundle.json" \
+            "dist/catalog-v3-stage/catalog-v3.modern.redirect.sigstore.json"
 
+          signing_list="${RUNNER_TEMP}/catalog-v3-stage-staged-assets.txt"
           go run .github/scripts/release_workflow_plan.go \
-            --central-assets-dir dist/catalog-v3-stage > dist/catalog-v3-stage/v3-central-assets.txt
+            --central-assets-dir dist/catalog-v3-stage > "${signing_list}"
+          test -s "${signing_list}"
 
           while IFS= read -r asset_name; do
             [ -n "${asset_name}" ] || continue
@@ -677,33 +697,20 @@ jobs:
               "dist/catalog-v3-stage/${asset_name}.sigstore.json"
             zstd -19 -f "dist/catalog-v3-stage/${asset_name}.bundle" -o "dist/catalog-v3-stage/${asset_name}.bundle.zst"
             rm -f "dist/catalog-v3-stage/${asset_name}.bundle"
-          done < dist/catalog-v3-stage/v3-central-assets.txt
+          done < "${signing_list}"
 
-          ./xtask/target/xtask-release/xtask catalog upload-v3r2 dist/catalog-v3-stage
 
-          gh release view "catalog/v3-stage" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
-            gh release create "catalog/v3-stage" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "Scryer plugin central catalog v3 stage" \
-              --target "$(git rev-parse HEAD)" \
-              --notes "Scryer plugin central catalog v3 staging assets."
-          central_release_assets=(
-            "dist/catalog-v3-stage/catalog-v3.redirect.json"
-            "dist/catalog-v3-stage/catalog-v3.redirect.bundle.json"
-            "dist/catalog-v3-stage/catalog-v3.redirect.sigstore.json"
-            "dist/catalog-v3-stage/catalog-v3.modern.redirect.json"
-            "dist/catalog-v3-stage/catalog-v3.modern.redirect.bundle.json"
-            "dist/catalog-v3-stage/catalog-v3.modern.redirect.sigstore.json"
-          )
-          while IFS= read -r asset_name; do
-            [ -n "${asset_name}" ] || continue
-            central_release_assets+=(
-              "dist/catalog-v3-stage/${asset_name}"
-              "dist/catalog-v3-stage/${asset_name}.bundle.zst"
-              "dist/catalog-v3-stage/${asset_name}.sigstore.json"
-            )
-          done < dist/catalog-v3-stage/v3-central-assets.txt
-          gh release upload "catalog/v3-stage" \
-            "${central_release_assets[@]}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --clobber
+      - name: Save signed catalog preparation before publication
+        if: steps.catalog-preparation.outputs.restored != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-catalog-preparation-${{ github.run_id }}
+          path: dist/catalog-v3-stage
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish saved catalog preparation
+        run: |
+          set -euo pipefail
+          ./xtask/target/xtask-release/xtask catalog publish-v3-generation \
+            --dist dist/catalog-v3-stage

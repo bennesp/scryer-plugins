@@ -154,19 +154,40 @@ catalog_v3_read_mirror_redirect() {
     "${repository}"
 }
 
+# Verify DIR/ASSET against its DIR/ASSET.bundle.zst companion (decompressed
+# beside it) as a release-trigger-bound signature for REPOSITORY.
+catalog_v3_verify_catalog_asset() {
+  local existing_dir="${1:?existing dir is required}"
+  local asset="${2:?asset is required}"
+  local repository="${3:?repository is required}"
+  zstd -dc "${existing_dir}/${asset}.bundle.zst" > "${existing_dir}/${asset}.bundle" &&
+    verify_release_blob_tag_bound \
+      "${existing_dir}/${asset}" \
+      "${existing_dir}/${asset}.bundle" \
+      "${repository}"
+}
+
 # Fetch ASSET and its .bundle.zst into DIR, trying each "<url> <signature url>"
-# pair in order; a pair with an empty url is skipped.
+# pair in order; a pair with an empty url is skipped. A pair only counts once
+# the downloaded bytes verify, so a corrupt or truncated copy on one source
+# falls through to the next instead of failing the run later.
 catalog_v3_fetch_catalog_pair() {
   local existing_dir="${1:?existing dir is required}"
   local asset="${2:?asset is required}"
-  shift 2
+  local repository="${3:?repository is required}"
+  shift 3
   while (( $# >= 2 )); do
     local url="$1" signature_url="$2"
     shift 2
     [ -n "${url}" ] && [ -n "${signature_url}" ] || continue
     if catalog_v3_retry catalog_v3_fetch "${url}" "${existing_dir}/${asset}" &&
       catalog_v3_retry catalog_v3_fetch "${signature_url}" "${existing_dir}/${asset}.bundle.zst"; then
-      return 0
+      if catalog_v3_verify_catalog_asset "${existing_dir}" "${asset}" "${repository}"; then
+        return 0
+      fi
+      printf 'catalog downloaded from %s failed signature verification; trying the next source\n' "${url}" >&2
+      rm -f "${existing_dir}/${asset}" "${existing_dir}/${asset}.bundle.zst" "${existing_dir}/${asset}.bundle"
+      continue
     fi
     printf 'catalog download from %s failed; trying the next source\n' "${url}" >&2
   done
@@ -205,7 +226,7 @@ resolve_catalog_v3_merge_base() {
     if [ "${catalog_asset}" = "${cdn_name}" ]; then
       # The live signed redirect carries both the generation directory and
       # the actual release tag, including release-trigger-backed generations.
-      catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+      catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" "${repository}" \
         "${cdn_url}" "${cdn_signature}" \
         "${cdn_mirror}" "${cdn_signature_mirror}"
     else
@@ -217,7 +238,7 @@ resolve_catalog_v3_merge_base() {
         override_url="${cdn_base}/${catalog_asset}"
       fi
       override_signature="${override_url}.bundle.zst"
-      if ! catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+      if ! catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" "${repository}" \
         "${override_url}" "${override_signature}"; then
         # The GitHub copy lives on the generation release that staged the
         # asset; only pre-generation snapshots sit on the redirect release.
@@ -235,6 +256,7 @@ resolve_catalog_v3_merge_base() {
             --pattern "${catalog_asset}" \
             --pattern "${catalog_asset}.bundle.zst"
         fi
+        catalog_v3_verify_catalog_asset "${existing_dir}" "${catalog_asset}" "${repository}"
       fi
     fi
   else
@@ -256,14 +278,8 @@ resolve_catalog_v3_merge_base() {
       return 1
     fi
     catalog_asset="${cdn_name}"
-    catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+    catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" "${repository}" \
       "${cdn_url}" "${cdn_signature}" \
       "${cdn_mirror}" "${cdn_signature_mirror}"
   fi
-
-  zstd -dc "${existing_dir}/${catalog_asset}.bundle.zst" > "${existing_dir}/${catalog_asset}.bundle"
-  verify_release_blob_tag_bound \
-    "${existing_dir}/${catalog_asset}" \
-    "${existing_dir}/${catalog_asset}.bundle" \
-    "${repository}"
 }

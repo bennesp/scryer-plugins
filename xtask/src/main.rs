@@ -3207,19 +3207,18 @@ fn maintenance_line_latest(plugin_id: &str, candidate: &Version, tags: &str) -> 
 }
 
 fn validate_maintenance_publication(args: &ReleasePublishTagsArgs) -> Result<()> {
-    if let Some(source) = args.maintenance_ref.as_deref() {
-        if source.is_empty()
+    if let Some(source) = args.maintenance_ref.as_deref()
+        && (source.is_empty()
             || source.starts_with('-')
             || args.plugin_ids.len() != 1
             || !args.plugin_sources.is_empty()
             || !args.rule_pack_ids.is_empty()
             || args.resume
-            || args.catalog_only_from.is_some()
-        {
-            bail!(
-                "--maintenance-ref requires a source ref and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog (use --plugin-source to combine lines)"
-            );
-        }
+            || args.catalog_only_from.is_some())
+    {
+        bail!(
+            "--maintenance-ref requires a source ref and exactly one --plugin-id; it cannot publish rule packs, resume, or republish a catalog (use --plugin-source to combine lines)"
+        );
     }
     if !args.plugin_sources.is_empty() && (args.resume || args.catalog_only_from.is_some()) {
         bail!(
@@ -3445,12 +3444,12 @@ fn plugin_components_published_at(
         .filter(|tag| tag.starts_with(&trigger_prefix) && !tag.starts_with(&catalog_only_prefix))
     {
         for (tag, tag_commit) in release_trigger_components(ctx, trigger)?.unwrap_or_default() {
-            if let Some(previous) = components.insert(tag.clone(), tag_commit.clone()) {
-                if previous != tag_commit {
-                    bail!(
-                        "{tag} is listed at both {previous} and {tag_commit} by triggers at {commit}"
-                    );
-                }
+            if let Some(previous) = components.insert(tag.clone(), tag_commit.clone())
+                && previous != tag_commit
+            {
+                bail!(
+                    "{tag} is listed at both {previous} and {tag_commit} by triggers at {commit}"
+                );
             }
         }
     }

@@ -379,6 +379,7 @@ fn last_artifact_name(bytes: &[u8]) -> Result<String> {
 /// store adopts the published signature bytes once they verify against that
 /// data (first store wins; a later store disagreeing with adopted bytes is a
 /// conflict, and so is a published companion that fails verification).
+#[allow(clippy::too_many_arguments)]
 fn preflight_store(
     destination: &str,
     plan: &GenerationPlan,

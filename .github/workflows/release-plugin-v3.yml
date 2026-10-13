@@ -475,6 +475,18 @@ jobs:
           git merge-base --is-ancestor "${SOURCE_COMMIT}" HEAD
           source_root="${RUNNER_TEMP}/release-source"
           git worktree add --detach "${source_root}" "${SOURCE_COMMIT}"
+          # The source commit may pin a different toolchain than the trigger
+          # commit the stable step installed. `xtask doctor` and the build run
+          # against the worktree's rust-toolchain.toml, so install that
+          # channel with the Wasm target before either runs.
+          if [ -f "${source_root}/rust-toolchain.toml" ]; then
+            channel="$(sed -n 's/^channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "${source_root}/rust-toolchain.toml" | head -n 1)"
+            if [ -z "${channel}" ]; then
+              echo "${source_root}/rust-toolchain.toml does not name a channel" >&2
+              exit 1
+            fi
+            rustup toolchain install "${channel}" --profile minimal --target wasm32-wasip2 --no-self-update
+          fi
           echo "Building from ${SOURCE_COMMIT} checked out at ${source_root}"
           echo "SCRYER_PLUGIN_RELEASE_SOURCE_ROOT=${source_root}" >> "${GITHUB_ENV}"
 

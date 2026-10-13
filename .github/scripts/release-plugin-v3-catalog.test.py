@@ -45,7 +45,7 @@ curl() {
     "$CDN/catalog-v3.modern.redirect.bundle.json") printf '{}' > "$destination" ;;
     "$CDN/full.json.zst"|"$CDN/full.json.zst.bundle.zst"|"$CDN/7/catalog-v3.7.repair.min.json.zst"|"$CDN/7/catalog-v3.7.repair.min.json.zst.bundle.zst")
       [[ "$MODE" != catalog_cdn_down && "$MODE" != catalog_unavailable ]] || return 22
-      printf 'catalog' > "$destination"
+      if [[ "$MODE" == catalog_cdn_corrupt ]]; then printf 'corrupt' > "$destination"; else printf 'catalog' > "$destination"; fi
       ;;
     "$MIRROR/full.json.zst"|"$MIRROR/full.json.zst.bundle.zst")
       [[ "$MODE" != catalog_unavailable ]] || return 22
@@ -98,7 +98,9 @@ gh() {
 sleep() { :; }
 verify_release_blob_tag_bound() {
   printf 'verify %s\n' "$1" >> calls
-  [[ "$MODE" != invalid_signature ]]
+  [[ "$MODE" != invalid_signature ]] || return 1
+  # A corrupt download carries bytes the signature does not cover.
+  [[ "$(cat "$1")" != corrupt ]]
 }
 zstd() { printf '{}'; }
 
@@ -181,6 +183,19 @@ class CatalogMergeBaseTests(unittest.TestCase):
         self.assertIn(f"curl {MIRROR}/full.json.zst\n", calls)
         self.assertIn(f"curl {MIRROR}/full.json.zst.bundle.zst\n", calls)
         self.assertIn("ready full.json.zst base full.json.zst", calls)
+
+    def test_corrupt_cdn_catalog_falls_through_to_the_verified_mirror_copy(self):
+        # The cdn pair downloads but its bytes do not verify; the redirect's
+        # mirror pair is the merge base instead of a later verification failure.
+        result, calls = self.run_selection("catalog_cdn_corrupt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("failed signature verification", result.stderr)
+        self.assertIn(f"curl {CDN}/full.json.zst\n", calls)
+        self.assertIn(f"curl {MIRROR}/full.json.zst\n", calls)
+        self.assertIn(f"curl {MIRROR}/full.json.zst.bundle.zst\n", calls)
+        self.assertIn("ready full.json.zst base full.json.zst", calls)
+        # cdn redirect, mirror redirect, corrupt cdn master, mirror master.
+        self.assertEqual(calls.count("verify "), 4)
 
     def test_catalog_unavailable_everywhere_stops_before_preparation(self):
         result, calls = self.run_selection("catalog_unavailable")

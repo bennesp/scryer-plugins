@@ -257,15 +257,14 @@ fn same_archive_group(candidate: &Path, selected: &Path) -> bool {
     };
     let candidate = candidate.to_ascii_lowercase();
     let selected = selected.to_ascii_lowercase();
-    if let Some((group, _)) = rar_volume_info(&selected) {
-        return rar_volume_info(&candidate).is_some_and(|(other, _)| other == group);
+    if let Some(primary) = crate::rar_volume_name(&selected) {
+        return crate::rar_volume_name(&candidate).is_some_and(|volume| {
+            volume.modern == primary.modern
+                && volume.set_name == primary.set_name
+                && volume.index >= primary.index
+        });
     }
-    if let Some(stem) = selected.strip_suffix(".001")
-        && let Some((other, part)) = candidate.rsplit_once('.')
-    {
-        return other == stem && part.len() == 3 && part.parse::<u16>().is_ok_and(|part| part > 0);
-    }
-    false
+    crate::split_volumes::same_split_set(&candidate, &selected)
 }
 
 fn source_relative_paths(
@@ -391,14 +390,27 @@ fn find_recovery_files(dir: &Path) -> Result<Vec<PathBuf>, Box<ArchivePluginProc
     let mut recovery_files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let is_par2 = path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("par2"));
         if !is_par2 {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            Box::new(failed_response(
+                "par2_input_type",
+                "failed to inspect PAR2 input",
+                error,
+            ))
+        })?;
+        if file_type.is_symlink() {
+            return Err(Box::new(failed_message(
+                "par2_symlink_input",
+                "PAR2 recovery inputs must be regular files, not symbolic links",
+            )));
+        }
+        if !file_type.is_file() {
             continue;
         }
         if recovery_files.len() >= MAX_PAR2_RECOVERY_FILES {
@@ -1181,6 +1193,8 @@ mod tests {
         for (canonical, actual) in [
             ("./set.part1.rar", "first.mkv"),
             ("set.part2.rar", "second.mkv"),
+            ("set.rar", "legacy.mkv"),
+            ("set.r00", "legacy-next.mkv"),
             ("other.rar", "other.rar"),
             ("episode.mkv", "episode.mkv"),
         ] {
@@ -1202,6 +1216,15 @@ mod tests {
             .unwrap(),
             ["first.mkv", "second.mkv"]
         );
+        assert_eq!(
+            replacement_paths(
+                source.path(),
+                &placement,
+                &Target::Archive("set.rar".to_string())
+            )
+            .unwrap(),
+            ["legacy-next.mkv", "legacy.mkv"]
+        );
         assert!(same_archive_group(
             Path::new("set.7z.002"),
             Path::new("set.7z.001")
@@ -1210,6 +1233,48 @@ mod tests {
             Path::new("other.7z.002"),
             Path::new("set.7z.001")
         ));
+    }
+
+    #[test]
+    fn replacement_groups_accept_all_supported_split_suffixes() {
+        for suffix in ["002", "0002", "1000", "65536", "4294967295"] {
+            assert!(
+                same_archive_group(
+                    Path::new(&format!("set.zip.{suffix}")),
+                    Path::new("set.zip.001")
+                ),
+                "{suffix}"
+            );
+        }
+        for suffix in ["000", "02", "abc", "4294967296"] {
+            assert!(
+                !same_archive_group(
+                    Path::new(&format!("set.zip.{suffix}")),
+                    Path::new("set.zip.001")
+                ),
+                "{suffix}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_discovery_rejects_live_and_dangling_symlinks() {
+        for target_exists in [true, false] {
+            let source = tempfile::tempdir().unwrap();
+            let target = source.path().join("recovery.bin");
+            if target_exists {
+                fs::write(&target, b"original").unwrap();
+            }
+            let link = source.path().join("recovery.par2");
+            std::os::unix::fs::symlink("recovery.bin", &link).unwrap();
+            let error = find_recovery_files(source.path()).unwrap_err();
+            assert_eq!(error.error_code.as_deref(), Some("par2_symlink_input"));
+            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+            if target_exists {
+                assert_eq!(fs::read(target).unwrap(), b"original");
+            }
+        }
     }
 
     #[cfg(unix)]

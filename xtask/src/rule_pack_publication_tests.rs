@@ -151,7 +151,6 @@ fn pack_only_args(out: PathBuf, existing_catalog: Option<PathBuf>) -> CatalogPre
         existing_catalog,
         prepared_plugin_root: None,
         allow_release_removals: Vec::new(),
-        allow_stratum_drops: Vec::new(),
         allow_selected_rebuild: false,
     }
 }
@@ -352,4 +351,179 @@ fn rule_pack_customizable_rejects_non_boolean_values() {
     let error = load_rule_pack_manifest(&ctx.path("rule_packs/invalid.json"))
         .expect_err("string customizable value must be rejected");
     assert!(format!("{error:#}").contains("invalid type"), "{error:#}");
+}
+
+#[test]
+fn prepare_writes_only_the_modern_redirect_with_generation_mirrors() {
+    let (_directory, ctx) = temp_context();
+    write_rule_pack_fixture(&ctx);
+    let baseline = write_existing_catalog(&ctx);
+    let out = ctx.path("out");
+
+    run_catalog_prepare_v3(&ctx, pack_only_args(out.clone(), Some(baseline)))
+        .expect("prepare catalog");
+
+    for legacy in [
+        "catalog-v3.redirect.json",
+        "catalog-v3.redirect.bundle.json",
+    ] {
+        assert!(!out.join(legacy).exists(), "{legacy} must not be produced");
+    }
+    assert!(!out.join("projections").exists());
+
+    let redirect: CatalogV3Redirect = serde_json::from_slice(
+        &fs::read(out.join(CATALOG_V3_MODERN_REDIRECT_JSON)).expect("read modern redirect"),
+    )
+    .expect("parse modern redirect");
+    assert_eq!(redirect.catalog_version, 8);
+    assert_eq!(redirect.artifacts.len(), 1);
+    let rung = &redirect.artifacts[0];
+    let master_name = url_file_name(&rung.url).expect("master file name");
+    assert!(
+        master_name.starts_with("catalog-v3.8."),
+        "generation in the asset name: {master_name}"
+    );
+    let generation_tag = central_catalog_v3_generation_tag(8);
+    assert_eq!(
+        rung.mirror_urls,
+        vec![github_release_asset_url(
+            OFFICIAL_GITHUB_REPO,
+            &generation_tag,
+            &master_name
+        )]
+    );
+    assert_eq!(
+        rung.signature_mirror_urls,
+        vec![github_release_asset_url(
+            OFFICIAL_GITHUB_REPO,
+            &generation_tag,
+            &signature_bundle_file_name(&master_name)
+        )]
+    );
+    assert!(generation_tag.ends_with("-g8"), "{generation_tag}");
+    assert!(
+        rung.mirror_urls[0].contains(&format!(
+            "/releases/download/{}/",
+            generation_tag.replace('/', "%2F")
+        )),
+        "tag slashes are percent-encoded: {}",
+        rung.mirror_urls[0]
+    );
+
+    let staged: Vec<CatalogV3Artifact> = serde_json::from_slice(
+        &fs::read(out.join(PREPARED_RULE_PACK_ARTIFACTS)).expect("read staged artifacts"),
+    )
+    .expect("parse staged artifacts");
+    assert_eq!(staged.len(), 2);
+    for artifact in &staged {
+        let name = url_file_name(&artifact.url).expect("pack file name");
+        assert_eq!(
+            artifact.mirror_urls,
+            vec![github_release_asset_url(
+                OFFICIAL_GITHUB_REPO,
+                &generation_tag,
+                &name
+            )]
+        );
+        assert_eq!(
+            artifact.signature_mirror_urls,
+            vec![github_release_asset_url(
+                OFFICIAL_GITHUB_REPO,
+                &generation_tag,
+                &signature_bundle_file_name(&name)
+            )]
+        );
+    }
+}
+
+#[test]
+fn re_preparing_a_published_pack_release_keeps_its_published_mirrors() {
+    let (_directory, ctx) = temp_context();
+    write_rule_pack_fixture(&ctx);
+    let baseline = write_existing_catalog(&ctx);
+    let first = ctx.path("first");
+    run_catalog_prepare_v3(&ctx, pack_only_args(first.clone(), Some(baseline)))
+        .expect("first prepare");
+
+    // Publish history as an older generation scheme would have written it.
+    let mut published = read_catalog_v3_from_path(&ctx, &first.join(CATALOG_V3_SNIPPET_JSON))
+        .expect("read first catalog");
+    let old_mirror =
+        "https://github.com/scryer-media/scryer-plugins/releases/download/catalog%2Fv3/x";
+    for pack in &mut published.rule_packs {
+        for release in &mut pack.releases {
+            for artifact in &mut release.artifacts {
+                artifact.mirror_urls = vec![old_mirror.to_string()];
+                artifact.signature_mirror_urls = vec![format!("{old_mirror}.bundle.zst")];
+            }
+        }
+    }
+    let published_path = ctx.path("published/catalog-v3.json");
+    write_file(
+        &published_path,
+        serde_json::to_vec_pretty(&published).expect("serialize published catalog"),
+    );
+
+    let second = ctx.path("second");
+    run_catalog_prepare_v3(&ctx, pack_only_args(second.clone(), Some(published_path)))
+        .expect("re-preparing an already published version is not a conflict");
+
+    let catalog = read_catalog_v3_from_path(&ctx, &second.join(CATALOG_V3_SNIPPET_JSON))
+        .expect("read second catalog");
+    assert_eq!(catalog.catalog_version, 9);
+    let release = catalog
+        .rule_packs
+        .iter()
+        .find(|pack| pack.id == "selected-pack")
+        .and_then(|pack| {
+            pack.releases
+                .iter()
+                .find(|release| release.version == "1.1.0")
+        })
+        .expect("selected release");
+    assert!(
+        release
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.mirror_urls == vec![old_mirror.to_string()])
+    );
+    let staged: Vec<CatalogV3Artifact> = serde_json::from_slice(
+        &fs::read(second.join(PREPARED_RULE_PACK_ARTIFACTS)).expect("read staged artifacts"),
+    )
+    .expect("parse staged artifacts");
+    assert!(
+        staged.is_empty(),
+        "an already published release has nothing new to upload"
+    );
+}
+
+#[test]
+fn re_preparing_a_published_pack_release_with_different_bytes_still_fails() {
+    let (_directory, ctx) = temp_context();
+    write_rule_pack_fixture(&ctx);
+    let baseline = write_existing_catalog(&ctx);
+    let first = ctx.path("first");
+    run_catalog_prepare_v3(&ctx, pack_only_args(first.clone(), Some(baseline)))
+        .expect("first prepare");
+    let published_path = first.join(CATALOG_V3_SNIPPET_JSON);
+
+    write_file(
+        &ctx.repo_root.join("rule_packs/selected-pack.json"),
+        r#"{
+  "schema_version": 1,
+  "id": "selected-pack",
+  "name": "Selected pack",
+  "description": "A tiny selected fixture pack.",
+  "author": "fixture",
+  "version": "1.1.0",
+  "rules": [{"id": "changed"}]
+}
+"#,
+    );
+    let error = run_catalog_prepare_v3(
+        &ctx,
+        pack_only_args(ctx.path("second"), Some(published_path)),
+    )
+    .expect_err("same version with different bytes must be rejected");
+    assert!(error.to_string().contains("differs from published history"));
 }

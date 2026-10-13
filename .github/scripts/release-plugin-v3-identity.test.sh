@@ -33,3 +33,4 @@ do
 done
 
 python3 "${script_dir}/release-plugin-v3-catalog.test.py"
+python3 "${script_dir}/catalog-v3-preparation.test.py"

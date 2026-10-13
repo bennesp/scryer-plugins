@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -12,7 +13,7 @@ func TestLoadReleasePlanBuildsIndependentComponentMatrices(t *testing.T) {
 	directory := t.TempDir()
 	pluginPath := filepath.Join(directory, "plugins.tsv")
 	rulePackPath := filepath.Join(directory, "packs.tsv")
-	if err := os.WriteFile(pluginPath, []byte("email\t1.2.3\n"), 0o600); err != nil {
+	if err := os.WriteFile(pluginPath, []byte("email\t1.2.3\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nemail\t1.1.9\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(rulePackPath, []byte("seadex-scoring-pack\t1.0.0\n"), 0o600); err != nil {
@@ -22,11 +23,45 @@ func TestLoadReleasePlanBuildsIndependentComponentMatrices(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := plan.Plugins; len(got) != 1 || got[0] != (releaseComponent{ID: "email", Version: "1.2.3"}) {
+	if got := plan.Plugins; len(got) != 2 ||
+		got[0] != (releaseComponent{ID: "email", Version: "1.2.3", Commit: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}) ||
+		got[1] != (releaseComponent{ID: "email", Version: "1.1.9", Commit: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}) {
 		t.Fatalf("plugin matrix = %#v", got)
 	}
 	if got := plan.RulePacks; len(got) != 1 || got[0] != (releaseComponent{ID: "seadex-scoring-pack", Version: "1.0.0"}) {
 		t.Fatalf("rule-pack matrix = %#v", got)
+	}
+}
+
+func TestPluginMatrixCarriesEachComponentSourceCommit(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "output")
+	plan := releasePlan{Plugins: []releaseComponent{
+		{ID: "email", Version: "1.2.3", Commit: "a000000000000000000000000000000000000000"},
+		{ID: "email", Version: "1.1.9", Commit: "b000000000000000000000000000000000000000"},
+	}}
+	if err := appendOutput(output, plan); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var matrix struct {
+		Include []pluginMatrixEntry `json:"include"`
+	}
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.HasPrefix(line, "plugin_matrix=") {
+			if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "plugin_matrix=")), &matrix); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	want := []pluginMatrixEntry{
+		{PluginID: "email", Version: "1.2.3", SourceCommit: "a000000000000000000000000000000000000000"},
+		{PluginID: "email", Version: "1.1.9", SourceCommit: "b000000000000000000000000000000000000000"},
+	}
+	if !reflect.DeepEqual(matrix.Include, want) {
+		t.Fatalf("plugin matrix = %#v", matrix.Include)
 	}
 }
 
@@ -55,13 +90,28 @@ func TestReleasePlanRejectsMalformedRows(t *testing.T) {
 		"unsafe-id":       "../pack\t1.0.0\n",
 		"unsafe-version":  "pack\t1.0.0/other\n",
 		"duplicate":       "pack\t1.0.0\npack\t1.0.1\n",
+		"with-commit":     "pack\t1.0.0\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
 	} {
 		path := filepath.Join(t.TempDir(), name+".tsv")
 		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := readReleasePlan(path); err == nil {
+		if _, err := readReleasePlan(path, false); err == nil {
 			t.Fatalf("%s plan row was accepted", name)
+		}
+	}
+	for name, content := range map[string]string{
+		"missing-commit":    "email\t1.0.0\n",
+		"short-commit":      "email\t1.0.0\tabc123\n",
+		"unsafe-commit":     "email\t1.0.0\t../aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
+		"duplicate-version": "email\t1.0.0\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nemail\t1.0.0\tbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n",
+	} {
+		path := filepath.Join(t.TempDir(), name+".tsv")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := readReleasePlan(path, true); err == nil {
+			t.Fatalf("%s plugin plan row was accepted", name)
 		}
 	}
 }
@@ -133,8 +183,10 @@ func TestCentralAssetsIncludeOnlyStagedVersionsAndFailMissingNewFiles(t *testing
 	artifact := func(name string) map[string]string {
 		return map[string]string{"url": "https://example.test/v1.0.0/" + name}
 	}
-	write("catalog-v3.redirect.json", map[string]any{"artifacts": []any{artifact("catalog.a.json.zst")}})
 	write("catalog-v3.modern.redirect.json", map[string]any{"artifacts": []any{artifact("catalog.a.json.zst")}})
+	// The frozen legacy redirect is never staged; a stale copy must not leak
+	// its per-stratum rungs into the signing list.
+	write("catalog-v3.redirect.json", map[string]any{"artifacts": []any{artifact("catalog.legacy.json.zst")}})
 	write("prepared-rule-pack-artifacts.json", []any{artifact("pack.new.min.json.br"), artifact("pack.new.min.json.zst")})
 	// The full catalog's historical asset must never be used as an upload list.
 	write("catalog-v3.json", map[string]any{"rule_packs": []any{artifact("pack.old.min.json.zst")}})
@@ -163,6 +215,39 @@ func TestCentralAssetsIncludeOnlyStagedVersionsAndFailMissingNewFiles(t *testing
 	write("prepared-rule-pack-artifacts.json", []any{artifact("evil%0afile.min.json.zst")})
 	if _, err := centralAssets(dir); err == nil {
 		t.Fatal("newline filename accepted")
+	}
+}
+
+func TestCentralAssetsRequireOnlyTheModernRedirect(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "catalog-v3.modern.redirect.json"),
+		[]byte(`{"artifacts":[{"url":"https://example.test/catalog.a.json.zst"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prepared-rule-pack-artifacts.json"), []byte(`[]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "catalog.a.json.zst"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := centralAssets(dir)
+	if err != nil {
+		t.Fatalf("modern-only staging rejected: %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{"catalog.a.json.zst"}) {
+		t.Fatalf("got %v", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "catalog-v3.modern.redirect.json"), []byte(`{"artifacts":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := centralAssets(dir); err == nil {
+		t.Fatal("empty modern redirect accepted")
+	}
+	if err := os.Remove(filepath.Join(dir, "catalog-v3.modern.redirect.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := centralAssets(dir); err == nil {
+		t.Fatal("missing modern redirect accepted")
 	}
 }
 

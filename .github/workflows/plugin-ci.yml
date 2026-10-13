@@ -33,6 +33,9 @@ jobs:
       - name: Test release identity policy
         run: |
           bash .github/scripts/release-plugin-v3-identity.test.sh
+          python3 -I .github/scripts/release-plugin-v3-components.test.py
+          python3 -I .github/scripts/release-plugin-v3-catalog.test.py
+          python3 -I .github/scripts/catalog-v3-preparation.test.py
           go test \
             .github/scripts/release_workflow_plan.go \
             .github/scripts/release_workflow_plan_test.go

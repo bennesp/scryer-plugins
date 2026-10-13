@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+# Resolve the central catalog v3 merge base.
+#
+# Source this file after release-plugin-v3-identity.sh, then call
+# resolve_catalog_v3_merge_base EXISTING_DIR REPOSITORY. On success it sets:
+#   catalog_asset     file name of the verified master catalog to merge onto,
+#                     downloaded to EXISTING_DIR/<catalog_asset>
+#   merge_base_asset  file name the live cdn modern redirect currently serves;
+#                     the publisher compare-and-sets against it
+#
+# Supported clients read the modern redirect from the cdn first and from the
+# GitHub catalog release second, so both copies must name the same generation
+# before anything merges onto either. The legacy redirect ladder is frozen and
+# is never read: its rungs are per-stratum projections, and merging onto one
+# drops every release the projection filtered out.
+#
+# Inputs (environment):
+#   CF_R2_PUBLIC_BASE_URL            cdn base, e.g. https://cdn.scryer.media/scryer
+#   SCRYER_CATALOG_V3_PATH_PREFIX    cdn path of the catalog (default catalog/v3)
+#   SCRYER_CATALOG_V3_RELEASE_TAG    GitHub release of the catalog (default catalog/v3)
+#   SCRYER_CATALOG_MERGE_BASE_ASSET  operator override: merge onto this signed
+#                                    master catalog asset instead
+#   CATALOG_V3_RETRY_DELAY           seconds per retry step (default 10)
+#
+# Callers run with errexit (set -e); any failed download or verification ends
+# the step before a merge base is chosen.
+
+readonly CATALOG_V3_MODERN_REDIRECT='catalog-v3.modern.redirect.json'
+readonly CATALOG_V3_MODERN_REDIRECT_BUNDLE='catalog-v3.modern.redirect.bundle.json'
+
+catalog_v3_retry() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if "$@"; then
+      return 0
+    fi
+    printf 'attempt %s/5 failed: %s\n' "${attempt}" "$*" >&2
+    sleep $(( attempt * ${CATALOG_V3_RETRY_DELAY:-10} ))
+  done
+  return 1
+}
+
+catalog_v3_cdn_base() {
+  printf '%s/%s\n' \
+    "${CF_R2_PUBLIC_BASE_URL:?CF_R2_PUBLIC_BASE_URL is required}" \
+    "${SCRYER_CATALOG_V3_PATH_PREFIX:-catalog/v3}"
+}
+
+catalog_v3_fetch() {
+  local url="${1:?url is required}"
+  local destination="${2:?destination is required}"
+  curl -fsSL --proto '=https' --tlsv1.2 -o "${destination}" "${url}"
+}
+
+catalog_v3_mirror_download() {
+  local destination="${1:?destination is required}"
+  local repository="${2:?repository is required}"
+  shift 2
+  gh release download "${SCRYER_CATALOG_V3_RELEASE_TAG:-catalog/v3}" \
+    --repo "${repository}" \
+    --dir "${destination}" \
+    --clobber \
+    "$@"
+}
+
+# Print "<catalog_version>\t<file name>\t<url>\t<mirror url>\t<signature url>\t<signature mirror url>"
+# for the last (newest) artifact of a redirect.
+catalog_v3_redirect_head() {
+  python3 -I -c '
+import json, sys
+from pathlib import Path
+from urllib.parse import urlsplit
+redirect = json.loads(Path(sys.argv[1]).read_text())
+version = redirect.get("catalog_version")
+if not isinstance(version, int) or isinstance(version, bool):
+    sys.exit("catalog-v3 redirect has no integer catalog_version")
+artifacts = redirect.get("artifacts") or []
+if not artifacts:
+    sys.exit("catalog-v3 redirect does not contain any artifacts")
+head = artifacts[-1]
+url = head.get("url") or ""
+name = urlsplit(url).path.rsplit("/", 1)[-1]
+if not name or name in (".", "..") or any(c in name for c in "\\\t\r\n"):
+    sys.exit("catalog-v3 redirect artifact url is not a file: " + repr(url))
+mirror = (head.get("mirror_urls") or [""])[0]
+signature = head.get("signature_url") or ""
+signature_mirror = (head.get("signature_mirror_urls") or [""])[0]
+for value in (url, mirror, signature, signature_mirror):
+    if any(c in value for c in "\t\r\n"):
+        sys.exit("catalog-v3 redirect contains a control character")
+print("\t".join([str(version), name, url, mirror, signature, signature_mirror]))
+' "$1"
+}
+
+# Download and verify the cdn copy of the modern redirect into DIR/cdn.
+catalog_v3_read_cdn_redirect() {
+  local existing_dir="${1:?existing dir is required}"
+  local repository="${2:?repository is required}"
+  local cdn_base
+  cdn_base="$(catalog_v3_cdn_base)"
+  mkdir -p "${existing_dir}/cdn"
+  catalog_v3_retry catalog_v3_fetch \
+    "${cdn_base}/${CATALOG_V3_MODERN_REDIRECT}" \
+    "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT}"
+  catalog_v3_retry catalog_v3_fetch \
+    "${cdn_base}/${CATALOG_V3_MODERN_REDIRECT_BUNDLE}" \
+    "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT_BUNDLE}"
+  test -s "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT}"
+  verify_release_blob_tag_bound \
+    "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT}" \
+    "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT_BUNDLE}" \
+    "${repository}"
+}
+
+# Download and verify the GitHub release copy of the modern redirect into DIR/mirror.
+catalog_v3_read_mirror_redirect() {
+  local existing_dir="${1:?existing dir is required}"
+  local repository="${2:?repository is required}"
+  mkdir -p "${existing_dir}/mirror"
+  catalog_v3_retry catalog_v3_mirror_download "${existing_dir}/mirror" "${repository}" \
+    --pattern "${CATALOG_V3_MODERN_REDIRECT}" \
+    --pattern "${CATALOG_V3_MODERN_REDIRECT_BUNDLE}"
+  test -s "${existing_dir}/mirror/${CATALOG_V3_MODERN_REDIRECT}"
+  verify_release_blob_tag_bound \
+    "${existing_dir}/mirror/${CATALOG_V3_MODERN_REDIRECT}" \
+    "${existing_dir}/mirror/${CATALOG_V3_MODERN_REDIRECT_BUNDLE}" \
+    "${repository}"
+}
+
+# Fetch ASSET and its .bundle.zst into DIR, trying each "<url> <signature url>"
+# pair in order; a pair with an empty url is skipped.
+catalog_v3_fetch_catalog_pair() {
+  local existing_dir="${1:?existing dir is required}"
+  local asset="${2:?asset is required}"
+  shift 2
+  while (( $# >= 2 )); do
+    local url="$1" signature_url="$2"
+    shift 2
+    [ -n "${url}" ] && [ -n "${signature_url}" ] || continue
+    if catalog_v3_retry catalog_v3_fetch "${url}" "${existing_dir}/${asset}" &&
+      catalog_v3_retry catalog_v3_fetch "${signature_url}" "${existing_dir}/${asset}.bundle.zst"; then
+      return 0
+    fi
+    printf 'catalog download from %s failed; trying the next source\n' "${url}" >&2
+  done
+  return 1
+}
+
+resolve_catalog_v3_merge_base() {
+  local existing_dir="${1:?existing dir is required}"
+  local repository="${2:?repository is required}"
+  local cdn_version cdn_name cdn_url cdn_mirror cdn_signature cdn_signature_mirror
+  mkdir -p "${existing_dir}"
+
+  catalog_v3_read_cdn_redirect "${existing_dir}" "${repository}"
+  IFS=$'\t' read -r cdn_version cdn_name cdn_url cdn_mirror cdn_signature cdn_signature_mirror \
+    < <(catalog_v3_redirect_head "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT}")
+  [ -n "${cdn_name:-}" ]
+  # shellcheck disable=SC2034 # consumed by the sourcing step
+  merge_base_asset="${cdn_name}"
+
+  if [ -n "${SCRYER_CATALOG_MERGE_BASE_ASSET:-}" ]; then
+    # Operator repair: merge onto a named, signed master catalog instead of
+    # the one the redirects serve. The compare-and-set still guards against
+    # the cdn redirect moving underneath this run. The mirror copy is not
+    # consulted, because repairing a disagreement is what the override is for.
+    printf '::warning::merging onto operator-selected catalog asset %s (cdn redirect serves %s, generation %s)\n' \
+      "${SCRYER_CATALOG_MERGE_BASE_ASSET}" "${cdn_name}" "${cdn_version}"
+    catalog_asset="${SCRYER_CATALOG_MERGE_BASE_ASSET}"
+    case "${catalog_asset}" in
+      */*|.|..|*[[:space:]]*)
+        printf 'SCRYER_CATALOG_MERGE_BASE_ASSET must be a bare asset file name; got %s\n' "${catalog_asset}" >&2
+        return 1
+        ;;
+    esac
+    local cdn_base
+    cdn_base="$(catalog_v3_cdn_base)"
+    if ! catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+      "${cdn_base}/${catalog_asset}" "${cdn_base}/${catalog_asset}.bundle.zst"; then
+      catalog_v3_retry catalog_v3_mirror_download "${existing_dir}" "${repository}" \
+        --pattern "${catalog_asset}" \
+        --pattern "${catalog_asset}.bundle.zst"
+    fi
+  else
+    local mirror_version mirror_name
+    catalog_v3_read_mirror_redirect "${existing_dir}" "${repository}"
+    IFS=$'\t' read -r mirror_version mirror_name _ \
+      < <(catalog_v3_redirect_head "${existing_dir}/mirror/${CATALOG_V3_MODERN_REDIRECT}")
+    [ -n "${mirror_name:-}" ]
+    if [ "${cdn_version}" != "${mirror_version}" ] || [ "${cdn_name}" != "${mirror_name}" ]; then
+      local direction="cdn and mirror disagree"
+      if (( mirror_version < cdn_version )); then
+        direction="mirror behind cdn"
+      elif (( cdn_version < mirror_version )); then
+        direction="cdn behind mirror"
+      fi
+      printf '::error::catalog v3 modern redirect: %s: cdn serves generation %s (%s), %s release serves generation %s (%s). Publish refuses to merge onto either. Bring the two back in line, or set SCRYER_CATALOG_MERGE_BASE_ASSET to the signed master catalog to merge onto.\n' \
+        "${direction}" "${cdn_version}" "${cdn_name}" \
+        "${SCRYER_CATALOG_V3_RELEASE_TAG:-catalog/v3}" "${mirror_version}" "${mirror_name}" >&2
+      return 1
+    fi
+    catalog_asset="${cdn_name}"
+    catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+      "${cdn_url}" "${cdn_signature}" \
+      "${cdn_mirror}" "${cdn_signature_mirror}"
+  fi
+
+  zstd -dc "${existing_dir}/${catalog_asset}.bundle.zst" > "${existing_dir}/${catalog_asset}.bundle"
+  verify_release_blob_tag_bound \
+    "${existing_dir}/${catalog_asset}" \
+    "${existing_dir}/${catalog_asset}.bundle" \
+    "${repository}"
+}

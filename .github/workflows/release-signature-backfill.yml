@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Official plugins-v3 release tag or catalog/v3"
+        description: "Official plugins-v3 release tag, catalog/v3, or a catalog/v3/g<version> generation release"
         required: true
         type: string
 
@@ -33,9 +33,9 @@ jobs:
         run: |
           set -euo pipefail
           case "${RELEASE_TAG}" in
-            plugins-v3/*/v*|catalog/v3) ;;
+            plugins-v3/*/v*|catalog/v3|catalog/v3/g*|catalog/v3-stage/g*) ;;
             *)
-              echo "Only official plugins-v3 releases and catalog/v3 may be backfilled." >&2
+              echo "Only official plugins-v3 releases, catalog/v3, and catalog generation releases may be backfilled." >&2
               exit 1
               ;;
           esac

@@ -3755,7 +3755,14 @@ fn ensure_resumable_signed_tag(ctx: &TaskContext, tag: &str, commit: &str) -> Re
         if remote_tag_exists(ctx, tag)? {
             bail!("cannot resume {tag}: remote tag was not fetched locally");
         }
-        create_and_verify_signed_tag(ctx, tag, &format!("Release {tag}"))?;
+        let message = if tag.starts_with(&repo_release_tag_prefix()) {
+            // A resumed pack release has no plugin components, but the signed
+            // trigger must still declare that explicitly to the publisher.
+            release_trigger_message(&[], &[])
+        } else {
+            format!("Release {tag}")
+        };
+        create_and_verify_signed_tag(ctx, tag, &message)?;
         return Ok(true);
     }
 
@@ -3788,6 +3795,11 @@ fn existing_release_trigger_for_commit(ctx: &TaskContext, commit: &str) -> Resul
             verify.args(["verify-tag", tag]);
             run_checked(&mut verify)
                 .with_context(|| format!("cannot resume unverified release trigger {tag}"))?;
+            if release_trigger_components(ctx, tag)?.is_none() {
+                bail!(
+                    "cannot resume {tag}: signed trigger has no components marker; preserve the tag and recover through release-plugin-v3 workflow_dispatch at this release commit"
+                );
+            }
             matching.push(tag.to_string());
         }
     }
@@ -9809,11 +9821,29 @@ mod tests {
                 .unwrap()
                 .contains('/')
         );
-        create_and_verify_signed_tag(&ctx, &first, "fixture trigger").expect("sign trigger");
+        assert!(ensure_resumable_signed_tag(&ctx, &first, &commit).expect("create trigger"));
+        assert_eq!(
+            release_trigger_components(&ctx, &first).expect("read trigger components"),
+            Some(Vec::new())
+        );
         assert_eq!(
             existing_release_trigger_for_commit(&ctx, &commit).expect("find trigger"),
             Some(first)
         );
+    }
+
+    #[test]
+    fn resumable_trigger_rejects_legacy_metadata_without_replacing_the_tag() {
+        let (_temp, ctx, commit) = signed_resume_repo();
+        let tag =
+            resumable_release_trigger(&ctx, "rule-packs/seadex-scoring-pack/v1.0.22", &commit)
+                .expect("trigger name");
+        create_and_verify_signed_tag(&ctx, &tag, "legacy trigger").expect("sign legacy trigger");
+        let object = git_capture(&ctx, &["rev-parse", &tag]).expect("tag object");
+        let error = existing_release_trigger_for_commit(&ctx, &commit)
+            .expect_err("legacy trigger must not appear resumable");
+        assert!(error.to_string().contains("workflow_dispatch"));
+        assert_eq!(git_capture(&ctx, &["rev-parse", &tag]).unwrap(), object);
     }
 
     fn write_community_v3_manifest(ctx: &TaskContext, contents: &str) {

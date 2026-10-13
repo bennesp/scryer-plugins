@@ -27,7 +27,7 @@
 //! handled data-driven inside [`par2`]: when the source directory has one it is
 //! verified, placed, and repaired before extraction starts.
 
-use lzma_turbo::hooks::{HostHashHooks, HostSha256Handle, install_host_hash_hooks};
+use lzma_turbo::hooks::{HostHashHooks, install_host_hash_hooks};
 use lzma_turbo::xz::{XzError, XzErrorKind, XzReader};
 use scryer_plugin_sdk::current_sdk_constraint;
 use scryer_plugin_sdk::{
@@ -45,6 +45,7 @@ use std::path::{Component, Path, PathBuf};
 use unrar_rs::hooks::{HostAesError, HostCryptoHooks, install_host_crypto_hooks};
 use unrar_rs::{RarArchive, RarError};
 
+mod guest_sha256;
 mod par2;
 mod split_volumes;
 
@@ -107,8 +108,9 @@ export!(ArchiveExtractorComponent);
 /// AES-CBC decrypt, and lzma-turbo's bulk CRC-32 and CRC-64/XZ at the world's
 /// `crypto` import.
 ///
-/// lzma-turbo's SHA-256 hooks are never called: `crypto-host` is off, and the
-/// xz SHA-256 check stays on the in-guest RustCrypto backend.
+/// sevenz-turbo enables lzma-turbo's SHA-256 hooks transitively. The archive
+/// world has no SHA-256 import, so those hooks retain the guest RustCrypto
+/// backend through a streaming handle adapter.
 ///
 /// All three crates are transport-agnostic — they hold plain `fn` pointers and know
 /// nothing about WIT — so this adapter is the whole seam between them and the
@@ -166,17 +168,14 @@ fn install_crypto_hooks() {
         aes_cbc_decrypt: sevenz_aes_cbc_decrypt,
     });
 
-    fn sha256_not_delegated() -> ! {
-        unreachable!("lzma-turbo `crypto-host` is off; SHA-256 is computed in the guest")
-    }
     install_host_hash_hooks(HostHashHooks::new(
         crc32,
         crc64_xz,
-        || sha256_not_delegated(),
-        |_: HostSha256Handle| sha256_not_delegated(),
-        |_: HostSha256Handle, _: &[u8]| sha256_not_delegated(),
-        |_: HostSha256Handle| sha256_not_delegated(),
-        |_: HostSha256Handle| sha256_not_delegated(),
+        guest_sha256::init,
+        guest_sha256::clone,
+        guest_sha256::update,
+        guest_sha256::finalize,
+        guest_sha256::release,
     ));
 }
 
@@ -188,6 +187,7 @@ fn build_descriptor() -> PluginDescriptor {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: vec![],
         provider: ProviderDescriptor::ArchiveExtractor(ArchiveExtractorDescriptor {
             provider_type: "archive-extraction".to_string(),
             provider_aliases: vec![],
@@ -195,6 +195,7 @@ fn build_descriptor() -> PluginDescriptor {
             default_base_url: None,
             allowed_hosts: vec![],
             capabilities: ArchiveExtractorCapabilities {
+                enforced_limits: true,
                 formats: vec![
                     ArchivePluginFormat::Rar,
                     ArchivePluginFormat::Zip,
@@ -252,8 +253,12 @@ fn extract_archive(
             extract_prepared_archive(archive_path, output_root, format, password)
         }
         par2::Par2Plan::Prepared(inputs) => {
-            let response =
+            let mut response =
                 extract_prepared_archive(&inputs.archive_path, output_root, format, password);
+            if response.status == ArchivePluginStatus::Ok {
+                response.replaced_source_paths = inputs.replaced_source_paths.clone();
+                response.processed_recovery_paths = inputs.processed_recovery_paths.clone();
+            }
             // The staged copy duplicates inputs the host still owns; drop it
             // whether or not extraction succeeded.
             inputs.cleanup();
@@ -1323,6 +1328,8 @@ fn sevenz_error_from_message(message: Option<&str>) -> sevenz_turbo::Error {
 pub(crate) fn empty_response() -> ArchivePluginProcessResponse {
     ArchivePluginProcessResponse {
         status: ArchivePluginStatus::Failed,
+        replaced_source_paths: vec![],
+        processed_recovery_paths: vec![],
         files: vec![],
         expanded_bytes: None,
         copied_bytes: None,

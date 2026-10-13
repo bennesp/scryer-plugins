@@ -103,6 +103,17 @@ struct SplitPartName<'a> {
     width: usize,
 }
 
+/// Use the extraction parser when accounting for consumed source parts too.
+pub(crate) fn same_split_set(candidate: &str, selected: &str) -> bool {
+    let Some(first) = split_part_name(selected) else {
+        return false;
+    };
+    let Some(part) = split_part_name(candidate) else {
+        return false;
+    };
+    first.number == 1 && part.number > 0 && first.set_name.eq_ignore_ascii_case(part.set_name)
+}
+
 fn split_part_name(file_name: &str) -> Option<SplitPartName<'_>> {
     let (set_name, digits) = file_name.rsplit_once('.')?;
     if set_name.is_empty() || digits.len() < 3 || !digits.bytes().all(|byte| byte.is_ascii_digit())

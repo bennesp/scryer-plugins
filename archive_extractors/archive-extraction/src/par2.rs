@@ -104,6 +104,8 @@ pub(crate) enum Par2Plan {
 /// was materialized without anything else having to be told about it.
 pub(crate) struct Par2Inputs {
     pub(crate) archive_path: PathBuf,
+    pub(crate) processed_recovery_paths: Vec<String>,
+    pub(crate) replaced_source_paths: Vec<String>,
     /// Removed by [`Par2Inputs::cleanup`] once extraction has finished with it.
     staging_dir: Option<PathBuf>,
 }
@@ -163,6 +165,11 @@ pub(crate) fn prepare_for_extraction(
         Err(response) => return Par2Plan::Complete(response),
     };
 
+    let processed_recovery = match source_relative_paths(source_dir, &recovery_files) {
+        Ok(paths) => paths,
+        Err(response) => return Par2Plan::Complete(response),
+    };
+
     let set = match load_set(&recovery_files) {
         Ok(set) => set,
         Err(response) => return Par2Plan::Complete(response),
@@ -192,10 +199,113 @@ pub(crate) fn prepare_for_extraction(
         Err(response) => return Par2Plan::Complete(response),
     };
 
-    match target {
+    let replaced = match replacement_paths(source_dir, &placement, &target) {
+        Ok(paths) => paths,
+        Err(response) => return Par2Plan::Complete(response),
+    };
+    let mut plan = match target {
         Target::PlainFiles => emit_plain_files(&set, &placement, output_dir),
         Target::Archive(canonical) => prepare_archive(&set, &placement, &canonical, source_dir),
+    };
+    match &mut plan {
+        Par2Plan::Prepared(inputs) => {
+            inputs.processed_recovery_paths = processed_recovery;
+            inputs.replaced_source_paths = replaced;
+        }
+        Par2Plan::Complete(response) if response.status == ArchivePluginStatus::Ok => {
+            response.replaced_source_paths = replaced;
+            response.processed_recovery_paths = processed_recovery;
+        }
+        _ => {}
     }
+    plan
+}
+
+fn replacement_paths(
+    source_dir: &Path,
+    placement: &Placement,
+    target: &Target,
+) -> Result<Vec<String>, Box<ArchivePluginProcessResponse>> {
+    // Plain-file emission stages every existing protected file. Derive its
+    // sources from that same placement map rather than joining raw canonical
+    // names against normalized output names (e.g. ./episode.mkv).
+    let mut sources = Vec::new();
+    for (canonical, actual) in &placement.actual_by_canonical {
+        let canonical = safe_relative_path(canonical)?;
+        if let Target::Archive(selected) = target
+            && !same_archive_group(&canonical, &safe_relative_path(selected)?)
+        {
+            continue;
+        }
+        sources.push(actual.clone());
+    }
+    source_relative_paths(source_dir, &sources)
+}
+
+fn same_archive_group(candidate: &Path, selected: &Path) -> bool {
+    if candidate == selected {
+        return true;
+    }
+    if candidate.parent() != selected.parent() {
+        return false;
+    }
+    let Some(candidate) = candidate.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(selected) = selected.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let candidate = candidate.to_ascii_lowercase();
+    let selected = selected.to_ascii_lowercase();
+    if let Some(primary) = crate::rar_volume_name(&selected) {
+        return crate::rar_volume_name(&candidate).is_some_and(|volume| {
+            volume.modern == primary.modern
+                && volume.set_name == primary.set_name
+                && volume.index >= primary.index
+        });
+    }
+    crate::split_volumes::same_split_set(&candidate, &selected)
+}
+
+fn source_relative_paths(
+    source_dir: &Path,
+    paths: &[PathBuf],
+) -> Result<Vec<String>, Box<ArchivePluginProcessResponse>> {
+    let invalid = || {
+        Box::new(failed_message(
+            "par2_unsafe_source_path",
+            "PAR2 source cannot be represented by an unambiguous source-relative path",
+        ))
+    };
+    let mut relative = Vec::new();
+    for path in paths {
+        let path_in_source = path.strip_prefix(source_dir).map_err(|_| invalid())?;
+        let mut parts = Vec::new();
+        for component in path_in_source.components() {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(part) => {
+                    let part = part.to_str().ok_or_else(invalid)?;
+                    // Host path validation treats backslashes as separators.
+                    // Refuse literal backslashes instead of naming another file.
+                    if part.contains('\\') {
+                        return Err(invalid());
+                    }
+                    parts.push(part);
+                }
+                _ => return Err(invalid()),
+            }
+        }
+        if parts.is_empty() {
+            return Err(invalid());
+        }
+        if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+            relative.push(parts.join("/"));
+        }
+    }
+    relative.sort();
+    relative.dedup();
+    Ok(relative)
 }
 
 /// Run PAR2 handling for an inspection request.
@@ -280,14 +390,27 @@ fn find_recovery_files(dir: &Path) -> Result<Vec<PathBuf>, Box<ArchivePluginProc
     let mut recovery_files = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
         let is_par2 = path
             .extension()
             .and_then(|extension| extension.to_str())
             .is_some_and(|extension| extension.eq_ignore_ascii_case("par2"));
         if !is_par2 {
+            continue;
+        }
+        let file_type = entry.file_type().map_err(|error| {
+            Box::new(failed_response(
+                "par2_input_type",
+                "failed to inspect PAR2 input",
+                error,
+            ))
+        })?;
+        if file_type.is_symlink() {
+            return Err(Box::new(failed_message(
+                "par2_symlink_input",
+                "PAR2 recovery inputs must be regular files, not symbolic links",
+            )));
+        }
+        if !file_type.is_file() {
             continue;
         }
         if recovery_files.len() >= MAX_PAR2_RECOVERY_FILES {
@@ -673,6 +796,8 @@ fn prepare_archive(
         return Par2Plan::Prepared(Par2Inputs {
             archive_path: source_dir.join(relative),
             staging_dir: None,
+            processed_recovery_paths: Vec::new(),
+            replaced_source_paths: Vec::new(),
         });
     }
 
@@ -690,6 +815,8 @@ fn prepare_archive(
         Ok(Par2Inputs {
             archive_path: staging_dir.join(relative),
             staging_dir: Some(staging_dir.clone()),
+            processed_recovery_paths: Vec::new(),
+            replaced_source_paths: Vec::new(),
         })
     })();
 
@@ -1040,6 +1167,132 @@ mod tests {
         assert_eq!(rar_volume_info("show.r00"), Some(("show".to_string(), 1)));
         assert_eq!(rar_volume_info("show.s00"), Some(("show".to_string(), 101)));
         assert_eq!(rar_volume_info("show.mkv"), None);
+    }
+
+    #[test]
+    fn replacements_follow_normalized_placement_and_exclude_unrelated_files() {
+        let source = tempfile::tempdir().unwrap();
+        let media = source.path().join("episode.mkv");
+        fs::write(&media, b"media").unwrap();
+        fs::write(source.path().join("unrelated.mkv"), b"other").unwrap();
+        let placement = Placement {
+            actual_by_canonical: HashMap::from([("./episode.mkv".to_string(), media)]),
+            state: State::Verified,
+            move_count: 0,
+        };
+        assert_eq!(
+            replacement_paths(source.path(), &placement, &Target::PlainFiles).unwrap(),
+            ["episode.mkv"]
+        );
+    }
+
+    #[test]
+    fn archive_replacements_include_only_the_selected_volume_group() {
+        let source = tempfile::tempdir().unwrap();
+        let mut paths = HashMap::new();
+        for (canonical, actual) in [
+            ("./set.part1.rar", "first.mkv"),
+            ("set.part2.rar", "second.mkv"),
+            ("set.rar", "legacy.mkv"),
+            ("set.r00", "legacy-next.mkv"),
+            ("other.rar", "other.rar"),
+            ("episode.mkv", "episode.mkv"),
+        ] {
+            let path = source.path().join(actual);
+            fs::write(&path, b"fixture").unwrap();
+            paths.insert(canonical.to_string(), path);
+        }
+        let placement = Placement {
+            actual_by_canonical: paths,
+            state: State::Verified,
+            move_count: 2,
+        };
+        assert_eq!(
+            replacement_paths(
+                source.path(),
+                &placement,
+                &Target::Archive("./set.part1.rar".to_string())
+            )
+            .unwrap(),
+            ["first.mkv", "second.mkv"]
+        );
+        assert_eq!(
+            replacement_paths(
+                source.path(),
+                &placement,
+                &Target::Archive("set.rar".to_string())
+            )
+            .unwrap(),
+            ["legacy-next.mkv", "legacy.mkv"]
+        );
+        assert!(same_archive_group(
+            Path::new("set.7z.002"),
+            Path::new("set.7z.001")
+        ));
+        assert!(!same_archive_group(
+            Path::new("other.7z.002"),
+            Path::new("set.7z.001")
+        ));
+    }
+
+    #[test]
+    fn replacement_groups_accept_all_supported_split_suffixes() {
+        for suffix in ["002", "0002", "1000", "65536", "4294967295"] {
+            assert!(
+                same_archive_group(
+                    Path::new(&format!("set.zip.{suffix}")),
+                    Path::new("set.zip.001")
+                ),
+                "{suffix}"
+            );
+        }
+        for suffix in ["000", "02", "abc", "4294967296"] {
+            assert!(
+                !same_archive_group(
+                    Path::new(&format!("set.zip.{suffix}")),
+                    Path::new("set.zip.001")
+                ),
+                "{suffix}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_discovery_rejects_live_and_dangling_symlinks() {
+        for target_exists in [true, false] {
+            let source = tempfile::tempdir().unwrap();
+            let target = source.path().join("recovery.bin");
+            if target_exists {
+                fs::write(&target, b"original").unwrap();
+            }
+            let link = source.path().join("recovery.par2");
+            std::os::unix::fs::symlink("recovery.bin", &link).unwrap();
+            let error = find_recovery_files(source.path()).unwrap_err();
+            assert_eq!(error.error_code.as_deref(), Some("par2_symlink_input"));
+            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+            if target_exists {
+                assert_eq!(fs::read(target).unwrap(), b"original");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_metadata_rejects_literal_backslashes_without_aliasing_nested_files() {
+        let source = tempfile::tempdir().unwrap();
+        for name in [r"set\vol.par2", r"set\episode.mkv"] {
+            let actual = source.path().join(name);
+            fs::write(&actual, b"original").unwrap();
+            let nested = source.path().join(name.replace('\\', "/"));
+            fs::create_dir_all(nested.parent().unwrap()).unwrap();
+            fs::write(&nested, b"unrelated").unwrap();
+            let error =
+                source_relative_paths(source.path(), std::slice::from_ref(&actual)).unwrap_err();
+            assert_eq!(error.error_code.as_deref(), Some("par2_unsafe_source_path"));
+            assert_eq!(fs::read(actual).unwrap(), b"original");
+            assert_eq!(fs::read(nested).unwrap(), b"unrelated");
+        }
     }
 
     #[test]

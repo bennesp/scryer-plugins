@@ -34,8 +34,10 @@ env:
   SCRYER_CATALOG_V3_RELEASE_TAG: catalog/v3-stage
   SCRYER_CATALOG_V3_PATH_PREFIX: catalog/v3-stage
   # Stage generations publish to their own releases so they never collide
-  # with production catalog/v3/g<version> releases.
-  SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX: catalog/v3-stage/g
+  # with production catalog/v3-g<version> releases. The stage catalog has no
+  # merge base, so every rehearsal is generation 1; the run id keeps each
+  # rehearsal on a release of its own instead of piling onto one.
+  SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX: catalog/v3-stage-r${{ github.run_id }}-g
 
 jobs:
   plan-release:
@@ -693,7 +695,7 @@ jobs:
               --notes "Scryer plugin central catalog v3 staging assets."
 
           # Same publication order as production: hashed assets to R2 and to
-          # this generation's own release (catalog/v3-stage/g<version>), both
+          # this generation's own release (catalog/v3-stage-r<run id>-g<version>), both
           # verified, before the modern redirect advances on R2 and then on
           # catalog/v3-stage. The stage catalog is rebuilt without a merge
           # base, so there is no expected merge base to compare against.

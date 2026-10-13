@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "pack_id": "seadex-scoring-pack",
-  "pack_version": "1.0.21",
-  "snapshot_sha256": "7f11e76a678dee939f27d4763acf1bd64be5006fe44a18efd895ebf9778685ce",
+  "pack_version": "1.0.22",
+  "snapshot_sha256": "c1217ec2f6d6bb859b114e7d036f6d744acc240b8aadf0b90ab37e7fe54faec4",
   "converter_revision": "83da44e98b85d2049b73a1915b54543023213d43642a62a7eeb6709489f21b6f",
   "included": [
     {
@@ -679,6 +679,22 @@
     },
     {
       "alias_sources": 0,
+      "entry_id": "09b1rf8onzj59wk",
+      "file_sources": 12,
+      "release_id": "ndqhjfv6dup505t",
+      "strict_keys": 12,
+      "tolerant_keys": 12
+    },
+    {
+      "alias_sources": 0,
+      "entry_id": "09b1rf8onzj59wk",
+      "file_sources": 12,
+      "release_id": "upr7a87s2vf5eir",
+      "strict_keys": 12,
+      "tolerant_keys": 12
+    },
+    {
+      "alias_sources": 0,
       "entry_id": "09vgnke3p76j9e6",
       "file_sources": 4,
       "release_id": "dlsl0tmkn8uoc9h",
@@ -1088,16 +1104,8 @@
     {
       "alias_sources": 0,
       "entry_id": "0es6ix42bjy76xi",
-      "file_sources": 27,
-      "release_id": "5zu2mdl82mhbeo0",
-      "strict_keys": 27,
-      "tolerant_keys": 27
-    },
-    {
-      "alias_sources": 0,
-      "entry_id": "0es6ix42bjy76xi",
       "file_sources": 21,
-      "release_id": "7gpwd4iw0kf9ahu",
+      "release_id": "285epm248vsipg7",
       "strict_keys": 21,
       "tolerant_keys": 21
     },
@@ -1105,7 +1113,7 @@
       "alias_sources": 0,
       "entry_id": "0es6ix42bjy76xi",
       "file_sources": 21,
-      "release_id": "7jxviee7meibqej",
+      "release_id": "ekggc7si1ps17m6",
       "strict_keys": 21,
       "tolerant_keys": 21
     },
@@ -1113,7 +1121,15 @@
       "alias_sources": 0,
       "entry_id": "0es6ix42bjy76xi",
       "file_sources": 21,
-      "release_id": "xo85amupo6yggjr",
+      "release_id": "fpvpjlpt7x7pm84",
+      "strict_keys": 21,
+      "tolerant_keys": 21
+    },
+    {
+      "alias_sources": 0,
+      "entry_id": "0es6ix42bjy76xi",
+      "file_sources": 21,
+      "release_id": "qxok8ew5zdrcunp",
       "strict_keys": 21,
       "tolerant_keys": 21
     },
@@ -12343,6 +12359,14 @@
     },
     {
       "alias_sources": 0,
+      "entry_id": "728ue1sv3w21vnz",
+      "file_sources": 12,
+      "release_id": "yklocodq5o2x27u",
+      "strict_keys": 12,
+      "tolerant_keys": 12
+    },
+    {
+      "alias_sources": 0,
       "entry_id": "73emf9xavag7pbz",
       "file_sources": 28,
       "release_id": "mr2gjxldj36l0vv",
@@ -17185,7 +17209,7 @@
       "alias_sources": 0,
       "entry_id": "9uyi394h1nkg4xd",
       "file_sources": 8,
-      "release_id": "vbzlu1iauppyuxt",
+      "release_id": "9afi7zgrn3fi91g",
       "strict_keys": 8,
       "tolerant_keys": 8
     },
@@ -24471,6 +24495,22 @@
     },
     {
       "alias_sources": 0,
+      "entry_id": "eozj2qjx5pc59te",
+      "file_sources": 50,
+      "release_id": "lb0w92tgpfctfqe",
+      "strict_keys": 50,
+      "tolerant_keys": 0
+    },
+    {
+      "alias_sources": 0,
+      "entry_id": "eozj2qjx5pc59te",
+      "file_sources": 50,
+      "release_id": "p3hqs44bwa6y0p5",
+      "strict_keys": 50,
+      "tolerant_keys": 0
+    },
+    {
+      "alias_sources": 0,
       "entry_id": "ep5ayhf863xcvwc",
       "file_sources": 12,
       "release_id": "c6pejvfhb042qgg",
@@ -26410,6 +26450,14 @@
       "entry_id": "fnsbrs56ny5bszo",
       "file_sources": 12,
       "release_id": "ptbuzx3ak8t29c2",
+      "strict_keys": 12,
+      "tolerant_keys": 12
+    },
+    {
+      "alias_sources": 0,
+      "entry_id": "fnsbrs56ny5bszo",
+      "file_sources": 12,
+      "release_id": "w9pbcq617enpxbl",
       "strict_keys": 12,
       "tolerant_keys": 12
     },
@@ -29025,6 +29073,14 @@
       "alias_sources": 0,
       "entry_id": "helj9w9w5q2qurt",
       "file_sources": 1,
+      "release_id": "1llwe2k68ds4mib",
+      "strict_keys": 1,
+      "tolerant_keys": 1
+    },
+    {
+      "alias_sources": 0,
+      "entry_id": "helj9w9w5q2qurt",
+      "file_sources": 1,
       "release_id": "4zs9qpmf7k300cj",
       "strict_keys": 1,
       "tolerant_keys": 1
@@ -29034,6 +29090,14 @@
       "entry_id": "helj9w9w5q2qurt",
       "file_sources": 1,
       "release_id": "pvi2msccmy4n0nk",
+      "strict_keys": 1,
+      "tolerant_keys": 1
+    },
+    {
+      "alias_sources": 0,
+      "entry_id": "helj9w9w5q2qurt",
+      "file_sources": 1,
+      "release_id": "x8t2ejixqfnnipi",
       "strict_keys": 1,
       "tolerant_keys": 1
     },
@@ -62407,6 +62471,14 @@
     },
     {
       "alias_sources": 0,
+      "entry_id": "zpme2r0mgzu71kd",
+      "file_sources": 2,
+      "release_id": "vel71aryzlv44sl",
+      "strict_keys": 2,
+      "tolerant_keys": 2
+    },
+    {
+      "alias_sources": 0,
       "entry_id": "zpn4vzc2vu2sz3u",
       "file_sources": 1,
       "release_id": "16t4iy2sgrgw4gy",
@@ -64852,42 +64924,6 @@
       "reason": "source_missing_edge_group_for_tolerant_match",
       "release_id": "qaw95vehrpsbdeu",
       "source_name": "PV - 03.mkv"
-    },
-    {
-      "entry_id": "0es6ix42bjy76xi",
-      "reason": "non_release_file",
-      "release_id": "7gpwd4iw0kf9ahu",
-      "source_name": "Extras/Gnosia - S01 NCED 01 (BD Remux 1080p AVC FLAC) [PMR].mkv"
-    },
-    {
-      "entry_id": "0es6ix42bjy76xi",
-      "reason": "non_release_file",
-      "release_id": "7gpwd4iw0kf9ahu",
-      "source_name": "Extras/Gnosia - S01 NCED 02 (BD Remux 1080p AVC FLAC) [PMR].mkv"
-    },
-    {
-      "entry_id": "0es6ix42bjy76xi",
-      "reason": "non_release_file",
-      "release_id": "7gpwd4iw0kf9ahu",
-      "source_name": "Extras/Gnosia - S01 NCED 03 (BD Remux 1080p AVC FLAC) [PMR].mkv"
-    },
-    {
-      "entry_id": "0es6ix42bjy76xi",
-      "reason": "non_release_file",
-      "release_id": "7gpwd4iw0kf9ahu",
-      "source_name": "Extras/Gnosia - S01 NCED 04 (BD Remux 1080p AVC FLAC) [PMR].mkv"
-    },
-    {
-      "entry_id": "0es6ix42bjy76xi",
-      "reason": "non_release_file",
-      "release_id": "7gpwd4iw0kf9ahu",
-      "source_name": "Extras/Gnosia - S01 NCED 05 (BD Remux 1080p AVC FLAC) [PMR].mkv"
-    },
-    {
-      "entry_id": "0es6ix42bjy76xi",
-      "reason": "non_release_file",
-      "release_id": "7gpwd4iw0kf9ahu",
-      "source_name": "Extras/Gnosia - S01 NCOP 01 (BD Remux 1080p AVC FLAC) [PMR].mkv"
     },
     {
       "entry_id": "0f8ktl7h0htazus",
@@ -138394,6 +138430,606 @@
       "reason": "source_missing_edge_group_for_tolerant_match",
       "release_id": "yg0ek4y7il6p3tn",
       "source_name": "Noukin 12.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 EP 01 - Power Up!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 EP 02 - Robot Ball.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 EP 03 - Atom In Space.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 04 - Lightning.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 05 - Save The Robot Farm!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 06 - The Birth Of Atlas.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 07 - Atom Vs. Atlas.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 08 - Robot Super Express.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 09 - Franken.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 10 - Attack Of The Venusian Robots!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 11 - The Robot Circus Is Here!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 12 - Ressurected Jumbo.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 13 - The Birth Of Uran.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 14 - Micro Voyage.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 15 - Protect The Ai!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 16 - Dark Robot Hunters.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 17 - World's Strongest Robot.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 18 - Pluto Never Dies.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 19 - Robot Boy.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 20 - Eternal Boy.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 21 - The Lake Monster.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 22 - Goodbye Princess.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 23 - The Lost Memory.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 24 - Little Bear.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 25 - If I Could Shed Tears.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 26 - Enter Blue Knight.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 27 - Mustachio, The Great Detective.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 28 - Space Plant Crisis.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 29 - Uran And The Great Detective.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 30 - Underground Expedition.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 31 - Goonon's Great Adventure.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 32 - The Secret Of Blue Knight.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 33 - Fairy Tale.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 34 - Spaceshifter Moopie.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 35 - Atom Vs. Rock.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 36 - Robot In Love.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 37 - Atlas Strikes Back.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 38 - Emily's Wish.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 39 - Time Hunters.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 40 - Robot Hatred.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 41 - Memories Of A Giant.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 42 - The Battle Of Steel Island.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 43 - The Robot Who Longed To Be Human.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 44 - To The Dragon Forest.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 45 - The Eve Of A Revolution.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 46 - The Founding Of Robotania.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 47 -  Showdown On Antarctica!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 48 - Journey To Tomorrow.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 49 - Atom Reborn.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "lb0w92tgpfctfqe",
+      "source_name": "Astro Boy 2003 Ep 50 - The Last Battle.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 EP 01 - Power Up!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 EP 02 - Robot Ball.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 EP 03 - Atom In Space.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 04 - Lightning.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 05 - Save The Robot Farm!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 06 - The Birth Of Atlas.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 07 - Atom Vs. Atlas.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 08 - Robot Super Express.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 09 - Franken.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 10 - Attack Of The Venusian Robots!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 11 - The Robot Circus Is Here!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 12 - Ressurected Jumbo.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 13 - The Birth Of Uran.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 14 - Micro Voyage.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 15 - Protect The Ai!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 16 - Dark Robot Hunters.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 17 - World's Strongest Robot.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 18 - Pluto Never Dies.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 19 - Robot Boy.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 20 - Eternal Boy.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 21 - The Lake Monster.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 22 - Goodbye Princess.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 23 - The Lost Memory.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 24 - Little Bear.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 25 - If I Could Shed Tears.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 26 - Enter Blue Knight.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 27 - Mustachio, The Great Detective.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 28 - Space Plant Crisis.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 29 - Uran And The Great Detective.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 30 - Underground Expedition.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 31 - Goonon's Great Adventure.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 32 - The Secret Of Blue Knight.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 33 - Fairy Tale.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 34 - Spaceshifter Moopie.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 35 - Atom Vs. Rock.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 36 - Robot In Love.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 37 - Atlas Strikes Back.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 38 - Emily's Wish.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 39 - Time Hunters.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 40 - Robot Hatred.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 41 - Memories Of A Giant.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 42 - The Battle Of Steel Island.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 43 - The Robot Who Longed To Be Human.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 44 - To The Dragon Forest.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 45 - The Eve Of A Revolution.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 46 - The Founding Of Robotania.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 47 -  Showdown On Antarctica!.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 48 - Journey To Tomorrow.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 49 - Atom Reborn.mkv"
+    },
+    {
+      "entry_id": "eozj2qjx5pc59te",
+      "reason": "source_missing_edge_group_for_tolerant_match",
+      "release_id": "p3hqs44bwa6y0p5",
+      "source_name": "Astro Boy 2003 Ep 50 - The Last Battle.mkv"
     },
     {
       "entry_id": "epd0mutbqlll2p5",
@@ -726249,41 +726885,61 @@
   "changes": {
     "entries": {
       "added": [
-        "fnsbrs56ny5bszo"
+        "09b1rf8onzj59wk",
+        "eozj2qjx5pc59te"
       ],
       "removed": []
     },
     "releases": {
       "added": [
-        "ptbuzx3ak8t29c2"
+        "1llwe2k68ds4mib",
+        "285epm248vsipg7",
+        "9afi7zgrn3fi91g",
+        "ekggc7si1ps17m6",
+        "fpvpjlpt7x7pm84",
+        "lb0w92tgpfctfqe",
+        "ndqhjfv6dup505t",
+        "p3hqs44bwa6y0p5",
+        "qxok8ew5zdrcunp",
+        "upr7a87s2vf5eir",
+        "vel71aryzlv44sl",
+        "w9pbcq617enpxbl",
+        "x8t2ejixqfnnipi",
+        "yklocodq5o2x27u"
       ],
-      "removed": []
+      "removed": [
+        "5zu2mdl82mhbeo0",
+        "7gpwd4iw0kf9ahu",
+        "7jxviee7meibqej",
+        "vbzlu1iauppyuxt",
+        "xo85amupo6yggjr"
+      ]
     }
   },
   "matching": {
     "encoding": {
       "direct_buckets": {
         "bucket_count": 350,
-        "key_count": 20682,
-        "max_keys": 227,
-        "mean_keys": 59.09142857142857
+        "key_count": 20816,
+        "max_keys": 230,
+        "mean_keys": 59.47428571428571
       },
-      "direct_entries": 20682,
+      "direct_entries": 20816,
       "route_buckets": 259,
-      "source_bytes": 2956596,
-      "source_lines": 44346,
+      "source_bytes": 2964479,
+      "source_lines": 44613,
       "template_buckets": {
         "bucket_count": 259,
-        "key_count": 6526,
+        "key_count": 6524,
         "max_keys": 126,
-        "mean_keys": 25.1969111969112
+        "mean_keys": 25.18918918918919
       },
-      "template_groups": 6526,
-      "tuple_chunks": 6722
+      "template_groups": 6524,
+      "tuple_chunks": 6720
     },
     "provenance": {
-      "strict_keys": 56183,
-      "tolerant_keys": 45670
+      "strict_keys": 56266,
+      "tolerant_keys": 45703
     },
     "stale_overrides": []
   }

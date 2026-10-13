@@ -33,11 +33,10 @@ env:
   SCRYER_OFFICIAL_PLUGIN_RELEASE_TAG_PREFIX: plugins-stage
   SCRYER_CATALOG_V3_RELEASE_TAG: catalog/v3-stage
   SCRYER_CATALOG_V3_PATH_PREFIX: catalog/v3-stage
-  # Stage generations publish to their own releases so they never collide
-  # with production catalog/v3-g<version> releases. The stage catalog has no
-  # merge base, so every rehearsal is generation 1; the run id keeps each
-  # rehearsal on a release of its own instead of piling onto one.
-  SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX: catalog/v3-stage-r${{ github.run_id }}-g
+  # A manual rehearsal must name an existing signed release tag: the publisher
+  # refuses a branch or commit SHA here because a generation release can only
+  # hang off a verified annotated tag.
+  SCRYER_CATALOG_V3_GENERATION_RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_ref || github.ref_name }}
 
 jobs:
   plan-release:
@@ -177,7 +176,7 @@ jobs:
           name: release-plugin-v3-stage-xtask-${{ github.run_id }}
           path: xtask/target/xtask-release/xtask
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90  # a rerun that restores the saved signed preparation needs these too
 
       - name: Upload release plan
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -186,7 +185,7 @@ jobs:
           path: |
             release-plan.tsv
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90  # a rerun that restores the saved signed preparation needs these too
 
       - name: Upload validate stats
         if: always()
@@ -569,6 +568,8 @@ jobs:
   publish-central-catalog:
     needs: [plan-release, build-sign-release-plugin, publish-release-provenance]
     runs-on: ubuntu-latest
+    # See release-plugin-v3.yml: a third queued run is cancelled by GitHub
+    # and is simply rerun once the others finish.
     concurrency:
       group: central-catalog-v3-stage
       cancel-in-progress: false
@@ -615,7 +616,16 @@ jobs:
           name: release-plugin-v3-stage-plan-${{ github.run_id }}
           path: release-plan-artifact
 
+      # Before any input is fetched: a rerun that finds the signed preparation
+      # republishes exactly those bytes and needs none of the inputs.
+      - name: Restore signed catalog preparation
+        id: catalog-preparation
+        run: |
+          set -euo pipefail
+          bash .github/scripts/catalog-v3-preparation.sh restore dist/catalog-v3-stage
+
       - name: Download prepared plugin artifacts
+        if: steps.catalog-preparation.outputs.restored != 'true'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-plugin-v3-stage-prepared-${{ github.run_id }}-*
@@ -638,13 +648,15 @@ jobs:
           fi
 
       - name: Verify prepared plugin artifacts
+        if: steps.catalog-preparation.outputs.restored != 'true'
         run: |
           set -euo pipefail
           while IFS=$'\t' read -r plugin_id _; do
             ./xtask/target/xtask-release/xtask official verify-prepared "prepared-plugins/${plugin_id}"
           done < release-plan.tsv
 
-      - name: Prepare sign and publish central catalog v3 stage
+      - name: Prepare and sign central catalog
+        if: steps.catalog-preparation.outputs.restored != 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -687,17 +699,18 @@ jobs:
             rm -f "dist/catalog-v3-stage/${asset_name}.bundle"
           done < "${signing_list}"
 
-          gh release view "${SCRYER_CATALOG_V3_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
-            gh release create "${SCRYER_CATALOG_V3_RELEASE_TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "Scryer plugin central catalog v3 stage" \
-              --target "$(git rev-parse HEAD)" \
-              --notes "Scryer plugin central catalog v3 staging assets."
 
-          # Same publication order as production: hashed assets to R2 and to
-          # this generation's own release (catalog/v3-stage-r<run id>-g<version>), both
-          # verified, before the modern redirect advances on R2 and then on
-          # catalog/v3-stage. The stage catalog is rebuilt without a merge
-          # base, so there is no expected merge base to compare against.
+      - name: Save signed catalog preparation before publication
+        if: steps.catalog-preparation.outputs.restored != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-catalog-preparation-${{ github.run_id }}
+          path: dist/catalog-v3-stage
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish saved catalog preparation
+        run: |
+          set -euo pipefail
           ./xtask/target/xtask-release/xtask catalog publish-v3-generation \
             --dist dist/catalog-v3-stage

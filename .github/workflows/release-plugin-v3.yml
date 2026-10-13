@@ -45,7 +45,8 @@ env:
   SCRYER_OFFICIAL_PLUGIN_RELEASE_TAG_PREFIX: plugins-v3
   SCRYER_CATALOG_V3_RELEASE_TAG: catalog/v3
   SCRYER_CATALOG_V3_PATH_PREFIX: catalog/v3
-  SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX: catalog/v3-g
+  # Reuse the operator-signed publication trigger; never create tags via the release API.
+  SCRYER_CATALOG_V3_GENERATION_RELEASE_TAG: ${{ github.ref_name }}
 
 jobs:
   plan-release:
@@ -237,7 +238,7 @@ jobs:
           name: release-plugin-v3-xtask-${{ github.run_id }}
           path: xtask/target/xtask-release/xtask
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90  # a rerun that restores the saved signed preparation needs these too
 
       - name: Upload release plan
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -247,7 +248,7 @@ jobs:
             release-plugin-plan.tsv
             release-rule-pack-plan.tsv
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90  # a rerun that restores the saved signed preparation needs these too
 
       - name: Upload validate stats
         if: always()
@@ -687,6 +688,10 @@ jobs:
     if: ${{ always() && !cancelled() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/plugins-v3/release/') && needs.plan-release.result == 'success' && (needs.build-sign-release-plugin.result == 'success' || needs.build-sign-release-plugin.result == 'skipped') && (needs.validate-release-rule-pack.result == 'success' || needs.validate-release-rule-pack.result == 'skipped') && (needs.publish-release-provenance.result == 'success' || needs.publish-release-provenance.result == 'skipped') }}
     needs: [plan-release, build-sign-release-plugin, validate-release-rule-pack, publish-release-provenance]
     runs-on: ubuntu-latest
+    # One publish at a time. GitHub keeps at most one pending run per group:
+    # a third run queued while two are waiting is cancelled, not queued.
+    # A cancelled run published nothing and saved no preparation, so
+    # rerunning it after the others finish prepares afresh on the new base.
     concurrency:
       group: central-catalog-v3
       cancel-in-progress: false
@@ -754,8 +759,17 @@ jobs:
           name: release-plugin-v3-plan-${{ github.run_id }}
           path: release-plan-artifact
 
+      # Before any input is fetched: a rerun that finds the signed preparation
+      # of an earlier attempt republishes exactly those bytes and needs none
+      # of the inputs the preparation was built from.
+      - name: Restore signed catalog preparation
+        id: catalog-preparation
+        run: |
+          set -euo pipefail
+          bash .github/scripts/catalog-v3-preparation.sh restore dist/catalog-v3
+
       - name: Download prepared plugin artifacts
-        if: ${{ needs.plan-release.outputs.has_plugins == 'true' && needs.plan-release.outputs.catalog_only != 'true' }}
+        if: ${{ needs.plan-release.outputs.has_plugins == 'true' && needs.plan-release.outputs.catalog_only != 'true' && steps.catalog-preparation.outputs.restored != 'true' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: release-plugin-v3-prepared-${{ github.run_id }}-*
@@ -779,7 +793,7 @@ jobs:
           fi
 
       - name: Restore catalog-only plugin snippets
-        if: ${{ needs.plan-release.outputs.catalog_only == 'true' }}
+        if: ${{ needs.plan-release.outputs.catalog_only == 'true' && steps.catalog-preparation.outputs.restored != 'true' }}
         run: |
           set -euo pipefail
           source .github/scripts/release-plugin-v3-identity.sh
@@ -802,7 +816,7 @@ jobs:
           done < release-plugin-plan.tsv
 
       - name: Verify prepared plugin artifacts
-        if: ${{ needs.plan-release.outputs.has_plugins == 'true' && needs.plan-release.outputs.catalog_only != 'true' }}
+        if: ${{ needs.plan-release.outputs.has_plugins == 'true' && needs.plan-release.outputs.catalog_only != 'true' && steps.catalog-preparation.outputs.restored != 'true' }}
         run: |
           set -euo pipefail
           readonly parallelism=4
@@ -845,7 +859,7 @@ jobs:
           (( ! failed ))
 
       - name: Verify selected plugin signing identities
-        if: ${{ needs.plan-release.outputs.has_plugins == 'true' && needs.plan-release.outputs.catalog_only != 'true' }}
+        if: ${{ needs.plan-release.outputs.has_plugins == 'true' && needs.plan-release.outputs.catalog_only != 'true' && steps.catalog-preparation.outputs.restored != 'true' }}
         run: |
           set -euo pipefail
           source .github/scripts/release-plugin-v3-identity.sh
@@ -873,7 +887,8 @@ jobs:
             fi
           done < <(cut -f1 release-plugin-plan.tsv | sort -u)
 
-      - name: Prepare sign and publish central catalog v3
+      - name: Prepare and sign central catalog
+        if: steps.catalog-preparation.outputs.restored != 'true'
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -975,20 +990,31 @@ jobs:
             test -s "dist/catalog-v3/${asset_name}.sigstore.json"
           done < "${signing_list}"
 
-          gh release view "${SCRYER_CATALOG_V3_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
-            gh release create "${SCRYER_CATALOG_V3_RELEASE_TAG}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --title "Scryer plugin central catalog v3" \
-              --target "$(git rev-parse HEAD)" \
-              --notes "Scryer plugin central catalog v3 assets."
+          printf '%s\n' "${merge_base_asset}" > dist/catalog-v3/expected-merge-base
 
-          # Hashed assets go to R2 and to this generation's own release first,
-          # and both copies are verified. Only then does the modern redirect
-          # advance: on R2 first, then the three redirect files on catalog/v3.
-          # A redirect therefore never names an asset that is not mirrored.
+      - name: Save signed catalog preparation before publication
+        if: steps.catalog-preparation.outputs.restored != 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: signed-catalog-preparation-${{ github.run_id }}
+          path: dist/catalog-v3
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish saved catalog preparation
+        run: |
+          set -euo pipefail
+          # The merge base travels with the preparation so a rerun compares
+          # against the base this preparation was really built on.
+          if ! test -s dist/catalog-v3/expected-merge-base; then
+            echo "dist/catalog-v3/expected-merge-base is missing or empty; refusing to publish" >&2
+            exit 1
+          fi
+          read -r expected_merge_base < dist/catalog-v3/expected-merge-base
+          test -n "${expected_merge_base}"
           ./xtask/target/xtask-release/xtask catalog publish-v3-generation \
             --dist dist/catalog-v3 \
-            --expected-merge-base "${merge_base_asset}"
+            --expected-merge-base "${expected_merge_base}"
 
   diagnose-central-catalog-repair:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.catalog_repair_specs != '' }}

@@ -60,6 +60,10 @@ pub struct NewRelease {
 pub trait ReleaseStore {
     /// Asset names on the release, or `None` when the release does not exist.
     fn asset_names(&self, tag: &str) -> Result<Option<Vec<String>>>;
+    /// Require `tag` to be an existing annotated tag whose signature GitHub
+    /// verifies and which points directly at `target`. A release is only ever
+    /// created on such a tag; the release API never creates one.
+    fn validate_tag(&self, tag: &str, target: &str) -> Result<()>;
     fn create_release(&self, release: &NewRelease) -> Result<()>;
     fn download_asset(&self, tag: &str, name: &str) -> Result<Vec<u8>>;
     fn upload_assets(&self, tag: &str, files: &[PathBuf], clobber: bool) -> Result<()>;
@@ -73,6 +77,11 @@ pub struct HashedAsset {
     pub name: String,
     pub local: PathBuf,
     pub r2_url: String,
+    /// For a signature companion (`.bundle.zst`, `.sigstore.json`): the name
+    /// of the data asset it signs. Signing is not deterministic, so a
+    /// companion already published beside byte-identical data is adopted
+    /// instead of being treated as a conflict.
+    pub signature_of: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +123,9 @@ pub struct PublishReport {
     pub github_skipped: Vec<String>,
     pub generation_release_created: bool,
     pub r2_redirect_moved: bool,
+    /// Signature companions whose already-published bytes replaced the
+    /// freshly signed local copy, as `<name> from <store>`.
+    pub adopted_signatures: Vec<String>,
 }
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
@@ -166,7 +178,11 @@ pub fn plan_generation(ctx: &TaskContext, dist: &Path) -> Result<GenerationPlan>
 
     let mut assets = Vec::new();
     let mut names = BTreeSet::new();
-    let mut push = |name: String, r2_url: String, mirrors: Option<&[String]>| -> Result<()> {
+    let mut push = |name: String,
+                    r2_url: String,
+                    mirrors: Option<&[String]>,
+                    signature_of: Option<&str>|
+     -> Result<()> {
         validate_asset_name(&name)?;
         if let Some(mirrors) = mirrors {
             let expected = mirror_for(&name);
@@ -186,6 +202,7 @@ pub fn plan_generation(ctx: &TaskContext, dist: &Path) -> Result<GenerationPlan>
             name,
             local,
             r2_url,
+            signature_of: signature_of.map(str::to_string),
         });
         Ok(())
     };
@@ -222,15 +239,21 @@ pub fn plan_generation(ctx: &TaskContext, dist: &Path) -> Result<GenerationPlan>
         .collect::<Vec<_>>();
     for (url, mirrors, signature_url, signature_mirrors) in locations {
         let name = url_file_name(url)?;
-        push(name.clone(), url.to_string(), Some(mirrors))?;
+        push(name.clone(), url.to_string(), Some(mirrors), None)?;
         push(
             url_file_name(signature_url)?,
             signature_url.to_string(),
             Some(signature_mirrors),
+            Some(&name),
         )?;
         // The raw sigstore bundle has no catalog URL; it sits beside the asset.
         let sigstore = format!("{name}.sigstore.json");
-        push(sigstore.clone(), format!("{url}.sigstore.json"), None)?;
+        push(
+            sigstore.clone(),
+            format!("{url}.sigstore.json"),
+            None,
+            Some(&name),
+        )?;
     }
 
     let base = format!(
@@ -306,6 +329,67 @@ fn last_artifact_name(bytes: &[u8]) -> Result<String> {
     url_file_name(&last.url)
 }
 
+/// Compare every asset with one store. Returns the indexes of assets absent
+/// there. A signature companion whose data asset is byte-identical on the
+/// store adopts the published signature bytes (first store wins; a later
+/// store disagreeing with adopted bytes is a conflict).
+fn preflight_store(
+    destination: &str,
+    plan: &GenerationPlan,
+    digests: &mut [String],
+    adopted: &mut BTreeSet<String>,
+    conflicts: &mut Vec<String>,
+    report: &mut PublishReport,
+    fetch: impl Fn(&HashedAsset) -> Result<Option<Vec<u8>>>,
+) -> Result<Vec<usize>> {
+    let mut missing = Vec::new();
+    let mut identical_data = BTreeSet::new();
+    // Data assets first, so companions know whether their data matched.
+    let order = plan
+        .assets
+        .iter()
+        .enumerate()
+        .filter(|(_, asset)| asset.signature_of.is_none())
+        .chain(
+            plan.assets
+                .iter()
+                .enumerate()
+                .filter(|(_, asset)| asset.signature_of.is_some()),
+        );
+    for (index, asset) in order {
+        let remote = fetch(asset)?;
+        let adoptable = asset
+            .signature_of
+            .as_ref()
+            .is_some_and(|data| identical_data.contains(data) && !adopted.contains(&asset.name));
+        if let (Some(bytes), true) = (&remote, adoptable) {
+            if sha256_hex(bytes) != digests[index] {
+                fs::write(&asset.local, bytes)
+                    .with_context(|| format!("failed to adopt {}", asset.local.display()))?;
+                digests[index] = sha256_hex(bytes);
+                warn(format!(
+                    "{} already signed on {destination}; adopting the published signature",
+                    asset.name
+                ));
+                report
+                    .adopted_signatures
+                    .push(format!("{} from {destination}", asset.name));
+            }
+            adopted.insert(asset.name.clone());
+        }
+        match classify(destination, asset, &digests[index], remote, conflicts) {
+            RemoteState::Absent => missing.push(index),
+            RemoteState::Identical => {
+                if asset.signature_of.is_none() {
+                    identical_data.insert(asset.name.clone());
+                }
+            }
+            RemoteState::Conflict => {}
+        }
+    }
+    Ok(missing)
+}
+
 pub fn publish_generation(
     plan: &GenerationPlan,
     r2: &dyn R2Store,
@@ -313,7 +397,7 @@ pub fn publish_generation(
     options: &PublishOptions,
 ) -> Result<PublishReport> {
     let mut report = PublishReport::default();
-    let digests = plan
+    let mut digests = plan
         .assets
         .iter()
         .map(|asset| Ok(sha256_hex(&read_local(&asset.local)?)))
@@ -326,34 +410,52 @@ pub fn publish_generation(
         plan.generation,
         plan.assets.len()
     ));
-    let mut conflicts = Vec::new();
-    let mut r2_missing = Vec::new();
-    for (asset, digest) in plan.assets.iter().zip(&digests) {
-        let remote = r2.get(&asset.r2_url)?;
-        match classify("R2", asset, digest, remote, &mut conflicts) {
-            RemoteState::Absent => r2_missing.push(asset),
-            RemoteState::Identical | RemoteState::Conflict => {}
-        }
+    if releases.asset_names(&plan.redirect_tag)?.is_none() {
+        bail!(
+            "redirect release {} does not exist; the publisher only replaces its redirect files \
+             and never creates it",
+            plan.redirect_tag
+        );
     }
     let generation_release = releases.asset_names(&plan.generation_tag)?;
+    if generation_release.is_none() {
+        // Fail on a bad tag before a single byte reaches either store.
+        releases.validate_tag(&plan.generation_tag, &options.target_commit)?;
+    }
     let published_names = generation_release
         .clone()
         .unwrap_or_default()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let mut github_missing = Vec::new();
-    for (asset, digest) in plan.assets.iter().zip(&digests) {
-        let remote = if published_names.contains(&asset.name) {
-            Some(releases.download_asset(&plan.generation_tag, &asset.name)?)
-        } else {
-            None
-        };
-        let destination = format!("GitHub release {}", plan.generation_tag);
-        match classify(&destination, asset, digest, remote, &mut conflicts) {
-            RemoteState::Absent => github_missing.push(asset),
-            RemoteState::Identical | RemoteState::Conflict => {}
-        }
-    }
+
+    let mut conflicts = Vec::new();
+    let mut adopted = BTreeSet::new();
+    let r2_missing = preflight_store(
+        "R2",
+        plan,
+        &mut digests,
+        &mut adopted,
+        &mut conflicts,
+        &mut report,
+        |asset| r2.get(&asset.r2_url),
+    )?;
+    let github_missing = preflight_store(
+        &format!("GitHub release {}", plan.generation_tag),
+        plan,
+        &mut digests,
+        &mut adopted,
+        &mut conflicts,
+        &mut report,
+        |asset| {
+            if published_names.contains(&asset.name) {
+                releases
+                    .download_asset(&plan.generation_tag, &asset.name)
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        },
+    )?;
     if !conflicts.is_empty() {
         bail!(
             "refusing to publish generation {}: published assets differ from the prepared ones \
@@ -362,6 +464,14 @@ pub fn publish_generation(
             conflicts.join("\n  ")
         );
     }
+    let r2_missing = r2_missing
+        .iter()
+        .map(|index| &plan.assets[*index])
+        .collect::<Vec<_>>();
+    let github_missing = github_missing
+        .iter()
+        .map(|index| &plan.assets[*index])
+        .collect::<Vec<_>>();
 
     step("Phase 1/5: hashed assets to R2");
     for asset in &plan.assets {
@@ -411,7 +521,9 @@ pub fn publish_generation(
             .iter()
             .map(|asset| asset.local.clone())
             .collect::<Vec<_>>();
-        releases.upload_assets(&plan.generation_tag, &files, false)?;
+        // Clobber: an asset GitHub lists but did not serve (a half-finished
+        // upload) is absent from the preflight and must be replaceable.
+        releases.upload_assets(&plan.generation_tag, &files, true)?;
         for asset in &github_missing {
             ok(format!("uploaded {}", asset.name));
             report.github_uploaded.push(asset.name.clone());
@@ -471,8 +583,9 @@ pub fn publish_generation(
             match &options.expected_merge_base {
                 Some(expected) if expected != &live_name && !resumed => bail!(
                     "the live modern redirect now serves {live_name}, not the merge base \
-                     {expected}: another publish landed in between. Re-prepare on top of \
-                     {live_name}; no redirect was moved"
+                     {expected}: another publish landed in between. No redirect was moved. \
+                     Rerunning this run would republish the same preparation; publish again \
+                     from a new signed release trigger tag so it merges onto {live_name}"
                 ),
                 Some(_) => {}
                 None => warn(format!(
@@ -500,16 +613,8 @@ pub fn publish_generation(
         "Phase 5/5: modern redirect to GitHub release {}",
         plan.redirect_tag
     ));
+    // The redirect release was required to exist in the preflight.
     let phase5 = || -> Result<()> {
-        if releases.asset_names(&plan.redirect_tag)?.is_none() {
-            releases.create_release(&NewRelease {
-                tag: plan.redirect_tag.clone(),
-                title: "Scryer plugin central catalog v3".to_string(),
-                notes: "Scryer plugin central catalog v3 redirect.".to_string(),
-                target: options.target_commit.clone(),
-                prerelease: false,
-            })?;
-        }
         releases.upload_assets(
             &plan.redirect_tag,
             &[
@@ -615,6 +720,18 @@ impl R2Store for AwsR2Store<'_> {
     }
 }
 
+pub fn validate_release_tag(tag: &serde_json::Value, target: &str) -> Result<()> {
+    if tag["verification"]["verified"].as_bool() != Some(true) {
+        bail!("release tag signature is not verified by GitHub");
+    }
+    if tag["object"]["type"].as_str() != Some("commit")
+        || tag["object"]["sha"].as_str() != Some(target)
+    {
+        bail!("release tag does not point directly at publication commit {target}");
+    }
+    Ok(())
+}
+
 /// GitHub releases through the `gh` CLI; public reads through `curl`.
 pub struct GhReleaseStore<'a> {
     pub ctx: &'a TaskContext,
@@ -627,7 +744,14 @@ impl ReleaseStore for GhReleaseStore<'_> {
             .ctx
             .command("gh")
             .args(["release", "view", tag, "--repo", &self.repo])
-            .args(["--json", "assets", "--jq", ".assets[].name"])
+            // Only assets GitHub actually serves; a half-finished upload is
+            // listed in another state and is treated as absent.
+            .args([
+                "--json",
+                "assets",
+                "--jq",
+                r#".assets[] | select(.state == "uploaded") | .name"#,
+            ])
             .output()
             .context("failed to run gh release view")?;
         if output.status.success() {
@@ -647,12 +771,35 @@ impl ReleaseStore for GhReleaseStore<'_> {
         bail!("failed to read GitHub release {tag}: {stderr}")
     }
 
+    fn validate_tag(&self, tag: &str, target: &str) -> Result<()> {
+        // Resolve an existing annotated tag, then require GitHub's verified
+        // signature and exact target commit. Never let the API create a tag.
+        let tag_object = run_capture(self.ctx.command_in("git", &self.ctx.repo_root).args([
+            "rev-parse",
+            "--verify",
+            &format!("refs/tags/{tag}^{{tag}}"),
+        ]))
+        .with_context(|| {
+            format!(
+                "release tag {tag} is not an annotated tag in this checkout; a generation \
+                 release needs the signed release trigger tag, not a branch or commit"
+            )
+        })?;
+        let json = run_capture(self.ctx.command("gh").args([
+            "api",
+            &format!("repos/{}/git/tags/{}", self.repo, tag_object.trim()),
+        ]))?;
+        validate_release_tag(&serde_json::from_str(&json)?, target)
+            .with_context(|| format!("release tag {tag} cannot carry a generation release"))
+    }
+
     fn create_release(&self, release: &NewRelease) -> Result<()> {
+        self.validate_tag(&release.tag, &release.target)?;
         let mut command = self.ctx.command("gh");
         command
             .args(["release", "create", &release.tag, "--repo", &self.repo])
             .args(["--title", &release.title, "--notes", &release.notes])
-            .args(["--target", &release.target]);
+            .args(["--target", &release.target, "--verify-tag"]);
         if release.prerelease {
             command.arg("--prerelease");
         }
@@ -733,6 +880,9 @@ pub mod fakes {
         pub uploads: RefCell<Vec<(String, Vec<String>, bool)>>,
         /// Uploads to this tag fail.
         pub fail_uploads_to: Option<String>,
+        /// Tags that fail validation (unsigned, or not at the target).
+        pub invalid_tags: Vec<String>,
+        pub validated_tags: RefCell<Vec<(String, String)>>,
     }
 
     impl ReleaseStore for FakeReleases {
@@ -744,7 +894,18 @@ pub mod fakes {
                 .map(|release| release.assets.keys().cloned().collect()))
         }
 
+        fn validate_tag(&self, tag: &str, target: &str) -> Result<()> {
+            self.validated_tags
+                .borrow_mut()
+                .push((tag.to_string(), target.to_string()));
+            if self.invalid_tags.iter().any(|invalid| invalid == tag) {
+                bail!("release tag {tag} is not verified at {target}");
+            }
+            Ok(())
+        }
+
         fn create_release(&self, release: &NewRelease) -> Result<()> {
+            self.validate_tag(&release.tag, &release.target)?;
             let mut releases = self.releases.borrow_mut();
             if releases.contains_key(&release.tag) {
                 bail!("release {} already exists", release.tag);

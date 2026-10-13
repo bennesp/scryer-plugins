@@ -63,8 +63,9 @@ catalog_v3_mirror_download() {
     "$@"
 }
 
-# Print "<catalog_version>\t<file name>\t<url>\t<mirror url>\t<signature url>\t<signature mirror url>"
-# for the last (newest) artifact of a redirect.
+# Print the last (newest) artifact of a redirect as
+# <catalog_version> <file name> <url> <mirror url> <signature url> <signature mirror url>
+# separated by the ASCII unit separator (0x1f), which no URL may contain.
 catalog_v3_redirect_head() {
   python3 -I -c '
 import json, sys
@@ -80,15 +81,15 @@ if not artifacts:
 head = artifacts[-1]
 url = head.get("url") or ""
 name = urlsplit(url).path.rsplit("/", 1)[-1]
-if not name or name in (".", "..") or any(c in name for c in "\\\t\r\n"):
+if not name or name in (".", "..") or any(c in name for c in "\\\t\r\n\x1f"):
     sys.exit("catalog-v3 redirect artifact url is not a file: " + repr(url))
 mirror = (head.get("mirror_urls") or [""])[0]
 signature = head.get("signature_url") or ""
 signature_mirror = (head.get("signature_mirror_urls") or [""])[0]
 for value in (url, mirror, signature, signature_mirror):
-    if any(c in value for c in "\t\r\n"):
+    if any(c in value for c in "\t\r\n\x1f"):
         sys.exit("catalog-v3 redirect contains a control character")
-print("\t".join([str(version), name, url, mirror, signature, signature_mirror]))
+print("\x1f".join([str(version), name, url, mirror, signature, signature_mirror]))
 ' "$1"
 }
 
@@ -153,7 +154,7 @@ resolve_catalog_v3_merge_base() {
   mkdir -p "${existing_dir}"
 
   catalog_v3_read_cdn_redirect "${existing_dir}" "${repository}"
-  IFS=$'\t' read -r cdn_version cdn_name cdn_url cdn_mirror cdn_signature cdn_signature_mirror \
+  IFS=$'\x1f' read -r cdn_version cdn_name cdn_url cdn_mirror cdn_signature cdn_signature_mirror \
     < <(catalog_v3_redirect_head "${existing_dir}/cdn/${CATALOG_V3_MODERN_REDIRECT}")
   [ -n "${cdn_name:-}" ]
   # shellcheck disable=SC2034 # consumed by the sourcing step
@@ -168,23 +169,39 @@ resolve_catalog_v3_merge_base() {
       "${SCRYER_CATALOG_MERGE_BASE_ASSET}" "${cdn_name}" "${cdn_version}"
     catalog_asset="${SCRYER_CATALOG_MERGE_BASE_ASSET}"
     case "${catalog_asset}" in
-      */*|.|..|*[[:space:]]*)
-        printf 'SCRYER_CATALOG_MERGE_BASE_ASSET must be a bare asset file name; got %s\n' "${catalog_asset}" >&2
+      */*|.|..|*[[:space:]]*|*[*?[]*)
+        printf 'SCRYER_CATALOG_MERGE_BASE_ASSET must be a bare asset file name without glob characters; got %s\n' "${catalog_asset}" >&2
         return 1
         ;;
     esac
-    local cdn_base
+    local cdn_base override_url override_signature
     cdn_base="$(catalog_v3_cdn_base)"
-    if ! catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
-      "${cdn_base}/${catalog_asset}" "${cdn_base}/${catalog_asset}.bundle.zst"; then
-      catalog_v3_retry catalog_v3_mirror_download "${existing_dir}" "${repository}" \
-        --pattern "${catalog_asset}" \
-        --pattern "${catalog_asset}.bundle.zst"
+    if [ "${catalog_asset}" = "${cdn_name}" ]; then
+      # The live signed redirect carries both the generation directory and
+      # the actual release tag, including release-trigger-backed generations.
+      catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+        "${cdn_url}" "${cdn_signature}" \
+        "${cdn_mirror}" "${cdn_signature_mirror}"
+    else
+      # Historical overrides keep their immutable generation path on R2.
+      # Older snapshots can additionally be recovered from catalog/v3.
+      if [[ "${catalog_asset}" =~ ^catalog-v3\.([0-9]+)\. ]]; then
+        override_url="${cdn_base}/${BASH_REMATCH[1]}/${catalog_asset}"
+      else
+        override_url="${cdn_base}/${catalog_asset}"
+      fi
+      override_signature="${override_url}.bundle.zst"
+      if ! catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
+        "${override_url}" "${override_signature}"; then
+        catalog_v3_retry catalog_v3_mirror_download "${existing_dir}" "${repository}" \
+          --pattern "${catalog_asset}" \
+          --pattern "${catalog_asset}.bundle.zst"
+      fi
     fi
   else
     local mirror_version mirror_name
     catalog_v3_read_mirror_redirect "${existing_dir}" "${repository}"
-    IFS=$'\t' read -r mirror_version mirror_name _ \
+    IFS=$'\x1f' read -r mirror_version mirror_name _ \
       < <(catalog_v3_redirect_head "${existing_dir}/mirror/${CATALOG_V3_MODERN_REDIRECT}")
     [ -n "${mirror_name:-}" ]
     if [ "${cdn_version}" != "${mirror_version}" ] || [ "${cdn_name}" != "${mirror_name}" ]; then
@@ -194,7 +211,7 @@ resolve_catalog_v3_merge_base() {
       elif (( cdn_version < mirror_version )); then
         direction="cdn behind mirror"
       fi
-      printf '::error::catalog v3 modern redirect: %s: cdn serves generation %s (%s), %s release serves generation %s (%s). Publish refuses to merge onto either. Bring the two back in line, or set SCRYER_CATALOG_MERGE_BASE_ASSET to the signed master catalog to merge onto.\n' \
+      printf '::error::catalog v3 modern redirect: %s: cdn serves generation %s (%s), %s release serves generation %s (%s). Publish refuses to merge onto either. If a publish failed in its last step (the GitHub redirect upload), rerun that run to finish it; otherwise bring the two back in line, or set SCRYER_CATALOG_MERGE_BASE_ASSET to the signed master catalog to merge onto.\n' \
         "${direction}" "${cdn_version}" "${cdn_name}" \
         "${SCRYER_CATALOG_V3_RELEASE_TAG:-catalog/v3}" "${mirror_version}" "${mirror_name}" >&2
       return 1

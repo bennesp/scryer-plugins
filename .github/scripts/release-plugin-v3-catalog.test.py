@@ -43,7 +43,7 @@ curl() {
       redirect_json "$version" "$name" > "$destination"
       ;;
     "$CDN/catalog-v3.modern.redirect.bundle.json") printf '{}' > "$destination" ;;
-    "$CDN/full.json.zst"|"$CDN/full.json.zst.bundle.zst"|"$CDN/repair.json.zst"|"$CDN/repair.json.zst.bundle.zst")
+    "$CDN/full.json.zst"|"$CDN/full.json.zst.bundle.zst"|"$CDN/7/catalog-v3.7.repair.min.json.zst"|"$CDN/7/catalog-v3.7.repair.min.json.zst.bundle.zst")
       [[ "$MODE" != catalog_cdn_down && "$MODE" != catalog_unavailable ]] || return 22
       printf 'catalog' > "$destination"
       ;;
@@ -167,12 +167,19 @@ class CatalogMergeBaseTests(unittest.TestCase):
         self.assert_refused(result, calls)
 
     def test_operator_override_merges_named_asset_and_keeps_cdn_compare_and_set(self):
-        result, calls = self.run_selection("override", override="repair.json.zst")
+        result, calls = self.run_selection("override", override="catalog-v3.7.repair.min.json.zst")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("ready repair.json.zst base full.json.zst", calls)
+        self.assertIn("ready catalog-v3.7.repair.min.json.zst base full.json.zst", calls)
         # The disagreeing mirror copy is not consulted under the override.
         self.assertNotIn("gh ", calls)
-        self.assertIn(f"curl {CDN}/repair.json.zst\n", calls)
+        self.assertIn(f"curl {CDN}/7/catalog-v3.7.repair.min.json.zst\n", calls)
+
+    def test_live_override_uses_the_signed_redirect_mirror_when_cdn_blob_is_down(self):
+        result, calls = self.run_selection("catalog_cdn_down", override="full.json.zst")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"curl {MIRROR}/full.json.zst\n", calls)
+        self.assertNotIn("gh ", calls)
+        self.assertIn("ready full.json.zst base full.json.zst", calls)
 
     def test_operator_override_rejects_paths(self):
         result, calls = self.run_selection("override", override="../escape.json.zst")

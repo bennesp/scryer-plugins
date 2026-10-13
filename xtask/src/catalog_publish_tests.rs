@@ -315,7 +315,17 @@ fn fresh_publish_uploads_everything_and_moves_both_redirects() {
     let uploads = releases.uploads.borrow();
     assert_eq!(uploads.len(), 2);
     assert_eq!(uploads[0].0, plan.generation_tag);
-    assert!(!uploads[0].2, "generation assets are never clobbered");
+    assert!(
+        uploads[0].2,
+        "generation uploads clobber: a listed-but-unserved asset is absent from the preflight \
+         and must be replaceable"
+    );
+    assert_eq!(
+        releases.validated_tags.borrow().first(),
+        Some(&(plan.generation_tag.clone(), TARGET.to_string())),
+        "the generation tag is validated in the preflight, before anything is written"
+    );
+    assert!(report.adopted_signatures.is_empty());
     assert_eq!(uploads[1].0, plan.redirect_tag);
     assert!(uploads[1].2, "the redirect replaces the previous one");
 }
@@ -524,4 +534,202 @@ fn publish_v3_generation_parses_its_arguments() {
         }
         _ => panic!("expected catalog publish-v3-generation"),
     }
+}
+
+#[test]
+fn release_creation_requires_a_verified_tag_at_the_publication_commit() {
+    let valid = serde_json::json!({
+        "verification": {"verified": true},
+        "object": {"type": "commit", "sha": TARGET}
+    });
+    crate::catalog_publish::validate_release_tag(&valid, TARGET).unwrap();
+    let mut unsigned = valid.clone();
+    unsigned["verification"]["verified"] = serde_json::json!(false);
+    assert!(crate::catalog_publish::validate_release_tag(&unsigned, TARGET).is_err());
+    assert!(crate::catalog_publish::validate_release_tag(&valid, "different-commit").is_err());
+    assert!(crate::catalog_publish::validate_release_tag(&serde_json::json!({}), TARGET).is_err());
+}
+
+#[test]
+fn an_invalid_generation_tag_fails_before_any_upload() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, mut releases) = live_stores(&plan);
+    releases.invalid_tags = vec![plan.generation_tag.clone()];
+
+    let error = publish_generation(&plan, &r2, &releases, &options())
+        .expect_err("an unverified trigger tag must stop the publish");
+    assert!(error.to_string().contains("not verified"), "{error:#}");
+    assert!(r2.puts.borrow().is_empty(), "nothing reaches R2");
+    assert!(releases.created.borrow().is_empty());
+    assert!(releases.uploads.borrow().is_empty());
+    assert_redirects_unmoved(&plan, &r2, &releases);
+}
+
+#[test]
+fn a_missing_redirect_release_is_refused_and_never_created() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, releases) = live_stores(&plan);
+    releases.releases.borrow_mut().remove(&plan.redirect_tag);
+
+    let error = publish_generation(&plan, &r2, &releases, &options())
+        .expect_err("the redirect release must already exist");
+    assert!(error.to_string().contains(&plan.redirect_tag), "{error:#}");
+    assert!(r2.puts.borrow().is_empty());
+    assert!(
+        releases.created.borrow().is_empty(),
+        "no release is created"
+    );
+    assert!(releases.uploads.borrow().is_empty());
+}
+
+#[test]
+fn a_published_signature_of_identical_data_is_adopted_not_rejected() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, releases) = live_stores(&plan);
+    let bundle = signature_bundle_file_name(MASTER);
+    let sigstore = format!("{MASTER}.sigstore.json");
+    // An earlier attempt published MASTER with a different (equally valid)
+    // signature to R2 and to GitHub, then died.
+    let master_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == MASTER)
+        .expect("master");
+    let bundle_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == bundle)
+        .expect("bundle");
+    r2.objects
+        .borrow_mut()
+        .insert(master_asset.r2_url.clone(), local(&plan, MASTER));
+    r2.objects
+        .borrow_mut()
+        .insert(bundle_asset.r2_url.clone(), b"earlier signature".to_vec());
+    releases.releases.borrow_mut().insert(
+        plan.generation_tag.clone(),
+        FakeRelease {
+            assets: BTreeMap::from([
+                (MASTER.to_string(), local(&plan, MASTER)),
+                (sigstore.clone(), b"earlier sigstore".to_vec()),
+            ]),
+        },
+    );
+
+    let report = publish_generation(&plan, &r2, &releases, &options()).expect("publish");
+
+    assert_eq!(
+        report.adopted_signatures,
+        vec![
+            format!("{bundle} from R2"),
+            format!("{sigstore} from GitHub release {}", plan.generation_tag),
+        ]
+    );
+    assert_eq!(
+        fs::read(&bundle_asset.local).expect("read"),
+        b"earlier signature"
+    );
+    assert!(
+        !report.r2_uploaded.contains(&bundle),
+        "the adopted bundle is not re-uploaded to R2"
+    );
+    assert!(
+        report.github_uploaded.contains(&bundle),
+        "GitHub gets the adopted bundle"
+    );
+    assert_eq!(
+        releases.releases.borrow()[&plan.generation_tag].assets[&bundle],
+        b"earlier signature".to_vec()
+    );
+    assert_eq!(
+        r2.objects.borrow()[&plan
+            .assets
+            .iter()
+            .find(|a| a.name == sigstore)
+            .expect("s")
+            .r2_url],
+        b"earlier sigstore".to_vec(),
+        "R2 gets the sigstore adopted from GitHub"
+    );
+    assert!(report.r2_redirect_moved);
+}
+
+#[test]
+fn signatures_adopted_from_r2_that_differ_on_github_are_a_conflict() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, releases) = live_stores(&plan);
+    let bundle = signature_bundle_file_name(MASTER);
+    let master_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == MASTER)
+        .expect("master");
+    let bundle_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == bundle)
+        .expect("bundle");
+    r2.objects
+        .borrow_mut()
+        .insert(master_asset.r2_url.clone(), local(&plan, MASTER));
+    r2.objects
+        .borrow_mut()
+        .insert(bundle_asset.r2_url.clone(), b"r2 signature".to_vec());
+    releases.releases.borrow_mut().insert(
+        plan.generation_tag.clone(),
+        FakeRelease {
+            assets: BTreeMap::from([
+                (MASTER.to_string(), local(&plan, MASTER)),
+                (bundle.clone(), b"github signature".to_vec()),
+            ]),
+        },
+    );
+
+    let error = publish_generation(&plan, &r2, &releases, &options())
+        .expect_err("two different published signatures for one asset is a conflict");
+    assert!(error.to_string().contains(&bundle), "{error:#}");
+    assert!(r2.puts.borrow().is_empty());
+    assert!(releases.uploads.borrow().is_empty());
+    assert_redirects_unmoved(&plan, &r2, &releases);
+}
+
+#[test]
+fn a_different_signature_beside_different_data_is_still_a_conflict() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, releases) = live_stores(&plan);
+    let bundle = signature_bundle_file_name(MASTER);
+    let master_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == MASTER)
+        .expect("master");
+    let bundle_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == bundle)
+        .expect("bundle");
+    r2.objects
+        .borrow_mut()
+        .insert(master_asset.r2_url.clone(), b"other data".to_vec());
+    r2.objects
+        .borrow_mut()
+        .insert(bundle_asset.r2_url.clone(), b"other signature".to_vec());
+
+    let error = publish_generation(&plan, &r2, &releases, &options())
+        .expect_err("a signature is adopted only beside identical data");
+    let message = error.to_string();
+    assert!(
+        message.contains(MASTER) && message.contains(&bundle),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read(&bundle_asset.local).expect("read"),
+        local(&plan, &bundle)
+    );
+    assert!(r2.puts.borrow().is_empty());
 }

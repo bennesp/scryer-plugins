@@ -81,6 +81,12 @@ const CENTRAL_CATALOG_V3_RELEASE_TAG_ENV: &str = "SCRYER_CATALOG_V3_RELEASE_TAG"
 /// name.
 const CENTRAL_CATALOG_V3_GENERATION_TAG_PREFIX_ENV: &str =
     "SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX";
+/// Names the generation release outright, overriding the prefix. The release
+/// workflows set it to their signed `plugins-v3/release/*` trigger tag, so the
+/// generation release sits on a tag an operator signed and GitHub verified
+/// instead of one the release API would create.
+const CENTRAL_CATALOG_V3_GENERATION_RELEASE_TAG_ENV: &str =
+    "SCRYER_CATALOG_V3_GENERATION_RELEASE_TAG";
 const DEFAULT_CENTRAL_CATALOG_V3_PATH_PREFIX: &str = "catalog/v3";
 const CENTRAL_CATALOG_V3_PATH_PREFIX_ENV: &str = "SCRYER_CATALOG_V3_PATH_PREFIX";
 const CATALOG_V2_BASE_SDK_VERSION: &str = "1.5.0";
@@ -482,10 +488,6 @@ enum CatalogCommand {
     /// generation's GitHub release, verify both, then move the modern redirect
     /// on R2 and on the stable redirect release.
     PublishV3Generation(CatalogPublishV3GenerationArgs),
-    /// R2-only upload of a prepared catalog (no GitHub, no idempotency
-    /// checks). Superseded by publish-v3-generation.
-    #[command(hide = true)]
-    UploadV3R2(CatalogUploadV3R2Args),
     #[command(hide = true)]
     ValidateV2,
 }
@@ -549,11 +551,6 @@ struct CatalogPrepareV3Args {
     allow_release_removals: Vec<String>,
     #[arg(long, hide = true)]
     allow_selected_rebuild: bool,
-}
-
-#[derive(Args)]
-struct CatalogUploadV3R2Args {
-    dir: PathBuf,
 }
 
 #[derive(Args)]
@@ -1348,7 +1345,6 @@ fn main() -> Result<()> {
             CatalogCommand::PublishV3Generation(args) => {
                 run_catalog_publish_v3_generation(&ctx, args)
             }
-            CatalogCommand::UploadV3R2(args) => run_catalog_upload_v3_r2(&ctx, &args.dir),
             CatalogCommand::ValidateV2 => run_catalog_validate_v2(&ctx),
         },
         Commands::Community(args) => match args.command {
@@ -4522,10 +4518,15 @@ fn central_catalog_v3_generation_tag_prefix() -> String {
 
 /// The GitHub release that mirrors the hashed assets of `catalog_version`.
 fn central_catalog_v3_generation_tag(catalog_version: u64) -> String {
-    format!(
-        "{}{catalog_version}",
-        central_catalog_v3_generation_tag_prefix()
+    env_override_or_default(
+        CENTRAL_CATALOG_V3_GENERATION_RELEASE_TAG_ENV,
+        &format!(
+            "{}{catalog_version}",
+            central_catalog_v3_generation_tag_prefix()
+        ),
     )
+    .trim_start_matches("refs/tags/")
+    .to_string()
 }
 
 fn central_catalog_v3_path_prefix() -> String {
@@ -6923,21 +6924,6 @@ fn upload_catalog_v3_artifact_urls_from_dir(
     Ok(true)
 }
 
-fn upload_catalog_v3_artifact_from_dir(
-    ctx: &TaskContext,
-    config: &R2Config,
-    dir: &Path,
-    artifact: &CatalogV3Artifact,
-) -> Result<bool> {
-    upload_catalog_v3_artifact_urls_from_dir(
-        ctx,
-        config,
-        dir,
-        &artifact.url,
-        &artifact.signature_url,
-    )
-}
-
 fn upload_catalog_v3_plugin_artifact_from_dir(
     ctx: &TaskContext,
     config: &R2Config,
@@ -6965,33 +6951,6 @@ fn release_artifacts_are_present(dir: &Path, release: &CatalogV3Release) -> Resu
         }
     }
     Ok(true)
-}
-
-fn upload_redirected_catalog_from_dir(
-    ctx: &TaskContext,
-    config: &R2Config,
-    dir: &Path,
-    artifact: &CatalogV3RedirectArtifact,
-) -> Result<()> {
-    let catalog_name = url_file_name(&artifact.url)?;
-    let catalog_path = dir.join(&catalog_name);
-    if !catalog_path.is_file() {
-        bail!(
-            "missing redirected catalog artifact {}",
-            catalog_path.display()
-        );
-    }
-    upload_file_to_r2(ctx, config, &catalog_path, &artifact.url)?;
-    let signature_name = url_file_name(&artifact.signature_url)?;
-    let signature_path = dir.join(&signature_name);
-    if !signature_path.is_file() {
-        bail!(
-            "missing redirected catalog signature bundle {}",
-            signature_path.display()
-        );
-    }
-    upload_file_to_r2(ctx, config, &signature_path, &artifact.signature_url)?;
-    Ok(())
 }
 
 fn run_official_upload_r2(ctx: &TaskContext, dir: &Path) -> Result<()> {
@@ -7076,66 +7035,6 @@ fn prepared_rule_pack_artifacts_for_upload(
         }
     }
     Ok(artifacts)
-}
-
-fn run_catalog_upload_v3_r2(ctx: &TaskContext, dir: &Path) -> Result<()> {
-    step(format!(
-        "Uploading catalog-v3 assets to R2 from {}",
-        dir.display()
-    ));
-    let config = r2_config_from_env()?;
-    let catalog = read_catalog_v3_from_path(ctx, &dir.join(CATALOG_V3_SNIPPET_JSON))?;
-    let prepared_artifacts = prepared_rule_pack_artifacts_for_upload(dir, &catalog)?;
-
-    // Upload locally materialized rule-pack blobs before making a catalog or
-    // redirect that can point clients at them visible. Historical releases are
-    // intentionally absent from a targeted staging directory and remain on
-    // their existing remote URLs.
-    let mut uploaded_rule_pack_artifacts = 0usize;
-    for artifact in &prepared_artifacts {
-        if !upload_catalog_v3_artifact_from_dir(ctx, &config, dir, artifact)? {
-            bail!("prepared rule-pack artifact disappeared: {}", artifact.url);
-        }
-        uploaded_rule_pack_artifacts += 1;
-    }
-
-    for redirect_name in [CATALOG_V3_MODERN_REDIRECT_JSON] {
-        let redirect_path = dir.join(redirect_name);
-        let redirect: CatalogV3Redirect = serde_json::from_slice(&fs::read(&redirect_path)?)
-            .with_context(|| format!("failed to parse {}", redirect_path.display()))?;
-
-        for artifact in &redirect.artifacts {
-            upload_redirected_catalog_from_dir(ctx, &config, dir, artifact)?;
-        }
-
-        let redirect_url = format!(
-            "{}/{}/{}",
-            public_catalog_base_url(),
-            central_catalog_v3_path_prefix(),
-            redirect_name
-        );
-        upload_file_to_r2(ctx, &config, &redirect_path, &redirect_url)?;
-        let redirect_bundle_name = redirect_signature_bundle_file_name(redirect_name);
-        let redirect_bundle_path = dir.join(&redirect_bundle_name);
-        if !redirect_bundle_path.is_file() {
-            bail!(
-                "missing redirect signature bundle {}",
-                redirect_bundle_path.display()
-            );
-        }
-        let redirect_bundle_url = format!(
-            "{}/{}/{}",
-            public_catalog_base_url(),
-            central_catalog_v3_path_prefix(),
-            redirect_bundle_name
-        );
-        upload_file_to_r2(ctx, &config, &redirect_bundle_path, &redirect_bundle_url)?;
-    }
-
-    ok(format!(
-        "uploaded catalog redirects and {uploaded_rule_pack_artifacts} rule-pack artifact(s) to R2"
-    ));
-    Ok(())
 }
 
 fn run_catalog_publish_v3_generation(

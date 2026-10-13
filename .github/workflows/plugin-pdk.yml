@@ -1,6 +1,11 @@
 name: plugin-pdk
 
 on:
+  pull_request:
+    paths:
+      - "pdk/scryer-plugin-pdk/**"
+      - ".github/workflows/plugin-pdk.yml"
+      - "rust-toolchain.toml"
   push:
     tags:
       - "scryer-plugin-pdk/v*"
@@ -24,14 +29,16 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: "1.98.0"
+          toolchain: "1.97.1"
           components: rustfmt, clippy
+          targets: wasm32-wasip2
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: true
 
       - name: Verify PDK tag and metadata
+        if: github.event_name == 'push'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -69,7 +76,7 @@ jobs:
         run: cargo fmt --manifest-path pdk/scryer-plugin-pdk/Cargo.toml -- --check
 
       - name: Test PDK
-        run: cargo test --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml
+        run: cargo test --no-fail-fast --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml
 
       - name: Lint PDK
         run: cargo clippy --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml --all-targets -- -D warnings
@@ -79,10 +86,14 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml --no-deps
 
+      - name: Check PDK component consumer
+        run: cargo check --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml --example component_smoke --target wasm32-wasip2
+
       - name: Package PDK
         run: cargo package --locked --manifest-path pdk/scryer-plugin-pdk/Cargo.toml
 
   publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/scryer-plugin-pdk/v')
     name: publish
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -98,7 +109,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
-          toolchain: "1.98.0"
+          toolchain: "1.97.1"
 
       - name: Authenticate to crates.io through Trusted Publishing
         id: crates-io-auth

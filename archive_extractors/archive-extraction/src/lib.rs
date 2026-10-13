@@ -195,7 +195,7 @@ fn build_descriptor() -> PluginDescriptor {
             default_base_url: None,
             allowed_hosts: vec![],
             capabilities: ArchiveExtractorCapabilities {
-                enforced_limits: false,
+                enforced_limits: true,
                 formats: vec![
                     ArchivePluginFormat::Rar,
                     ArchivePluginFormat::Zip,
@@ -253,8 +253,11 @@ fn extract_archive(
             extract_prepared_archive(archive_path, output_root, format, password)
         }
         par2::Par2Plan::Prepared(inputs) => {
-            let response =
+            let mut response =
                 extract_prepared_archive(&inputs.archive_path, output_root, format, password);
+            if response.status == ArchivePluginStatus::Ok {
+                response.processed_recovery_paths = inputs.processed_recovery_paths.clone();
+            }
             // The staged copy duplicates inputs the host still owns; drop it
             // whether or not extraction succeeded.
             inputs.cleanup();

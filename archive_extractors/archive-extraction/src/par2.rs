@@ -104,6 +104,7 @@ pub(crate) enum Par2Plan {
 /// was materialized without anything else having to be told about it.
 pub(crate) struct Par2Inputs {
     pub(crate) archive_path: PathBuf,
+    pub(crate) processed_recovery_paths: Vec<String>,
     /// Removed by [`Par2Inputs::cleanup`] once extraction has finished with it.
     staging_dir: Option<PathBuf>,
 }
@@ -192,10 +193,49 @@ pub(crate) fn prepare_for_extraction(
         Err(response) => return Par2Plan::Complete(response),
     };
 
-    match target {
+    let mut plan = match target {
         Target::PlainFiles => emit_plain_files(&set, &placement, output_dir),
         Target::Archive(canonical) => prepare_archive(&set, &placement, &canonical, source_dir),
+    };
+    match &mut plan {
+        Par2Plan::Prepared(inputs) => {
+            inputs.processed_recovery_paths = source_relative_paths(source_dir, &recovery_files);
+        }
+        Par2Plan::Complete(response) if response.status == ArchivePluginStatus::Ok => {
+            // Only plain-file emission completes successfully here. Report the
+            // actual inputs superseded by emitted media, never canonical guesses
+            // or unrelated siblings. Missing inputs have no source to replace.
+            let emitted = response
+                .files
+                .iter()
+                .map(|file| file.relative_path.as_str())
+                .collect::<HashSet<_>>();
+            let replaced = placement
+                .actual_by_canonical
+                .iter()
+                .filter(|(canonical, _)| emitted.contains(canonical.replace('\\', "/").as_str()))
+                .map(|(_, actual)| actual.clone())
+                .collect::<Vec<_>>();
+            response.replaced_source_paths = source_relative_paths(source_dir, &replaced);
+            response.processed_recovery_paths = source_relative_paths(source_dir, &recovery_files);
+        }
+        _ => {}
     }
+    plan
+}
+
+fn source_relative_paths(source_dir: &Path, paths: &[PathBuf]) -> Vec<String> {
+    let mut relative = paths
+        .iter()
+        .filter(|path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+        })
+        .filter_map(|path| path.strip_prefix(source_dir).ok())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .collect::<Vec<_>>();
+    relative.sort();
+    relative.dedup();
+    relative
 }
 
 /// Run PAR2 handling for an inspection request.
@@ -673,6 +713,7 @@ fn prepare_archive(
         return Par2Plan::Prepared(Par2Inputs {
             archive_path: source_dir.join(relative),
             staging_dir: None,
+            processed_recovery_paths: Vec::new(),
         });
     }
 
@@ -690,6 +731,7 @@ fn prepare_archive(
         Ok(Par2Inputs {
             archive_path: staging_dir.join(relative),
             staging_dir: Some(staging_dir.clone()),
+            processed_recovery_paths: Vec::new(),
         })
     })();
 

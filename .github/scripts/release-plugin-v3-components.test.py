@@ -60,9 +60,13 @@ class ComponentTests(unittest.TestCase):
     def tearDown(self):
         self.directory.cleanup()
 
-    def trigger(self, body, name="plugins-v3/release/1700000000-abcdef012345"):
-        message = "Release trigger for components\n\n" + body
-        git(self.repo, "tag", "-a", "-m", message, name, self.head)
+    def trigger(self, body, name="plugins-v3/release/1700000000-abcdef012345", marker=True, at=None):
+        count = sum(1 for line in body.splitlines() if line.startswith("component "))
+        message = "Release trigger for components\n\n"
+        if marker:
+            message += f"components {count}\n"
+        message += body
+        git(self.repo, "tag", "-a", "-m", message, name, at or self.head)
         return name
 
     def run_components(self, trigger, *, release_sha=None, verify="true", unverified=""):
@@ -85,19 +89,86 @@ class ComponentTests(unittest.TestCase):
             result.stdout,
             f"newznab\t3.1.0\t{self.head}\nnewznab\t2.3.3\t{self.legacy}\n",
         )
-        self.assertEqual(calls.count("gh api repos/example/plugins/git/tags/"), 2)
+        # The trigger tag and both component tags are verified.
+        self.assertEqual(calls.count("gh api repos/example/plugins/git/tags/"), 3)
 
-    def test_triggers_without_component_lines_use_tags_at_the_release_commit(self):
+    def test_the_trigger_tag_itself_is_verified(self):
+        trigger = self.trigger(f"component plugins-v3/newznab/v3.1.0 {self.head}\n")
+        trigger_object = git(self.repo, "rev-parse", f"refs/tags/{trigger}")
+        result, calls = self.run_components(trigger, unverified=trigger_object)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a GitHub-verified signed tag", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(calls.count("gh api"), 1)
+
+    def test_a_trigger_declaring_zero_components_builds_nothing(self):
+        # A rule-pack-only trigger at a commit that already carries plugin tags
+        # must not rebuild and re-sign those plugins.
         trigger = self.trigger("")
-        result, calls = self.run_components(trigger, verify="false")
+        result, _ = self.run_components(trigger)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, f"newznab\t3.1.0\t{self.head}\n")
-        self.assertEqual(calls, "")
+        self.assertEqual(result.stdout, "")
 
-    def test_a_missing_trigger_falls_back_too(self):
+    def test_a_trigger_without_a_components_marker_is_refused(self):
+        trigger = self.trigger("", marker=False)
+        result, _ = self.run_components(trigger, verify="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no components marker", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_a_lightweight_or_missing_trigger_is_refused(self):
+        git(self.repo, "tag", "plugins-v3/release/light", self.head)
+        for trigger in ["plugins-v3/release/light", "plugins-v3/release/absent"]:
+            with self.subTest(trigger=trigger):
+                result, _ = self.run_components(trigger, verify="false")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("not an annotated tag", result.stderr)
+                self.assertEqual(result.stdout, "")
+
+    def test_a_mismatched_component_count_is_refused(self):
+        message = f"Release trigger\n\ncomponents 2\ncomponent plugins-v3/newznab/v3.1.0 {self.head}\n"
+        git(self.repo, "tag", "-a", "-m", message, "plugins-v3/release/short", self.head)
+        result, _ = self.run_components("plugins-v3/release/short", verify="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("declares 2 components but lists 1", result.stderr)
+
+    def test_crlf_component_lines_are_accepted(self):
+        message = f"Release trigger\r\n\r\ncomponents 1\r\ncomponent plugins-v3/newznab/v2.3.3 {self.legacy}\r\n"
+        git(self.repo, "tag", "-a", "-m", message, "plugins-v3/release/crlf", self.head)
+        result, _ = self.run_components("plugins-v3/release/crlf", verify="false")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, f"newznab\t2.3.3\t{self.legacy}\n")
+
+    def test_without_a_trigger_the_release_commit_tags_and_its_triggers_are_used(self):
+        # Catalog-only and manual runs: tags at the commit plus the components
+        # that triggers created there list at earlier commits, deduplicated.
+        self.trigger(
+            f"component plugins-v3/newznab/v3.1.0 {self.head}\n"
+            f"component plugins-v3/newznab/v2.3.3 {self.legacy}\n"
+        )
+        self.trigger("", name="plugins-v3/release/catalog-1-from-x", marker=False)
+        result, calls = self.run_components("", verify="false")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f"newznab\t3.1.0\t{self.head}\nnewznab\t2.3.3\t{self.legacy}\n",
+        )
+        self.assertEqual(calls, "")
+        result, calls = self.run_components("", verify="true")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls.count("gh api"), 2)
+
+    def test_without_a_trigger_only_the_release_commit_tags_are_used_when_no_trigger_lists_more(self):
         result, _ = self.run_components("", verify="false")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, f"newznab\t3.1.0\t{self.head}\n")
+
+    def test_a_tag_that_does_not_round_trip_is_refused(self):
+        git(self.repo, "tag", "-a", "-m", "Release", "plugins-v3/a/b/v1.0.0", self.head)
+        trigger = self.trigger(f"component plugins-v3/a/b/v1.0.0 {self.head}\n")
+        result, _ = self.run_components(trigger, verify="false")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsafe id or version", result.stderr)
 
     def test_a_release_without_plugin_tags_prints_nothing(self):
         (self.repo / "c").write_text("4")
@@ -137,14 +208,15 @@ class ComponentTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
     def test_malformed_and_duplicate_component_lines_are_refused(self):
-        for body in [
+        bodies = [
             f"component plugins-v3/newznab/v2.3.3 {self.legacy} extra\n",
             f"component plugins-v3/newznab/v2.3.3 {self.legacy}\ncomponent plugins-v3/newznab/v2.3.3 {self.legacy}\n",
             f"component rule-packs/trash/v1.0.0 {self.head}\n",
             "component plugins-v3/newznab/v2.3.3 abc\n",
-        ]:
+        ]
+        for index, body in enumerate(bodies):
             with self.subTest(body=body):
-                trigger = self.trigger(body, name=f"plugins-v3/release/t{abs(hash(body))}")
+                trigger = self.trigger(body, name=f"plugins-v3/release/t{index}")
                 result, _ = self.run_components(trigger)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")

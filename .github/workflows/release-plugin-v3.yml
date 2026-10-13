@@ -192,10 +192,12 @@ jobs:
               RELEASE_SHA="${{ github.event_name == 'workflow_dispatch' && inputs.release_commit || '' }}"
             fi
             if [ -z "${RELEASE_SHA:-}" ]; then RELEASE_SHA="$(git rev-parse HEAD)"; fi
-            # A push trigger lists its plugin components (tag and source commit)
-            # in its signed body; older triggers and catalog-only or manual runs
-            # fall back to the plugin tags at the release commit. Pushed tags are
-            # additionally checked as GitHub-verified signatures.
+            # A pushed trigger lists its plugin components (tag and source
+            # commit) in its signed body and nothing else is built from it.
+            # Catalog-only and manual runs take the plugin tags at the release
+            # commit plus the components that triggers created there list.
+            # On a push the trigger and every component tag must also be
+            # GitHub-verified signatures.
             trigger_tag=""
             verify_components=false
             if [ "${GITHUB_EVENT_NAME}" = "push" ]; then

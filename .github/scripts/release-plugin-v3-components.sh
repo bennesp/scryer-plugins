@@ -3,18 +3,22 @@
 set -euo pipefail
 
 # Prints one `plugin_id<TAB>version<TAB>commit` row per plugin component a
-# release trigger publishes.
+# release publishes.
 #
-# A trigger created by `xtask release-publish-tags` lists every plugin
-# component in its signed tag body as `component <tag> <commit>` so one
-# trigger can publish several lines of one plugin, each built from its own
-# commit (own lockfile, own SDK) by the trigger's xtask. A trigger without
-# such lines publishes the plugin tags that point at the release commit.
+# A trigger created by `xtask release-publish-tags` lists its plugin
+# components in its signed tag body as a `components <n>` marker followed by
+# one `component <tag> <commit>` line each, so one trigger can publish several
+# lines of one plugin, each built from its own commit (own lockfile, own SDK)
+# by the trigger's xtask. With a trigger tag given, that body is the only
+# source: a trigger without the marker, or a lightweight one, is refused.
+# Without a trigger tag (catalog-only and manual runs) the rows are the plugin
+# tags pointing at the release commit plus the components listed by release
+# triggers created there.
 #
 # Every row is checked against the repository: the component tag must be
 # annotated, point at the listed commit, and that commit must be an ancestor
-# of the release commit. With VERIFY=true the tag must also be
-# signature-verified by GitHub (gh api), as the trigger tag itself is.
+# of the release commit. With VERIFY=true the trigger tag and every component
+# tag must also be signature-verified by GitHub (gh api).
 release_plugin_components() {
   local trigger_tag="${1:-}"
   local release_sha="${2:?release commit is required}"
@@ -28,31 +32,62 @@ release_plugin_components() {
   fi
 
   local -a rows=()
-  local line tag sha extra
+  local tag sha
   if [[ -n "${trigger_tag}" ]]; then
-    while IFS= read -r line; do
-      [[ "${line}" == component\ * ]] || continue
-      read -r _ tag sha extra <<<"${line}"
-      if [[ -z "${tag:-}" || -z "${sha:-}" || -n "${extra:-}" ]]; then
-        printf 'Malformed component line in %s: %s\n' "${trigger_tag}" "${line}" >&2
-        return 1
-      fi
-      rows+=("${tag}"$'\t'"${sha}")
-    done < <(git tag -l --format='%(contents:body)' "${trigger_tag}")
-  fi
-  if (( ${#rows[@]} == 0 )); then
+    if [[ "$(git cat-file -t "refs/tags/${trigger_tag}" 2>/dev/null || true)" != tag ]]; then
+      printf 'Release trigger %s is not an annotated tag\n' "${trigger_tag}" >&2
+      return 1
+    fi
+    if [[ "${verify}" == true ]]; then
+      _release_plugin_components_verify_tag "${repository}" "${trigger_tag}" || return 1
+    fi
+    local declared
+    declared="$(_release_plugin_components_from_trigger "${trigger_tag}")" || return 1
+    if [[ -z "${declared}" ]]; then
+      printf 'Release trigger %s carries no components marker; refusing to guess its components\n' "${trigger_tag}" >&2
+      return 1
+    fi
+    if [[ "${declared}" != none ]]; then
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        rows+=("${line}")
+      done <<<"${declared}"
+    fi
+  else
+    local pointing
+    pointing="$(git tag --points-at "${release_sha}")"
     while IFS= read -r tag; do
       [[ -n "${tag}" ]] || continue
       rows+=("${tag}"$'\t'"${release_sha}")
-    done < <(git tag --points-at "${release_sha}" | grep -E "^${prefix}/[^/]+/v.+$" | sort || true)
+    done < <(printf '%s\n' "${pointing}" | grep -E "^${prefix}/[^/]+/v.+$" | sort || true)
+    local trigger declared
+    while IFS= read -r trigger; do
+      [[ -n "${trigger}" ]] || continue
+      declared="$(_release_plugin_components_from_trigger "${trigger}")" || return 1
+      [[ -n "${declared}" && "${declared}" != none ]] || continue
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] || continue
+        rows+=("${line}")
+      done <<<"${declared}"
+    done < <(printf '%s\n' "${pointing}" | grep -E "^${prefix}/release/" | grep -Ev "^${prefix}/release/catalog-" | sort || true)
   fi
 
-  local row spec plugin_id version tag_object resolved verified
+  local row spec plugin_id version tag_object resolved
   local seen=$'\n'
   local -a output=()
   for row in ${rows[@]+"${rows[@]}"}; do
     tag="${row%%$'\t'*}"
     sha="${row#*$'\t'}"
+    if [[ "${seen}" == *$'\n'"${tag}"$'\t'"${sha}"$'\n'* ]]; then
+      # The same component listed by both the release commit's tags and a
+      # trigger body there.
+      continue
+    fi
+    if [[ "${seen}" == *$'\n'"${tag}"$'\t'* ]]; then
+      printf 'Component %s is listed at more than one commit\n' "${tag}" >&2
+      return 1
+    fi
+    seen+="${tag}"$'\t'"${sha}"$'\n'
     if [[ "${tag}" != "${prefix}"/*/v* ]]; then
       printf 'Component tag is not a plugin release tag: %s\n' "${tag}" >&2
       return 1
@@ -60,7 +95,7 @@ release_plugin_components() {
     spec="${tag#"${prefix}"/}"
     plugin_id="${spec%%/*}"
     version="${spec#*/v}"
-    if [[ ! "${plugin_id}" =~ ^[a-z0-9][a-z0-9-]*$ || -z "${version}" || "${version}" == */* ]]; then
+    if [[ ! "${plugin_id}" =~ ^[a-z0-9][a-z0-9-]*$ || -z "${version}" || "${prefix}/${plugin_id}/v${version}" != "${tag}" ]]; then
       printf 'Component tag carries an unsafe id or version: %s\n' "${tag}" >&2
       return 1
     fi
@@ -68,11 +103,6 @@ release_plugin_components() {
       printf 'Component %s lists an invalid commit: %s\n' "${tag}" "${sha}" >&2
       return 1
     fi
-    if [[ "${seen}" == *$'\n'"${tag}"$'\n'* ]]; then
-      printf 'Component %s is listed twice\n' "${tag}" >&2
-      return 1
-    fi
-    seen+="${tag}"$'\n'
     if ! tag_object="$(git rev-parse --verify --quiet "refs/tags/${tag}^{tag}")"; then
       printf 'Component %s is not an annotated tag\n' "${tag}" >&2
       return 1
@@ -87,11 +117,7 @@ release_plugin_components() {
       return 1
     fi
     if [[ "${verify}" == true ]]; then
-      verified="$(gh api "repos/${repository}/git/tags/${tag_object}" --jq '.verification.verified')"
-      if [[ "${verified}" != true ]]; then
-        printf 'Component %s is not a GitHub-verified signed tag\n' "${tag}" >&2
-        return 1
-      fi
+      _release_plugin_components_verify_tag "${repository}" "${tag}" "${tag_object}" || return 1
     fi
     output+=("${plugin_id}"$'\t'"${version}"$'\t'"${sha}")
   done
@@ -100,6 +126,69 @@ release_plugin_components() {
   for row in ${output[@]+"${output[@]}"}; do
     printf '%s\n' "${row}"
   done
+}
+
+# Prints the `tag<TAB>commit` rows a trigger's body lists, `none` when the
+# body declares zero components, or nothing when it has no marker at all.
+_release_plugin_components_from_trigger() {
+  local trigger_tag="$1"
+  local body line tag sha extra count="" listed=0 seen=$'\n'
+  local -a rows=()
+  body="$(git tag -l --format='%(contents:body)' "${trigger_tag}")"
+  while IFS= read -r line; do
+    line="${line%$'\r'}"
+    case "${line}" in
+      components\ *)
+        read -r _ count extra <<<"${line}"
+        if [[ ! "${count}" =~ ^[0-9]+$ || -n "${extra:-}" ]]; then
+          printf 'Malformed components marker in %s: %s\n' "${trigger_tag}" "${line}" >&2
+          return 1
+        fi
+        ;;
+      component\ *)
+        read -r _ tag sha extra <<<"${line}"
+        if [[ -z "${tag:-}" || -z "${sha:-}" || -n "${extra:-}" ]]; then
+          printf 'Malformed component line in %s: %s\n' "${trigger_tag}" "${line}" >&2
+          return 1
+        fi
+        if [[ "${seen}" == *$'\n'"${tag}"$'\n'* ]]; then
+          printf 'Release trigger %s lists %s twice\n' "${trigger_tag}" "${tag}" >&2
+          return 1
+        fi
+        seen+="${tag}"$'\n'
+        rows+=("${tag}"$'\t'"${sha}")
+        listed=$((listed + 1))
+        ;;
+    esac
+  done <<<"${body}"
+  [[ -n "${count}" ]] || return 0
+  if (( count != listed )); then
+    printf 'Release trigger %s declares %s components but lists %s\n' "${trigger_tag}" "${count}" "${listed}" >&2
+    return 1
+  fi
+  if (( listed == 0 )); then
+    printf 'none\n'
+    return 0
+  fi
+  local row
+  for row in "${rows[@]}"; do
+    printf '%s\n' "${row}"
+  done
+}
+
+_release_plugin_components_verify_tag() {
+  local repository="$1" tag="$2" tag_object="${3:-}" verified
+  if [[ -z "${tag_object}" ]]; then
+    tag_object="$(git rev-parse --verify --quiet "refs/tags/${tag}^{tag}")" || {
+      printf '%s is not an annotated tag\n' "${tag}" >&2
+      return 1
+    }
+  fi
+  verified="$(gh api "repos/${repository}/git/tags/${tag_object}" --jq '.verification.verified')"
+  if [[ "${verified}" != true ]]; then
+    printf '%s is not a GitHub-verified signed tag\n' "${tag}" >&2
+    return 1
+  fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

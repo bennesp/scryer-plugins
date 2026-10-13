@@ -68,30 +68,30 @@ func validComponentVersion(value string) bool {
 	return true
 }
 
-// centralAssets lists only artifacts staged by this catalog preparation.
-// Historical releases remain referenced remotely and are not uploaded again.
+// centralAssets lists only artifacts staged by this catalog preparation, so
+// the workflow can sign them before publication. Historical releases remain
+// referenced remotely and are not signed or uploaded again. Only the modern
+// redirect is read: the legacy redirect ladder is frozen and no longer staged.
 func centralAssets(directory string) ([]string, error) {
 	type artifact struct {
 		URL string `json:"url"`
 	}
-	var artifacts []artifact
-	for _, name := range []string{"catalog-v3.redirect.json", "catalog-v3.modern.redirect.json"} {
-		content, err := os.ReadFile(filepath.Join(directory, name))
-		if err != nil {
-			return nil, err
-		}
-		var redirect struct {
-			Artifacts []artifact `json:"artifacts"`
-		}
-		if err := json.Unmarshal(content, &redirect); err != nil {
-			return nil, err
-		}
-		if len(redirect.Artifacts) == 0 {
-			return nil, fmt.Errorf("%s has no catalog artifacts", name)
-		}
-		artifacts = append(artifacts, redirect.Artifacts...)
+	const redirectName = "catalog-v3.modern.redirect.json"
+	content, err := os.ReadFile(filepath.Join(directory, redirectName))
+	if err != nil {
+		return nil, err
 	}
-	content, err := os.ReadFile(filepath.Join(directory, "prepared-rule-pack-artifacts.json"))
+	var redirect struct {
+		Artifacts []artifact `json:"artifacts"`
+	}
+	if err := json.Unmarshal(content, &redirect); err != nil {
+		return nil, err
+	}
+	if len(redirect.Artifacts) == 0 {
+		return nil, fmt.Errorf("%s has no catalog artifacts", redirectName)
+	}
+	artifacts := append([]artifact(nil), redirect.Artifacts...)
+	content, err = os.ReadFile(filepath.Join(directory, "prepared-rule-pack-artifacts.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +279,7 @@ func main() {
 	rulePackID := flag.String("rule-pack-id", "", "rule-pack id for manifest validation")
 	tagVersion := flag.String("tag-version", "", "component tag version for manifest validation")
 	manifestPath := flag.String("manifest", "", "rule-pack manifest path for version validation")
-	centralAssetsDir := flag.String("central-assets-dir", "", "list files staged for central catalog publication")
+	centralAssetsDir := flag.String("central-assets-dir", "", "list hashed files staged for central catalog publication")
 	flag.Parse()
 	if *centralAssetsDir != "" {
 		assets, err := centralAssets(*centralAssetsDir)

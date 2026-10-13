@@ -33,6 +33,9 @@ env:
   SCRYER_OFFICIAL_PLUGIN_RELEASE_TAG_PREFIX: plugins-stage
   SCRYER_CATALOG_V3_RELEASE_TAG: catalog/v3-stage
   SCRYER_CATALOG_V3_PATH_PREFIX: catalog/v3-stage
+  # Stage generations publish to their own releases so they never collide
+  # with production catalog/v3/g<version> releases.
+  SCRYER_CATALOG_V3_GENERATION_TAG_PREFIX: catalog/v3-stage/g
 
 jobs:
   plan-release:
@@ -564,6 +567,9 @@ jobs:
   publish-central-catalog:
     needs: [plan-release, build-sign-release-plugin, publish-release-provenance]
     runs-on: ubuntu-latest
+    concurrency:
+      group: central-catalog-v3-stage
+      cancel-in-progress: false
     permissions:
       actions: read
       contents: write
@@ -655,17 +661,17 @@ jobs:
               --bundle "dist/catalog-v3-stage/${asset}.bundle" \
               "dist/catalog-v3-stage/${asset}"
           done
-          for redirect_name in catalog-v3.redirect catalog-v3.modern.redirect; do
-            cosign sign-blob \
-              --yes \
-              --bundle "dist/catalog-v3-stage/${redirect_name}.bundle.json" \
-              "dist/catalog-v3-stage/${redirect_name}.json"
-            cp "dist/catalog-v3-stage/${redirect_name}.bundle.json" \
-              "dist/catalog-v3-stage/${redirect_name}.sigstore.json"
-          done
+          cosign sign-blob \
+            --yes \
+            --bundle "dist/catalog-v3-stage/catalog-v3.modern.redirect.bundle.json" \
+            "dist/catalog-v3-stage/catalog-v3.modern.redirect.json"
+          cp "dist/catalog-v3-stage/catalog-v3.modern.redirect.bundle.json" \
+            "dist/catalog-v3-stage/catalog-v3.modern.redirect.sigstore.json"
 
+          signing_list="${RUNNER_TEMP}/catalog-v3-stage-staged-assets.txt"
           go run .github/scripts/release_workflow_plan.go \
-            --central-assets-dir dist/catalog-v3-stage > dist/catalog-v3-stage/v3-central-assets.txt
+            --central-assets-dir dist/catalog-v3-stage > "${signing_list}"
+          test -s "${signing_list}"
 
           while IFS= read -r asset_name; do
             [ -n "${asset_name}" ] || continue
@@ -677,33 +683,19 @@ jobs:
               "dist/catalog-v3-stage/${asset_name}.sigstore.json"
             zstd -19 -f "dist/catalog-v3-stage/${asset_name}.bundle" -o "dist/catalog-v3-stage/${asset_name}.bundle.zst"
             rm -f "dist/catalog-v3-stage/${asset_name}.bundle"
-          done < dist/catalog-v3-stage/v3-central-assets.txt
+          done < "${signing_list}"
 
-          ./xtask/target/xtask-release/xtask catalog upload-v3r2 dist/catalog-v3-stage
-
-          gh release view "catalog/v3-stage" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
-            gh release create "catalog/v3-stage" \
+          gh release view "${SCRYER_CATALOG_V3_RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 || \
+            gh release create "${SCRYER_CATALOG_V3_RELEASE_TAG}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "Scryer plugin central catalog v3 stage" \
               --target "$(git rev-parse HEAD)" \
               --notes "Scryer plugin central catalog v3 staging assets."
-          central_release_assets=(
-            "dist/catalog-v3-stage/catalog-v3.redirect.json"
-            "dist/catalog-v3-stage/catalog-v3.redirect.bundle.json"
-            "dist/catalog-v3-stage/catalog-v3.redirect.sigstore.json"
-            "dist/catalog-v3-stage/catalog-v3.modern.redirect.json"
-            "dist/catalog-v3-stage/catalog-v3.modern.redirect.bundle.json"
-            "dist/catalog-v3-stage/catalog-v3.modern.redirect.sigstore.json"
-          )
-          while IFS= read -r asset_name; do
-            [ -n "${asset_name}" ] || continue
-            central_release_assets+=(
-              "dist/catalog-v3-stage/${asset_name}"
-              "dist/catalog-v3-stage/${asset_name}.bundle.zst"
-              "dist/catalog-v3-stage/${asset_name}.sigstore.json"
-            )
-          done < dist/catalog-v3-stage/v3-central-assets.txt
-          gh release upload "catalog/v3-stage" \
-            "${central_release_assets[@]}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --clobber
+
+          # Same publication order as production: hashed assets to R2 and to
+          # this generation's own release (catalog/v3-stage/g<version>), both
+          # verified, before the modern redirect advances on R2 and then on
+          # catalog/v3-stage. The stage catalog is rebuilt without a merge
+          # base, so there is no expected merge base to compare against.
+          ./xtask/target/xtask-release/xtask catalog publish-v3-generation \
+            --dist dist/catalog-v3-stage

@@ -133,8 +133,10 @@ func TestCentralAssetsIncludeOnlyStagedVersionsAndFailMissingNewFiles(t *testing
 	artifact := func(name string) map[string]string {
 		return map[string]string{"url": "https://example.test/v1.0.0/" + name}
 	}
-	write("catalog-v3.redirect.json", map[string]any{"artifacts": []any{artifact("catalog.a.json.zst")}})
 	write("catalog-v3.modern.redirect.json", map[string]any{"artifacts": []any{artifact("catalog.a.json.zst")}})
+	// The frozen legacy redirect is never staged; a stale copy must not leak
+	// its per-stratum rungs into the signing list.
+	write("catalog-v3.redirect.json", map[string]any{"artifacts": []any{artifact("catalog.legacy.json.zst")}})
 	write("prepared-rule-pack-artifacts.json", []any{artifact("pack.new.min.json.br"), artifact("pack.new.min.json.zst")})
 	// The full catalog's historical asset must never be used as an upload list.
 	write("catalog-v3.json", map[string]any{"rule_packs": []any{artifact("pack.old.min.json.zst")}})
@@ -163,6 +165,39 @@ func TestCentralAssetsIncludeOnlyStagedVersionsAndFailMissingNewFiles(t *testing
 	write("prepared-rule-pack-artifacts.json", []any{artifact("evil%0afile.min.json.zst")})
 	if _, err := centralAssets(dir); err == nil {
 		t.Fatal("newline filename accepted")
+	}
+}
+
+func TestCentralAssetsRequireOnlyTheModernRedirect(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "catalog-v3.modern.redirect.json"),
+		[]byte(`{"artifacts":[{"url":"https://example.test/catalog.a.json.zst"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "prepared-rule-pack-artifacts.json"), []byte(`[]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "catalog.a.json.zst"), []byte("fixture"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := centralAssets(dir)
+	if err != nil {
+		t.Fatalf("modern-only staging rejected: %v", err)
+	}
+	if !reflect.DeepEqual(got, []string{"catalog.a.json.zst"}) {
+		t.Fatalf("got %v", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "catalog-v3.modern.redirect.json"), []byte(`{"artifacts":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := centralAssets(dir); err == nil {
+		t.Fatal("empty modern redirect accepted")
+	}
+	if err := os.Remove(filepath.Join(dir, "catalog-v3.modern.redirect.json")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := centralAssets(dir); err == nil {
+		t.Fatal("missing modern redirect accepted")
 	}
 }
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::catalog_publish::fakes::{FakeR2, FakeRelease, FakeReleases};
+use crate::catalog_publish::fakes::{FakeR2, FakeRelease, FakeReleases, FakeVerifier};
 use crate::catalog_publish::{
     GenerationPlan, PublishOptions, plan_generation, publish_generation, sha256_hex,
 };
@@ -260,7 +260,8 @@ fn fresh_publish_uploads_everything_and_moves_both_redirects() {
     let plan = plan(&fixture);
     let (r2, releases) = live_stores(&plan);
 
-    let report = publish_generation(&plan, &r2, &releases, &options()).expect("publish");
+    let report = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
+        .expect("publish");
 
     assert_eq!(report.r2_uploaded.len(), plan.assets.len());
     assert_eq!(report.github_uploaded.len(), plan.assets.len());
@@ -351,7 +352,8 @@ fn resume_with_complete_r2_and_partial_github_uploads_only_what_is_missing() {
         },
     );
 
-    let report = publish_generation(&plan, &r2, &releases, &options()).expect("resume");
+    let report = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
+        .expect("resume");
 
     assert!(report.r2_uploaded.is_empty());
     assert_eq!(report.r2_skipped.len(), plan.assets.len());
@@ -382,7 +384,7 @@ fn a_conflicting_digest_on_r2_is_rejected_before_anything_moves() {
         .borrow_mut()
         .insert(plan.assets[3].r2_url.clone(), b"other bytes".to_vec());
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("different bytes under a hashed name must fail");
     let message = error.to_string();
     assert!(message.contains(PACK), "{message}");
@@ -409,7 +411,7 @@ fn a_conflicting_digest_on_github_is_rejected_before_anything_moves() {
         },
     );
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("different bytes on the generation release must fail");
     let message = error.to_string();
     assert!(message.contains(MASTER), "{message}");
@@ -436,7 +438,8 @@ fn an_existing_generation_release_with_identical_assets_is_not_reuploaded() {
         },
     );
 
-    let report = publish_generation(&plan, &r2, &releases, &options()).expect("publish");
+    let report = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
+        .expect("publish");
 
     assert!(report.github_uploaded.is_empty());
     assert_eq!(report.github_skipped.len(), plan.assets.len());
@@ -461,7 +464,7 @@ fn a_compare_and_set_mismatch_aborts_before_the_redirect_moves() {
         .borrow_mut()
         .insert(plan.redirect.json_r2_url.clone(), concurrent.clone());
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("a moved redirect must stop the publish");
     assert!(error.to_string().contains("another publish landed"));
     assert_eq!(
@@ -486,7 +489,7 @@ fn a_github_redirect_failure_after_r2_moved_reports_and_a_rerun_converges() {
     let (r2, mut releases) = live_stores(&plan);
     releases.fail_uploads_to = Some(plan.redirect_tag.clone());
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("the stable release upload fails");
     let message = error.to_string();
     assert!(message.contains("R2 now serves generation 9"), "{message}");
@@ -503,7 +506,8 @@ fn a_github_redirect_failure_after_r2_moved_reports_and_a_rerun_converges() {
 
     // The rerun finds its own redirect live; that passes the compare-and-set.
     releases.fail_uploads_to = None;
-    let report = publish_generation(&plan, &r2, &releases, &options()).expect("rerun converges");
+    let report = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
+        .expect("rerun converges");
     assert!(report.r2_uploaded.is_empty());
     assert!(report.github_uploaded.is_empty());
     assert!(!report.r2_redirect_moved, "R2 already serves the redirect");
@@ -557,11 +561,39 @@ fn an_invalid_generation_tag_fails_before_any_upload() {
     let (r2, mut releases) = live_stores(&plan);
     releases.invalid_tags = vec![plan.generation_tag.clone()];
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("an unverified trigger tag must stop the publish");
     assert!(error.to_string().contains("not verified"), "{error:#}");
     assert!(r2.puts.borrow().is_empty(), "nothing reaches R2");
     assert!(releases.created.borrow().is_empty());
+    assert!(releases.uploads.borrow().is_empty());
+    assert_redirects_unmoved(&plan, &r2, &releases);
+}
+
+#[test]
+fn an_existing_generation_release_on_an_invalid_tag_is_still_refused() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, mut releases) = live_stores(&plan);
+    // A release was created on the trigger tag out of band (or the tag was
+    // moved after an earlier attempt): its existence must not bypass the
+    // signed-tag-at-target check.
+    releases.releases.borrow_mut().insert(
+        plan.generation_tag.clone(),
+        FakeRelease {
+            assets: BTreeMap::from([(MASTER.to_string(), local(&plan, MASTER))]),
+        },
+    );
+    releases.invalid_tags = vec![plan.generation_tag.clone()];
+
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
+        .expect_err("an unverified trigger tag must stop the publish even with a release");
+    assert!(error.to_string().contains("not verified"), "{error:#}");
+    assert_eq!(
+        releases.validated_tags.borrow().as_slice(),
+        [(plan.generation_tag.clone(), TARGET.to_string())]
+    );
+    assert!(r2.puts.borrow().is_empty(), "nothing reaches R2");
     assert!(releases.uploads.borrow().is_empty());
     assert_redirects_unmoved(&plan, &r2, &releases);
 }
@@ -573,7 +605,7 @@ fn a_missing_redirect_release_is_refused_and_never_created() {
     let (r2, releases) = live_stores(&plan);
     releases.releases.borrow_mut().remove(&plan.redirect_tag);
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("the redirect release must already exist");
     assert!(error.to_string().contains(&plan.redirect_tag), "{error:#}");
     assert!(r2.puts.borrow().is_empty());
@@ -619,7 +651,8 @@ fn a_published_signature_of_identical_data_is_adopted_not_rejected() {
         },
     );
 
-    let report = publish_generation(&plan, &r2, &releases, &options()).expect("publish");
+    let verifier = FakeVerifier::default();
+    let report = publish_generation(&plan, &r2, &releases, &verifier, &options()).expect("publish");
 
     assert_eq!(
         report.adopted_signatures,
@@ -627,6 +660,14 @@ fn a_published_signature_of_identical_data_is_adopted_not_rejected() {
             format!("{bundle} from R2"),
             format!("{sigstore} from GitHub release {}", plan.generation_tag),
         ]
+    );
+    assert_eq!(
+        verifier.checks.borrow().as_slice(),
+        [
+            (MASTER.to_string(), bundle.clone()),
+            (MASTER.to_string(), sigstore.clone()),
+        ],
+        "every adopted companion is verified against its data first"
     );
     assert_eq!(
         fs::read(&bundle_asset.local).expect("read"),
@@ -655,6 +696,54 @@ fn a_published_signature_of_identical_data_is_adopted_not_rejected() {
         "R2 gets the sigstore adopted from GitHub"
     );
     assert!(report.r2_redirect_moved);
+}
+
+#[test]
+fn a_published_signature_that_does_not_verify_is_a_conflict_not_adopted() {
+    let fixture = fixture();
+    let plan = plan(&fixture);
+    let (r2, releases) = live_stores(&plan);
+    let bundle = signature_bundle_file_name(MASTER);
+    let master_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == MASTER)
+        .expect("master");
+    let bundle_asset = plan
+        .assets
+        .iter()
+        .find(|a| a.name == bundle)
+        .expect("bundle");
+    let local_bundle = local(&plan, &bundle);
+    // Identical data on R2, but the companion beside it is truncated or was
+    // produced by something other than the release workflow.
+    r2.objects
+        .borrow_mut()
+        .insert(master_asset.r2_url.clone(), local(&plan, MASTER));
+    r2.objects
+        .borrow_mut()
+        .insert(bundle_asset.r2_url.clone(), b"not a signature".to_vec());
+    let verifier = FakeVerifier {
+        rejected: vec![bundle.clone()],
+        ..FakeVerifier::default()
+    };
+
+    let error = publish_generation(&plan, &r2, &releases, &verifier, &options())
+        .expect_err("an unverifiable published signature must not be adopted");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&bundle) && message.contains("not a verifiable release signature"),
+        "{message}"
+    );
+    assert_eq!(
+        fs::read(&bundle_asset.local).expect("read"),
+        local_bundle,
+        "the locally signed bundle is left untouched"
+    );
+    assert!(r2.puts.borrow().is_empty());
+    assert!(releases.uploads.borrow().is_empty());
+    assert!(releases.created.borrow().is_empty());
+    assert_redirects_unmoved(&plan, &r2, &releases);
 }
 
 #[test]
@@ -689,7 +778,7 @@ fn signatures_adopted_from_r2_that_differ_on_github_are_a_conflict() {
         },
     );
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("two different published signatures for one asset is a conflict");
     assert!(error.to_string().contains(&bundle), "{error:#}");
     assert!(r2.puts.borrow().is_empty());
@@ -720,7 +809,7 @@ fn a_different_signature_beside_different_data_is_still_a_conflict() {
         .borrow_mut()
         .insert(bundle_asset.r2_url.clone(), b"other signature".to_vec());
 
-    let error = publish_generation(&plan, &r2, &releases, &options())
+    let error = publish_generation(&plan, &r2, &releases, &FakeVerifier::default(), &options())
         .expect_err("a signature is adopted only beside identical data");
     let message = error.to_string();
     assert!(

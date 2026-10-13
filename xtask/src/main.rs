@@ -7060,10 +7060,15 @@ fn run_catalog_publish_v3_generation(
         ctx,
         repo: OFFICIAL_GITHUB_REPO.to_string(),
     };
+    let verifier = catalog_publish::CosignReleaseVerifier {
+        ctx,
+        repo: OFFICIAL_GITHUB_REPO.to_string(),
+    };
     let report = catalog_publish::publish_generation(
         &plan,
         &r2,
         &releases,
+        &verifier,
         &catalog_publish::PublishOptions {
             expected_merge_base: args.expected_merge_base,
             target_commit,

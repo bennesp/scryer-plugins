@@ -31,10 +31,12 @@ use sha2::{Digest, Sha256};
 use crate::{
     CATALOG_V3_MODERN_REDIRECT_JSON, CATALOG_V3_SNIPPET_JSON, CatalogV3Redirect,
     OFFICIAL_GITHUB_REPO, R2Config, TaskContext, central_catalog_v3_generation_tag,
-    central_catalog_v3_path_prefix, central_catalog_v3_release_tag, github_release_asset_url, ok,
-    prepared_rule_pack_artifacts_for_upload, public_catalog_base_url, read_catalog_v3_from_path,
-    redirect_signature_bundle_file_name, run_capture, run_checked, step, upload_file_to_r2,
-    url_file_name, url_path_key, warn,
+    central_catalog_v3_path_prefix, central_catalog_v3_release_tag,
+    cosign_verify_blob_with_identity_pattern, github_release_asset_url, official_release_workflow,
+    ok, prepared_rule_pack_artifacts_for_upload, public_catalog_base_url,
+    read_catalog_v3_from_path, redirect_signature_bundle_file_name, regex_escape_literal,
+    repo_release_tag_prefix, run_capture, run_checked, step, upload_file_to_r2, url_file_name,
+    url_path_key, warn,
 };
 
 /// The R2 bucket behind the public CDN base URL.
@@ -69,6 +71,49 @@ pub trait ReleaseStore {
     fn upload_assets(&self, tag: &str, files: &[PathBuf], clobber: bool) -> Result<()>;
     /// Download through the public release download URL, the way clients do.
     fn fetch_public(&self, tag: &str, name: &str) -> Result<Vec<u8>>;
+}
+
+/// Verifies a published signature companion against the data it claims to
+/// sign, under the release workflow's signing identity. A companion found
+/// beside byte-identical data is adopted only after it verifies; a truncated,
+/// corrupted, or foreign one is a conflict, never something to republish.
+pub trait SignatureVerifier {
+    /// `companion_name` names the format: `.bundle.zst` is a zstd-compressed
+    /// sigstore bundle, `.sigstore.json` the raw bundle.
+    fn verify(&self, data: &Path, companion_name: &str, companion: &[u8]) -> Result<()>;
+}
+
+/// `cosign verify-blob` against the official release workflow signing a
+/// `plugins-v3/release/*` trigger tag: the only identity that publishes
+/// catalog generations.
+pub struct CosignReleaseVerifier<'a> {
+    pub ctx: &'a TaskContext,
+    pub repo: String,
+}
+
+impl SignatureVerifier for CosignReleaseVerifier<'_> {
+    fn verify(&self, data: &Path, companion_name: &str, companion: &[u8]) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        // Keep the companion's own name so the compressed form is detected.
+        let bundle = dir.path().join(companion_name);
+        fs::write(&bundle, companion)
+            .with_context(|| format!("failed to stage {companion_name} for verification"))?;
+        let identity = format!(
+            "^https://github\\.com/{}/{}@refs/tags/{}.+$",
+            regex_escape_literal(&self.repo),
+            regex_escape_literal(&official_release_workflow()),
+            regex_escape_literal(&repo_release_tag_prefix()),
+        );
+        cosign_verify_blob_with_identity_pattern(self.ctx, data, &bundle, &identity).with_context(
+            || {
+                format!(
+                    "published {companion_name} does not verify against {} under the release \
+                     workflow identity",
+                    data.display()
+                )
+            },
+        )
+    }
 }
 
 /// One immutable file of the generation.
@@ -331,8 +376,9 @@ fn last_artifact_name(bytes: &[u8]) -> Result<String> {
 
 /// Compare every asset with one store. Returns the indexes of assets absent
 /// there. A signature companion whose data asset is byte-identical on the
-/// store adopts the published signature bytes (first store wins; a later
-/// store disagreeing with adopted bytes is a conflict).
+/// store adopts the published signature bytes once they verify against that
+/// data (first store wins; a later store disagreeing with adopted bytes is a
+/// conflict, and so is a published companion that fails verification).
 fn preflight_store(
     destination: &str,
     plan: &GenerationPlan,
@@ -340,6 +386,7 @@ fn preflight_store(
     adopted: &mut BTreeSet<String>,
     conflicts: &mut Vec<String>,
     report: &mut PublishReport,
+    verifier: &dyn SignatureVerifier,
     fetch: impl Fn(&HashedAsset) -> Result<Option<Vec<u8>>>,
 ) -> Result<Vec<usize>> {
     let mut missing = Vec::new();
@@ -364,11 +411,31 @@ fn preflight_store(
             .is_some_and(|data| identical_data.contains(data) && !adopted.contains(&asset.name));
         if let (Some(bytes), true) = (&remote, adoptable) {
             if sha256_hex(bytes) != digests[index] {
+                let data_name = asset.signature_of.as_deref().unwrap_or_default();
+                let data = plan
+                    .assets
+                    .iter()
+                    .find(|candidate| candidate.name == data_name)
+                    .map(|candidate| candidate.local.as_path())
+                    .ok_or_else(|| {
+                        anyhow!("{} signs an unplanned asset {data_name}", asset.name)
+                    })?;
+                // The data matched, so the bytes beside it are the only thing
+                // in doubt: adopt them only once they prove to be a signature
+                // of that data by the release workflow.
+                if let Err(error) = verifier.verify(data, &asset.name, bytes) {
+                    conflicts.push(format!(
+                        "{destination}: {} is published beside identical {data_name} but is not \
+                         a verifiable release signature of it: {error:#}",
+                        asset.name
+                    ));
+                    continue;
+                }
                 fs::write(&asset.local, bytes)
                     .with_context(|| format!("failed to adopt {}", asset.local.display()))?;
                 digests[index] = sha256_hex(bytes);
                 warn(format!(
-                    "{} already signed on {destination}; adopting the published signature",
+                    "{} already signed on {destination}; adopting the verified published signature",
                     asset.name
                 ));
                 report
@@ -394,6 +461,7 @@ pub fn publish_generation(
     plan: &GenerationPlan,
     r2: &dyn R2Store,
     releases: &dyn ReleaseStore,
+    verifier: &dyn SignatureVerifier,
     options: &PublishOptions,
 ) -> Result<PublishReport> {
     let mut report = PublishReport::default();
@@ -417,11 +485,12 @@ pub fn publish_generation(
             plan.redirect_tag
         );
     }
+    // Fail on a bad tag before a single byte reaches either store, whether or
+    // not the generation release already exists: a release pre-created on an
+    // unsigned, lightweight, or mistargeted tag must not receive generation
+    // assets or move the redirect either.
+    releases.validate_tag(&plan.generation_tag, &options.target_commit)?;
     let generation_release = releases.asset_names(&plan.generation_tag)?;
-    if generation_release.is_none() {
-        // Fail on a bad tag before a single byte reaches either store.
-        releases.validate_tag(&plan.generation_tag, &options.target_commit)?;
-    }
     let published_names = generation_release
         .clone()
         .unwrap_or_default()
@@ -437,6 +506,7 @@ pub fn publish_generation(
         &mut adopted,
         &mut conflicts,
         &mut report,
+        verifier,
         |asset| r2.get(&asset.r2_url),
     )?;
     let github_missing = preflight_store(
@@ -446,6 +516,7 @@ pub fn publish_generation(
         &mut adopted,
         &mut conflicts,
         &mut report,
+        verifier,
         |asset| {
             if published_names.contains(&asset.name) {
                 releases
@@ -656,6 +727,12 @@ fn curl_download(url: &str) -> Result<Vec<u8>> {
             .arg("--retry")
             .arg("5")
             .arg("--retry-all-errors")
+            // A peer that accepts the connection and then stalls must fail
+            // the run, not hold the publish slot until the platform kills it.
+            .arg("--connect-timeout")
+            .arg("30")
+            .arg("--max-time")
+            .arg("600")
             .arg("--output")
             .arg(&path)
             .arg(url),
@@ -952,6 +1029,31 @@ pub mod fakes {
 
         fn fetch_public(&self, tag: &str, name: &str) -> Result<Vec<u8>> {
             self.download_asset(tag, name)
+        }
+    }
+
+    /// Accepts every companion except those listed in `rejected`, recording
+    /// each check as `(data file name, companion name)`.
+    #[derive(Default)]
+    pub struct FakeVerifier {
+        pub rejected: Vec<String>,
+        pub checks: RefCell<Vec<(String, String)>>,
+    }
+
+    impl SignatureVerifier for FakeVerifier {
+        fn verify(&self, data: &Path, companion_name: &str, _companion: &[u8]) -> Result<()> {
+            let data_name = data
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_string();
+            self.checks
+                .borrow_mut()
+                .push((data_name, companion_name.to_string()));
+            if self.rejected.iter().any(|name| name == companion_name) {
+                bail!("simulated verification failure for {companion_name}");
+            }
+            Ok(())
         }
     }
 }

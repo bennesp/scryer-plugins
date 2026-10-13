@@ -49,18 +49,44 @@ catalog_v3_cdn_base() {
 catalog_v3_fetch() {
   local url="${1:?url is required}"
   local destination="${2:?destination is required}"
-  curl -fsSL --proto '=https' --tlsv1.2 -o "${destination}" "${url}"
+  # A peer that connects and then stalls must fail the attempt (and the
+  # retry loop above it), not hold the publish slot until the job times out.
+  curl -fsSL --proto '=https' --tlsv1.2 --connect-timeout 30 --max-time 600 \
+    -o "${destination}" "${url}"
+}
+
+catalog_v3_release_download() {
+  local tag="${1:?release tag is required}"
+  local destination="${2:?destination is required}"
+  local repository="${3:?repository is required}"
+  shift 3
+  gh release download "${tag}" \
+    --repo "${repository}" \
+    --dir "${destination}" \
+    --clobber \
+    "$@"
 }
 
 catalog_v3_mirror_download() {
   local destination="${1:?destination is required}"
   local repository="${2:?repository is required}"
   shift 2
-  gh release download "${SCRYER_CATALOG_V3_RELEASE_TAG:-catalog/v3}" \
-    --repo "${repository}" \
-    --dir "${destination}" \
-    --clobber \
-    "$@"
+  catalog_v3_release_download "${SCRYER_CATALOG_V3_RELEASE_TAG:-catalog/v3}" \
+    "${destination}" "${repository}" "$@"
+}
+
+# Masters published since generation releases began are mirrored on the
+# release-trigger-backed generation release that staged them, not on the
+# redirect release. Print the tag of the generation release carrying ASSET,
+# or nothing when no generation release has it (a pre-generation snapshot).
+catalog_v3_generation_release_for_asset() {
+  local repository="${1:?repository is required}"
+  local asset="${2:?asset is required}"
+  local prefix="${SCRYER_OFFICIAL_PLUGIN_RELEASE_TAG_PREFIX:-plugins-v3}/release/"
+  gh api --paginate "repos/${repository}/releases?per_page=100" \
+    | jq -r --arg asset "${asset}" --arg prefix "${prefix}" \
+      '.[] | select(.tag_name | startswith($prefix)) | select(any(.assets[]?; .name == $asset)) | .tag_name' \
+    | head -n 1
 }
 
 # Print the last (newest) artifact of a redirect as
@@ -193,9 +219,22 @@ resolve_catalog_v3_merge_base() {
       override_signature="${override_url}.bundle.zst"
       if ! catalog_v3_fetch_catalog_pair "${existing_dir}" "${catalog_asset}" \
         "${override_url}" "${override_signature}"; then
-        catalog_v3_retry catalog_v3_mirror_download "${existing_dir}" "${repository}" \
-          --pattern "${catalog_asset}" \
-          --pattern "${catalog_asset}.bundle.zst"
+        # The GitHub copy lives on the generation release that staged the
+        # asset; only pre-generation snapshots sit on the redirect release.
+        local generation_tag
+        generation_tag="$(catalog_v3_retry catalog_v3_generation_release_for_asset \
+          "${repository}" "${catalog_asset}")"
+        if [ -n "${generation_tag}" ]; then
+          printf 'recovering %s from generation release %s\n' "${catalog_asset}" "${generation_tag}" >&2
+          catalog_v3_retry catalog_v3_release_download "${generation_tag}" \
+            "${existing_dir}" "${repository}" \
+            --pattern "${catalog_asset}" \
+            --pattern "${catalog_asset}.bundle.zst"
+        else
+          catalog_v3_retry catalog_v3_mirror_download "${existing_dir}" "${repository}" \
+            --pattern "${catalog_asset}" \
+            --pattern "${catalog_asset}.bundle.zst"
+        fi
       fi
     fi
   else

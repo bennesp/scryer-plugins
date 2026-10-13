@@ -26,7 +26,7 @@ curl() {
   local destination="" url=""
   while (( $# > 0 )); do
     case "$1" in
-      -o|--proto) [[ "$1" == -o ]] && destination="$2"; shift 2 ;;
+      -o|--proto|--connect-timeout|--max-time) [[ "$1" == -o ]] && destination="$2"; shift 2 ;;
       -*) shift ;;
       *) url="$1"; shift ;;
     esac
@@ -64,6 +64,26 @@ gh() {
     if [[ "${args[$index]}" == --dir ]]; then destination="${args[$((index + 1))]}"; fi
   done
   case "$*" in
+    "api --paginate repos/example/plugins/releases?per_page=100")
+      # Two pages, as gh prints them: a generation release carrying the
+      # generation-9 master, and the redirect release carrying only redirects.
+      if [[ "$MODE" == override_generation ]]; then
+        printf '[{"tag_name":"plugins-v3/release/1700000000-abcdef012345","assets":[{"name":"catalog-v3.9.repair.min.json.zst"},{"name":"catalog-v3.9.repair.min.json.zst.bundle.zst"}]}]'
+        printf '[{"tag_name":"catalog/v3","assets":[{"name":"catalog-v3.modern.redirect.json"}]}]'
+      else
+        printf '[{"tag_name":"catalog/v3","assets":[{"name":"catalog-v3.modern.redirect.json"}]}]'
+      fi
+      ;;
+    "release download plugins-v3/release/1700000000-abcdef012345 "*)
+      [[ "$MODE" == override_generation ]] || return 1
+      printf 'catalog' > "$destination/catalog-v3.9.repair.min.json.zst"
+      printf 'sig' > "$destination/catalog-v3.9.repair.min.json.zst.bundle.zst"
+      ;;
+    "release download catalog/v3 "*catalog-v3.6.snapshot.min.json.zst*)
+      [[ "$MODE" == override_snapshot ]] || return 1
+      printf 'catalog' > "$destination/catalog-v3.6.snapshot.min.json.zst"
+      printf 'sig' > "$destination/catalog-v3.6.snapshot.min.json.zst.bundle.zst"
+      ;;
     *catalog-v3.modern.redirect.json*)
       [[ "$MODE" != mirror_unavailable ]] || return 1
       local version=7 name=full.json.zst
@@ -180,6 +200,25 @@ class CatalogMergeBaseTests(unittest.TestCase):
         self.assertIn(f"curl {MIRROR}/full.json.zst\n", calls)
         self.assertNotIn("gh ", calls)
         self.assertIn("ready full.json.zst base full.json.zst", calls)
+
+    def test_historical_override_recovers_from_its_generation_release(self):
+        # The R2 copy of a post-migration historical master is gone; its
+        # GitHub mirror lives on the trigger-backed generation release.
+        result, calls = self.run_selection("override_generation", override="catalog-v3.9.repair.min.json.zst")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"curl {CDN}/9/catalog-v3.9.repair.min.json.zst\n", calls)
+        self.assertIn("gh api --paginate repos/example/plugins/releases?per_page=100\n", calls)
+        self.assertIn("gh release download plugins-v3/release/1700000000-abcdef012345 ", calls)
+        self.assertNotIn("gh release download catalog/v3", calls)
+        self.assertIn("ready catalog-v3.9.repair.min.json.zst base full.json.zst", calls)
+
+    def test_historical_override_without_generation_release_uses_the_redirect_release(self):
+        # A pre-generation snapshot is only on the redirect release.
+        result, calls = self.run_selection("override_snapshot", override="catalog-v3.6.snapshot.min.json.zst")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("gh api --paginate", calls)
+        self.assertIn("gh release download catalog/v3 ", calls)
+        self.assertIn("ready catalog-v3.6.snapshot.min.json.zst base full.json.zst", calls)
 
     def test_operator_override_rejects_paths(self):
         result, calls = self.run_selection("override", override="../escape.json.zst")

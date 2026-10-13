@@ -145,9 +145,27 @@ jobs:
           install -d xtask/target/debug
           install -m 0755 xtask-artifact/xtask xtask/target/debug/xtask
 
-      # Only the plugins that compile C sources need this. Every other official
-      # plugin — including the migrated `wasm32-wasip2` components — builds
-      # from pure Rust and needs nothing but the rustup target above.
+      - name: Install packaging tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y zstd
+          readonly wasm_tools_version='1.253.0'
+          readonly wasm_tools_archive="wasm-tools-${wasm_tools_version}-x86_64-linux.tar.gz"
+          readonly wasm_tools_sha256='4e2898f7ca3bd0536218ed9b7b36ff7b86954c57ae0e6272fde69728cbe01088'
+          readonly wasm_tools_root="${RUNNER_TEMP}/wasm-tools-${wasm_tools_version}"
+          readonly wasm_tools_url="https://github.com/bytecodealliance/wasm-tools/releases/download/v${wasm_tools_version}/${wasm_tools_archive}"
+          curl -fsSL "$wasm_tools_url" -o "${RUNNER_TEMP}/${wasm_tools_archive}"
+          printf '%s  %s\n' "$wasm_tools_sha256" "${RUNNER_TEMP}/${wasm_tools_archive}" | sha256sum --check --strict
+          mkdir "$wasm_tools_root"
+          tar -xzf "${RUNNER_TEMP}/${wasm_tools_archive}" -C "$wasm_tools_root" --strip-components=1
+          test -x "$wasm_tools_root/wasm-tools"
+          "$wasm_tools_root/wasm-tools" --version
+          zstd --version
+          echo "$wasm_tools_root" >> "$GITHUB_PATH"
+
+      # Only plugins that compile C sources need the additional WASI SDK.
       - name: Install WASI SDK for native plugin libraries
         if: ${{ matrix.plugin_id == 'enhanced-subtitle-sync' || matrix.plugin_id == 'archive-extraction' }}
         shell: bash

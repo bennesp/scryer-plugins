@@ -266,6 +266,14 @@ async fn search(request: sdk::PluginSearchRequest) -> FnResult<sdk::PluginSearch
 /// Anything else is reported as unsupported so the host can keep its own
 /// fallbacks.
 async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    if request.action == "resolve_network_endpoints" {
+        let (definition, config) = load_definition_and_config().map_err(Error::msg)?;
+        let origins =
+            runtime::resolve_network_endpoints(&definition, &config).map_err(Error::msg)?;
+        return Ok(PluginActionResponse {
+            payload: serde_json::json!({ "origins": origins }),
+        });
+    }
     let action = match request.action.as_str() {
         "checkCaptcha" | "check_captcha" => EngineAction::CheckCaptcha,
         "grab" => EngineAction::Grab(action_url(&request.payload).map_err(Error::msg)?),
@@ -336,7 +344,12 @@ fn load_definition_and_config() -> Result<(Definition, BTreeMap<String, String>)
     let definition_yaml = load_definition_source()?;
     let definition = parse_definition(&definition_yaml)?;
     let mut config = BTreeMap::new();
-    for key in HOST_CONFIG_KEYS {
+    for key in HOST_CONFIG_KEYS.into_iter().chain(
+        definition
+            .settings
+            .iter()
+            .map(|setting| setting.name.as_str()),
+    ) {
         if let Some(value) = host_config(key)?
             && !value.trim().is_empty()
         {
@@ -486,6 +499,11 @@ search:
         assert_eq!(indexer.provider_type, "cardigann");
         assert!(indexer.allowed_hosts.is_empty());
         assert!(indexer.capabilities.search);
+        let wire: Value = serde_json::from_slice(&descriptor_bytes()).unwrap();
+        assert_eq!(
+            wire["provider"]["capabilities"]["resolve_network_endpoints"],
+            true
+        );
         assert_eq!(
             indexer
                 .config_fields
@@ -817,8 +835,45 @@ search:
     }
 }
 
-scryer_plugin_pdk::scryer_indexer_component_main!(
-    descriptor = build_descriptor,
-    search = search,
-    action = action,
-);
+// Advertise the host's optional endpoint capability through the existing JSON
+// channel until the published SDK includes the field. Keep this adapter local
+// so other plugins continue using the unchanged PDK entrypoint.
+fn descriptor_bytes() -> Vec<u8> {
+    let mut value = serde_json::to_value(build_descriptor()).expect("JSON descriptor");
+    value["provider"]["capabilities"]["resolve_network_endpoints"] = Value::Bool(true);
+    serde_json::to_vec(&value).expect("JSON descriptor")
+}
+
+fn install_component_runtime() {
+    component::install_config_get();
+    component::install_log();
+    component::install_indexer_runtime();
+}
+
+struct CardigannComponent;
+
+impl component::Guest for CardigannComponent {
+    fn describe() -> Vec<u8> {
+        install_component_runtime();
+        descriptor_bytes()
+    }
+
+    async fn search(request: Vec<u8>) -> Result<Vec<u8>, component::InvocationError> {
+        install_component_runtime();
+        component::dispatch_search(request, search).await
+    }
+
+    async fn search_plan(request: Vec<u8>) -> Result<Vec<u8>, component::InvocationError> {
+        install_component_runtime();
+        let parallelism = component::strategy_plan_parallelism(&build_descriptor())
+            .ok_or(component::InvocationError::InvalidResponse)?;
+        component::dispatch_search_plan(request, parallelism, search).await
+    }
+
+    async fn action(request: Vec<u8>) -> Result<Vec<u8>, component::InvocationError> {
+        install_component_runtime();
+        component::dispatch_action(request, action).await
+    }
+}
+
+component::export!(CardigannComponent with_types_in component);

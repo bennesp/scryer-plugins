@@ -86,7 +86,11 @@ struct RpcResponse {
 
 #[derive(Debug, Default, Deserialize)]
 struct SessionConfig {
-    #[serde(default, rename = "rpc-version")]
+    #[serde(
+        default,
+        rename = "rpc-version",
+        deserialize_with = "deserialize_rpc_version"
+    )]
     rpc_version: Option<String>,
     #[serde(default)]
     version: Option<String>,
@@ -100,6 +104,24 @@ struct SessionConfig {
     idle_seeding_limit_enabled: Option<bool>,
     #[serde(default, rename = "idle-seeding-limit")]
     idle_seeding_limit: Option<i64>,
+}
+
+fn deserialize_rpc_version<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Version {
+        Number(u64),
+        Text(String),
+    }
+    Ok(
+        Option::<Version>::deserialize(deserializer)?.map(|version| match version {
+            Version::Number(value) => value.to_string(),
+            Version::Text(value) => value,
+        }),
+    )
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1995,6 +2017,44 @@ fn is_localhost_url(url: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_protocol_accepts_integer_string_and_absent_values() {
+        for value in [serde_json::json!(19), serde_json::json!("19")] {
+            let session: SessionConfig = serde_json::from_value(serde_json::json!({
+                "rpc-version": value, "rpc-version-semver": "6.0.1",
+                "version": "4.1.3 (synthetic)", "download-dir": "/downloads",
+                "seedRatioLimit": 2.0, "seedRatioLimited": true
+            }))
+            .unwrap();
+            assert_eq!(session.rpc_version.as_deref(), Some("19"));
+            assert_eq!(session.version.as_deref(), Some("4.1.3 (synthetic)"));
+            assert!(session_supports_labels(&session));
+        }
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"rpc-version": null}),
+        ] {
+            assert!(
+                serde_json::from_value::<SessionConfig>(value)
+                    .unwrap()
+                    .rpc_version
+                    .is_none()
+            );
+        }
+        for value in [
+            serde_json::json!(-1),
+            serde_json::json!(19.0),
+            serde_json::json!(true),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<SessionConfig>(serde_json::json!({"rpc-version": value}))
+                    .is_err()
+            );
+        }
+    }
 
     fn base_config() -> TransmissionConfig {
         TransmissionConfig {

@@ -10,8 +10,85 @@ pub fn render(input: &str, variables: &Variables) -> Result<String, String> {
     render_with_current(input, variables, None, false)
 }
 
+/// Authority templates may depend only on configuration available at startup.
+pub fn render_endpoint_authority(input: &str, variables: &Variables) -> Result<String, String> {
+    let mut remainder = input;
+    while let Some((_, tag)) = remainder.split_once("{{") {
+        let (expression, rest) = tag
+            .split_once("}}")
+            .ok_or("unterminated endpoint template")?;
+        for token in tokenize(expression.trim().trim_matches('-').trim())? {
+            if (token.starts_with('.') || token.starts_with('$'))
+                && (!variables.contains_key(&token)
+                    || !(token.starts_with(".Config.")
+                        || matches!(token.as_str(), ".True" | ".False")))
+            {
+                return Err("Endpoint authority requires an unavailable runtime value; use a configured hostname".into());
+            }
+        }
+        remainder = rest;
+    }
+    render(input, variables)
+}
+
 pub fn render_search_path(input: &str, variables: &Variables) -> Result<String, String> {
-    render_with_current(input, variables, None, true)
+    // This renderer also serves raw query values and relative path branches.
+    // Only a resolvable URL authority receives unescaped expansion.
+    let authority = endpoint_authority_prefix(input).unwrap_or("");
+    let mut output = match render_endpoint_authority(authority, variables) {
+        Ok(output) => output,
+        Err(_) => return render_with_current(input, variables, None, true),
+    };
+    if !output.to_ascii_lowercase().starts_with("http://")
+        && !output.to_ascii_lowercase().starts_with("https://")
+        && !output.starts_with("//")
+    {
+        return render_with_current(input, variables, None, true);
+    }
+    output.push_str(&render_with_current(
+        &input[authority.len()..],
+        variables,
+        None,
+        true,
+    )?);
+    Ok(output)
+}
+
+/// Find the authority without evaluating query-dependent path templates.
+pub fn endpoint_authority_prefix(endpoint: &str) -> Result<&str, String> {
+    if endpoint.starts_with("{{ if ") && !endpoint.contains("://") && !endpoint.contains("//") {
+        return Ok("");
+    }
+    let lowercase = endpoint.to_ascii_lowercase();
+    let start = if let Some(rest) = lowercase.strip_prefix("https://") {
+        endpoint.len() - rest.len()
+    } else if let Some(rest) = lowercase.strip_prefix("http://") {
+        endpoint.len() - rest.len()
+    } else if endpoint.starts_with("//") {
+        2
+    } else if endpoint.starts_with("{{") {
+        0
+    } else if endpoint
+        .split(['/', '?', '#'])
+        .next()
+        .is_some_and(|first| first.contains(':'))
+    {
+        return Err("Endpoint scheme must be HTTP(S)".into());
+    } else {
+        return Ok("");
+    };
+    let mut cursor = start;
+    while cursor < endpoint.len() {
+        let rest = &endpoint[cursor..];
+        if rest.starts_with("{{") {
+            cursor += rest.find("}}").ok_or("Unterminated endpoint template")? + 2;
+        } else if rest.starts_with(['/', '?', '#']) {
+            return Ok(&endpoint[..cursor]);
+        } else {
+            cursor += rest.chars().next().expect("nonempty suffix").len_utf8();
+        }
+    }
+    Ok(endpoint)
 }
 
 fn render_with_current(
@@ -522,6 +599,41 @@ mod tests {
                 "{expression}"
             );
         }
+    }
+
+    #[test]
+    fn network_endpoint_ports_and_query_values_render_separately() {
+        let vars = Variables::from([
+            (
+                ".Config.apiurl".into(),
+                Value::String("api.example:8443".into()),
+            ),
+            (".Keywords".into(), Value::String("a/b & c".into())),
+        ]);
+        assert_eq!(
+            render_search_path(
+                "https://{{ .Config.apiurl }}/search?q={{ .Keywords }}",
+                &vars
+            )
+            .unwrap(),
+            "https://api.example:8443/search?q=a%2Fb%20%26%20c"
+        );
+        assert_eq!(
+            render_search_path("{{ .Keywords }}/search", &vars).unwrap(),
+            "a%2Fb%20%26%20c/search"
+        );
+        assert_eq!(
+            render_search_path("q=urn:{{ .Keywords }}", &vars).unwrap(),
+            "q=urn:a%2Fb%20%26%20c"
+        );
+        assert_eq!(
+            render_search_path(
+                "{{ if .Keywords }}search/{{ .Keywords }}{{ else }}recent{{ end }}",
+                &vars
+            )
+            .unwrap(),
+            "search/a%2Fb%20%26%20c"
+        );
     }
 
     #[test]

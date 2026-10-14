@@ -1505,6 +1505,76 @@ fn resolve_url(
         .map_err(|error| format!("could not resolve `{value}` against `{base}`: {error}"))
 }
 
+pub fn resolve_network_endpoints(
+    definition: &Definition,
+    config: &BTreeMap<String, String>,
+) -> Result<Vec<String>, String> {
+    let variables = base_variables(definition, config);
+    let base = config
+        .get("base_url")
+        .or_else(|| definition.links.first())
+        .ok_or("Missing base URL")?;
+    let base = Url::parse(base).map_err(|_| "Invalid base URL")?;
+    let mut endpoints: Vec<&str> = definition
+        .search
+        .paths
+        .iter()
+        .map(|path| path.path.as_str())
+        .collect();
+    if let Some(login) = &definition.login {
+        endpoints.push(&login.path);
+        endpoints.extend(login.submit_path.as_deref());
+        endpoints.extend(login.test.as_ref().and_then(|test| test.path.as_deref()));
+    }
+    if let Some(before) = definition
+        .download
+        .as_ref()
+        .and_then(|download| download.before.as_ref())
+    {
+        let authority = crate::template::endpoint_authority_prefix(&before.path)?;
+        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
+            endpoints.push(&before.path);
+        }
+    }
+    // A literal download template is an endpoint declaration. Extracted links
+    // and selector/filter output remain subject to the existing host policy.
+    if let Some(field) = definition.search.fields.get("download")
+        && let Some(value) = field.text.as_ref().and_then(serde_yaml::Value::as_str)
+    {
+        let authority = crate::template::endpoint_authority_prefix(value)?;
+        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
+            endpoints.push(value);
+        }
+    }
+    let mut origins = std::collections::BTreeSet::new();
+    origins.insert(base.origin().ascii_serialization());
+    for endpoint in endpoints {
+        if endpoint.starts_with("magnet:") {
+            continue;
+        }
+        let prefix = crate::template::endpoint_authority_prefix(endpoint)?;
+        let rendered = crate::template::render_endpoint_authority(prefix, &variables)?;
+        if rendered.contains(['\\', '*', '@']) || rendered.chars().any(char::is_whitespace) {
+            return Err("Invalid configured endpoint authority".into());
+        }
+        let url = base
+            .join(&rendered)
+            .map_err(|_| "Invalid configured endpoint authority")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+        {
+            return Err("Endpoint authorities must be HTTP(S) URLs without credentials".into());
+        }
+        origins.insert(url.origin().ascii_serialization());
+        if origins.len() > 64 {
+            return Err("Too many configured endpoint origins".into());
+        }
+    }
+    Ok(origins.into_iter().collect())
+}
+
 fn base_variables(definition: &Definition, config: &BTreeMap<String, String>) -> Variables {
     let mut variables = Variables::new();
     variables.insert(".True".to_string(), Value::String("True".to_string()));
@@ -4036,6 +4106,105 @@ mod tests {
     use scryer_plugin_sdk::PluginSearchContext;
 
     use super::*;
+
+    #[test]
+    fn network_endpoints_skip_result_derived_download_links() {
+        for id in ["hdforever", "nyaasi", "pwtorrents", "hdturk", "tmghub"] {
+            let definition =
+                parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
+            let origins = resolve_network_endpoints(&definition, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+            assert!(
+                origins.contains(
+                    &Url::parse(&definition.links[0])
+                        .unwrap()
+                        .origin()
+                        .ascii_serialization()
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn network_endpoints_resolve_reported_definition_defaults() {
+        for (id, host) in [
+            ("abnormal-api", "api.abn.lol"),
+            ("animetosho-xyz", "feed.animetosho.xyz"),
+            ("thepiratebay", "apibay.org"),
+            ("v3x", "api.v3x.club"),
+            ("yggreborn-api", "api.yggreborn.org"),
+            ("yts", "movies-api.accel.li"),
+        ] {
+            let definition =
+                parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
+            let origins = resolve_network_endpoints(&definition, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+            assert!(
+                origins.contains(&format!("https://{host}")),
+                "{id}: {origins:?}"
+            );
+            let config = BTreeMap::from([("apiurl".into(), "alternate.example:8443".into())]);
+            let origins = resolve_network_endpoints(&definition, &config).unwrap();
+            assert!(
+                origins.contains(&"https://alternate.example:8443".into()),
+                "{id}"
+            );
+            assert!(
+                !origins.contains(&format!("https://{host}")),
+                "stale host for {id}"
+            );
+        }
+    }
+
+    #[test]
+    fn network_endpoints_custom_relative_and_unavailable_authorities() {
+        let mut definition = parse_definition(
+            &crate::baked::definition_yaml("thepiratebay")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        definition.search.fields.clear();
+        definition.search.paths[0].path = "/search/{{ .Keywords }}".into();
+        assert_eq!(
+            resolve_network_endpoints(&definition, &BTreeMap::new()).unwrap(),
+            vec![
+                Url::parse(&definition.links[0])
+                    .unwrap()
+                    .origin()
+                    .ascii_serialization()
+            ]
+        );
+        definition.search.paths[0].path =
+            "{{ if .Keywords }}search/{{ .Keywords }}{{ else }}recent{{ end }}".into();
+        assert_eq!(
+            resolve_network_endpoints(&definition, &BTreeMap::new())
+                .unwrap()
+                .len(),
+            1
+        );
+        for path in [
+            "https://{{ .Result.host }}/file",
+            "https://{{ .Keywords }}/search",
+            "https://{{ .Config.missing }}/search",
+            "https://user:password@example.test/path",
+            "ftp://example.test/path",
+            "https://*.example.test/path",
+        ] {
+            definition.search.paths[0].path = path.into();
+            assert!(
+                resolve_network_endpoints(&definition, &BTreeMap::new()).is_err(),
+                "{path}"
+            );
+        }
+        definition.search.paths[0].path =
+            "//alternate.example:8080/{{ if .Keywords }}search{{ else }}recent{{ end }}".into();
+        assert!(
+            resolve_network_endpoints(&definition, &BTreeMap::new())
+                .unwrap()
+                .contains(&"https://alternate.example:8080".into())
+        );
+    }
 
     /// Drive one engine future to completion. Every mock boundary below
     /// resolves immediately, so a bare poll loop is enough and keeps the crate

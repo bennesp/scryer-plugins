@@ -4,7 +4,7 @@
   "name": "Anime Scoring Pack",
   "description": "Community-curated rules for anime collectors",
   "author": "scryer-media",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "rules": [
     {
       "id": "prefer-subsplease",
@@ -12,7 +12,7 @@
       "description": "SubsPlease provides fast, consistent CR rips with standard naming",
       "category": "Anime",
       "appliedFacets": ["anime"],
-      "regoSource": "import rego.v1\n\nscore_entry[\"subsplease_bonus\"] := 400 if {\n    lower(input.release.release_group) == \"subsplease\"\n}"
+      "regoSource": "import rego.v1\n\nscore_entry[\"subsplease_bonus\"] := 400 if {\n    is_string(input.release.release_group)\n    lower(input.release.release_group) == \"subsplease\"\n}"
     },
     {
       "id": "prefer-erai-raws",
@@ -20,7 +20,7 @@
       "description": "Erai-raws provides multi-sub releases from multiple streaming sources",
       "category": "Anime",
       "appliedFacets": ["anime"],
-      "regoSource": "import rego.v1\n\nscore_entry[\"erai_bonus\"] := 350 if {\n    lower(input.release.release_group) == \"erai-raws\"\n}"
+      "regoSource": "import rego.v1\n\nscore_entry[\"erai_bonus\"] := 350 if {\n    is_string(input.release.release_group)\n    lower(input.release.release_group) == \"erai-raws\"\n}"
     },
     {
       "id": "block-mini-encodes",
@@ -28,7 +28,7 @@
       "description": "Mini encodes sacrifice quality for size — block known groups",
       "category": "Anime",
       "appliedFacets": ["anime"],
-      "regoSource": "import rego.v1\n\nmini_groups := {\"judas\", \"bonkai77\", \"mini-encode\", \"minifreeza\", \"smallsizedanime\"}\n\nscore_entry[\"block_mini_encode\"] := scryer.block_score() if {\n    group := lower(input.release.release_group)\n    mini_groups[group]\n}"
+      "regoSource": "import rego.v1\n\nmini_groups := {\"judas\", \"bonkai77\", \"mini-encode\", \"minifreeza\", \"smallsizedanime\"}\n\nscore_entry[\"block_mini_encode\"] := scryer.block_score() if {\n    is_string(input.release.release_group)\n    group := lower(input.release.release_group)\n    mini_groups[group]\n}"
     },
     {
       "id": "prefer-batch-releases",

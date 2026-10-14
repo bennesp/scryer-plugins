@@ -227,6 +227,16 @@ fn config_fields() -> Vec<ConfigFieldDef> {
             Some("Delivers the message with no notification sound."),
         ),
         field(
+            "compact",
+            "Compact Messages",
+            ConfigFieldType::Bool,
+            false,
+            Some("false"),
+            Some(
+                "Show the heading and summary without detail lines. Selected metadata links are retained.",
+            ),
+        ),
+        field(
             "include_app_name_in_title",
             "Include App Name In Title",
             ConfigFieldType::Bool,
@@ -293,6 +303,7 @@ struct Settings {
     chat_id: String,
     topic_id: Option<i64>,
     send_silently: bool,
+    compact: bool,
     include_app_name_in_title: bool,
     metadata_links: Vec<String>,
     link_preview: String,
@@ -319,6 +330,7 @@ impl Settings {
             chat_id,
             topic_id,
             send_silently: config_bool("send_silently"),
+            compact: config_bool("compact"),
             include_app_name_in_title: config_bool("include_app_name_in_title"),
             metadata_links,
             link_preview,
@@ -574,7 +586,9 @@ fn build_lines(req: &PluginNotificationRequest, settings: &Settings) -> Vec<Line
         lines.push(Line::Plain(message.to_string()));
     }
 
-    lines.extend(detail_lines(req));
+    if !settings.compact {
+        lines.extend(detail_lines(req));
+    }
 
     if req.is_test {
         lines.push(Line::Link {
@@ -1503,6 +1517,7 @@ mod tests {
             chat_id: "-1001".to_string(),
             topic_id: None,
             send_silently: false,
+            compact: false,
             include_app_name_in_title: false,
             metadata_links: Vec::new(),
             link_preview: LINK_PREVIEW_NONE.to_string(),
@@ -1612,6 +1627,14 @@ mod tests {
         }
         assert!(keys.contains(&"metadata_links"));
         assert!(keys.contains(&"link_preview"));
+        let compact = notification
+            .config_fields
+            .iter()
+            .find(|field| field.key == "compact")
+            .unwrap();
+        assert!(matches!(compact.field_type, ConfigFieldType::Bool));
+        assert_eq!(compact.default_value.as_deref(), Some("false"));
+        assert!(!compact.required);
 
         let metadata = notification
             .config_fields
@@ -1827,6 +1850,32 @@ mod tests {
         assert!(text.contains("<b>Indexer:</b> Example Indexer"), "{text}");
         assert!(text.contains("<b>Size:</b> 2 GB"), "{text}");
         assert!(text.contains("<b>Client:</b> Weaver"), "{text}");
+    }
+
+    #[test]
+    fn compact_messages_keep_summary_and_links_without_detail_lines() {
+        let mut req = request(NotificationEventType::Grab);
+        req.title = Some(series_title());
+        req.release = Some(PluginNotificationRelease {
+            source_title: Some("Example.Show.S01E01.1080p.WEB-DL".to_string()),
+            quality: Some("WEBDL-1080p".to_string()),
+            ..PluginNotificationRelease::default()
+        });
+        let mut settings = settings();
+        settings.compact = true;
+        settings.metadata_links = vec!["imdb".to_string()];
+        settings.link_preview = "imdb".to_string();
+        let (payload, warnings) = build_payload(&req, &settings);
+        let text = text_of(&payload);
+        assert!(text.contains(&html_escape(&req.summary_message)));
+        assert!(text.starts_with("<b>Grabbed:"));
+        assert!(!text.contains("<b>Quality:</b>"));
+        assert!(!text.contains("<b>Release:</b>"));
+        assert!(text.contains("https://www.imdb.com/title/tt0903747"));
+        assert_eq!(payload["link_preview_options"]["is_disabled"], false);
+        assert!(warnings.is_empty());
+        settings.compact = false;
+        assert!(text_of(&build_payload(&req, &settings).0).contains("<b>Quality:</b>"));
     }
 
     #[test]

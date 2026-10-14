@@ -1538,7 +1538,10 @@ pub fn resolve_network_endpoints(
     if let Some(field) = definition.search.fields.get("download")
         && let Some(value) = field.text.as_ref().and_then(serde_yaml::Value::as_str)
     {
-        endpoints.push(value);
+        let authority = crate::template::endpoint_authority_prefix(value)?;
+        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
+            endpoints.push(value);
+        }
     }
     let mut origins = std::collections::BTreeSet::new();
     origins.insert(base.origin().ascii_serialization());
@@ -4100,6 +4103,24 @@ mod tests {
     use scryer_plugin_sdk::PluginSearchContext;
 
     use super::*;
+
+    #[test]
+    fn network_endpoints_skip_result_derived_download_links() {
+        for id in ["hdforever", "nyaasi", "pwtorrents"] {
+            let definition =
+                parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
+            let origins = resolve_network_endpoints(&definition, &BTreeMap::new())
+                .unwrap_or_else(|error| panic!("{id}: {error}"));
+            assert!(
+                origins.contains(
+                    &Url::parse(&definition.links[0])
+                        .unwrap()
+                        .origin()
+                        .ascii_serialization()
+                )
+            );
+        }
+    }
 
     #[test]
     fn network_endpoints_resolve_reported_definition_defaults() {

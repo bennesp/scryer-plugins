@@ -129,70 +129,83 @@ fn refresh_requests_stay_scoped_and_preserve_move_fallbacks() {
             vec![("1", Some("/media/TV/Example"))],
         ),
     ];
-    for (path, old, explicit, mapped, expected) in cases {
-        let mut suite = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "plex")
-            .wasm("plex_notification.wasm")
-            .config("base_url", "http://plex.test.invalid:32400")
-            .config("update_library", "true")
-            .config("auth_token", "synthetic-token");
-        if explicit {
-            suite = suite.config("section_ids", "9");
-        }
-        if mapped {
-            suite = suite
-                .config("map_from", "/downloads")
-                .config("map_to", "/media/TV");
-        }
-        let mut script = suite.script();
-        script.http = HttpScript::Routed(vec![
-            HttpRoute::contains("/refresh?", HttpReply::ok("{}")),
-            HttpRoute::contains("/library/sections?", HttpReply::ok(sections)),
-        ]);
-        let mut request = test_request(if old.is_some() {
-            NotificationEventType::TitleMoved
-        } else {
-            NotificationEventType::Download
-        });
-        request.title.as_mut().unwrap().facet = "series".into();
-        request.title.as_mut().unwrap().path = path.map(str::to_owned);
-        request.file = None;
-        request.media_files.clear();
-        if let Some(old) = old {
-            request.title_move = Some(PluginNotificationTitleMove {
-                source_path: Some(old.into()),
-                destination_path: path.map(str::to_owned),
-                ..Default::default()
+    for version in ["1.20.0.3125-build", "1.19.9.9999", "unknown"] {
+        for (path, old, explicit, mapped, expected) in cases.clone() {
+            let expected = if version == "1.20.0.3125-build" {
+                expected
+            } else {
+                let mut ids = std::collections::BTreeSet::new();
+                expected
+                    .into_iter()
+                    .filter_map(|(id, _)| ids.insert(id).then_some((id, None)))
+                    .collect()
+            };
+            let mut suite = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "plex")
+                .wasm("plex_notification.wasm")
+                .config("base_url", "http://plex.test.invalid:32400")
+                .config("update_library", "true")
+                .config("auth_token", "synthetic-token");
+            if explicit {
+                suite = suite.config("section_ids", "9");
+            }
+            if mapped {
+                suite = suite
+                    .config("map_from", "/downloads")
+                    .config("map_to", "/media/TV");
+            }
+            let mut script = suite.script();
+            let identity = serde_json::json!({"MediaContainer": {"version": version}}).to_string();
+            script.http = HttpScript::Routed(vec![
+                HttpRoute::contains("/identity?", HttpReply::ok(&identity)),
+                HttpRoute::contains("/refresh?", HttpReply::ok("{}")),
+                HttpRoute::contains("/library/sections?", HttpReply::ok(sections)),
+            ]);
+            let mut request = test_request(if old.is_some() {
+                NotificationEventType::TitleMoved
+            } else {
+                NotificationEventType::Download
             });
-        }
-        let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
-        let result = call_notification(
-            &mut store,
-            &plugin,
-            PluginNotificationCommand::Send(request),
-        );
-        let PluginNotificationCommandResult::Send(PluginResult::Ok(response)) = result else {
-            panic!("{result:?}")
-        };
-        assert!(response.success, "{response:?}");
-        let urls: Vec<_> = store
-            .data()
-            .script
-            .urls
-            .iter()
-            .filter(|url| url.contains("/refresh?"))
-            .collect();
-        assert_eq!(urls.len(), expected.len(), "{urls:?}");
-        for (url, (section, path)) in urls.iter().zip(expected) {
-            assert!(
-                url.contains(&format!("/sections/{section}/refresh?")),
-                "{url}"
+            request.title.as_mut().unwrap().facet = "series".into();
+            request.title.as_mut().unwrap().path = path.map(str::to_owned);
+            request.file = None;
+            request.media_files.clear();
+            if let Some(old) = old {
+                request.title_move = Some(PluginNotificationTitleMove {
+                    source_path: Some(old.into()),
+                    destination_path: path.map(str::to_owned),
+                    ..Default::default()
+                });
+            }
+            let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+            let result = call_notification(
+                &mut store,
+                &plugin,
+                PluginNotificationCommand::Send(request),
             );
-            match path {
-                Some(path) => assert!(
-                    url.contains(&format!("path={}", path.replace('/', "%2F"))),
+            let PluginNotificationCommandResult::Send(PluginResult::Ok(response)) = result else {
+                panic!("{result:?}")
+            };
+            assert!(response.success, "{response:?}");
+            let urls: Vec<_> = store
+                .data()
+                .script
+                .urls
+                .iter()
+                .filter(|url| url.contains("/refresh?"))
+                .collect();
+            assert_eq!(urls.len(), expected.len(), "{urls:?}");
+            for (url, (section, path)) in urls.iter().zip(expected) {
+                assert!(
+                    url.contains(&format!("/sections/{section}/refresh?")),
                     "{url}"
-                ),
-                None => assert!(!url.contains("path="), "{url}"),
+                );
+                match path {
+                    Some(path) => assert!(
+                        url.contains(&format!("path={}", path.replace('/', "%2F"))),
+                        "{url}"
+                    ),
+                    None => assert!(!url.contains("path="), "{url}"),
+                }
             }
         }
     }

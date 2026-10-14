@@ -189,6 +189,13 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
             }
         }
     }
+    if targets.iter().any(|target| target.path.is_some()) && !supports_partial_refresh() {
+        let mut sections = std::collections::BTreeSet::new();
+        for target in &mut targets {
+            target.path = None;
+        }
+        targets.retain(|target| sections.insert(target.section_id.clone()));
+    }
     let mut responses = Vec::new();
     for target in targets {
         responses.push(refresh_section(&target.section_id, target.path.as_deref()));
@@ -397,6 +404,38 @@ struct PathMapping {
     source_prefix: String,
     source_prefix_normalized: String,
     destination_prefix: String,
+}
+
+fn supports_partial_refresh() -> bool {
+    let url = append_query(
+        &format!("{}/identity", base_url()),
+        &plex_server_query_params(),
+    );
+    let request = HttpRequest::new(url)
+        .with_method("GET")
+        .with_header("Accept", "application/json");
+    let Ok(response) = http::request::<Vec<u8>>(&request, None) else {
+        return false;
+    };
+    if !(200..300).contains(&response.status_code()) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&response.body()) else {
+        return false;
+    };
+    value
+        .pointer("/MediaContainer/version")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(version_supports_partial_refresh)
+}
+
+fn version_supports_partial_refresh(version: &str) -> bool {
+    let core = version.split('-').next().unwrap_or_default();
+    let parts = core
+        .split('.')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>();
+    matches!(parts, Ok(parts) if parts.len() == 4 && parts.as_slice() >= [1, 20, 0, 3125].as_slice())
 }
 
 fn refresh_targets(

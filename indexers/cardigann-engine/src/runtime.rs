@@ -1531,7 +1531,10 @@ pub fn resolve_network_endpoints(
         .as_ref()
         .and_then(|download| download.before.as_ref())
     {
-        endpoints.push(&before.path);
+        let authority = crate::template::endpoint_authority_prefix(&before.path)?;
+        if crate::template::render_endpoint_authority(authority, &variables).is_ok() {
+            endpoints.push(&before.path);
+        }
     }
     // A literal download template is an endpoint declaration. Extracted links
     // and selector/filter output remain subject to the existing host policy.
@@ -4106,7 +4109,7 @@ mod tests {
 
     #[test]
     fn network_endpoints_skip_result_derived_download_links() {
-        for id in ["hdforever", "nyaasi", "pwtorrents"] {
+        for id in ["hdforever", "nyaasi", "pwtorrents", "hdturk", "tmghub"] {
             let definition =
                 parse_definition(&crate::baked::definition_yaml(id).unwrap().unwrap()).unwrap();
             let origins = resolve_network_endpoints(&definition, &BTreeMap::new())

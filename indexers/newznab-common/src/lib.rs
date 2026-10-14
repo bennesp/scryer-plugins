@@ -1447,7 +1447,7 @@ async fn execute_rss_search(
     let search_types = rss_search_types(req, search_caps.as_ref());
 
     log!(
-        LogLevel::Info,
+        LogLevel::Debug,
         "rss_search: fetching recent releases cat={} search_types={:?}",
         cat_str,
         search_types
@@ -1614,7 +1614,7 @@ async fn execute_rss_search(
                 rss_page_reaches_marker(marker, marker_published_at, &page_results)
             });
             log!(
-                LogLevel::Info,
+                LogLevel::Debug,
                 "rss_search: t={} page={} returned {} results reached_marker={}",
                 search_type,
                 page,
@@ -1639,7 +1639,7 @@ async fn execute_rss_search(
     }
 
     log!(
-        LogLevel::Info,
+        LogLevel::Debug,
         "rss_search: total {} results across {} search types",
         all_results.len(),
         search_types.len()

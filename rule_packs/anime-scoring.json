@@ -4,7 +4,7 @@
   "name": "Anime Scoring Pack",
   "description": "Community-curated rules for anime collectors",
   "author": "scryer-media",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "rules": [
     {
       "id": "prefer-subsplease",

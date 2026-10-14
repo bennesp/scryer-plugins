@@ -1,0 +1,30 @@
+use scryer_rules::*;
+use serde_json::Value;
+
+__SYNTHETIC_INPUT__
+
+#[test]
+fn anime_pack_null_and_known_groups() {
+    let pack: Value = serde_json::from_slice(&std::fs::read(std::env::var_os("ANIME_PACK").unwrap()).unwrap()).unwrap();
+    let cases: Value = serde_json::from_slice(&std::fs::read(std::env::var_os("ANIME_CASES").unwrap()).unwrap()).unwrap();
+    let policies: Vec<_> = pack["rules"].as_array().unwrap().iter().enumerate().map(|(index, rule)| {
+        let id = format!("anime_validation_{index}");
+        UserPolicy { rego_source: rewrite_package_declaration(rule["regoSource"].as_str().unwrap(), &id),
+            id, name: rule["id"].as_str().unwrap().into(), origin: PolicyOrigin::User, applied_facets: vec!["anime".into()] }
+    }).collect();
+    let engine = UserRulesEngine::build(&policies).unwrap();
+    let mut evaluator = engine.evaluator();
+    for case in cases.as_array().unwrap() {
+        let mut input = synthetic_test_input();
+        input.release.raw_title = case["title"].as_str().unwrap().into();
+        input.release.release_group = case["group"].as_str().map(str::to_owned);
+        input.release.has_release_group = input.release.release_group.is_some();
+        input.context.category = "anime".into();
+        input.context.media_type = "anime".into();
+        input.context.is_anime = true;
+        input.file = None;
+        let result = evaluator.evaluate(&input, "anime").unwrap();
+        assert!(result.errors.is_empty(), "{case}: {:?}", result.errors);
+        assert_eq!(result.entries.iter().map(|e| i64::from(e.delta)).sum::<i64>(), case["score"].as_i64().unwrap(), "{case}");
+    }
+}

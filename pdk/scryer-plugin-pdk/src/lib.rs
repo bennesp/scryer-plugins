@@ -231,7 +231,7 @@ macro_rules! scryer_indexer_component_main {
             ScryerIndexerComponent with_types_in $crate::component
         );
     };
-    (descriptor = $descriptor:path, search = $search:path, action = $action:path $(, resolve_network_endpoints = $resolve:expr)? $(,)?) => {
+    (descriptor = $descriptor:path, search = $search:path, action = $action:path $(,)?) => {
         struct ScryerIndexerComponent;
 
         impl $crate::component::Guest for ScryerIndexerComponent {
@@ -239,7 +239,7 @@ macro_rules! scryer_indexer_component_main {
                 $crate::component::install_config_get();
                 $crate::component::install_log();
                 $crate::component::install_indexer_runtime();
-                $crate::component::descriptor_bytes_with_endpoints($descriptor(), false $(|| $resolve)?)
+                $crate::component::descriptor_bytes($descriptor())
             }
 
             async fn search(

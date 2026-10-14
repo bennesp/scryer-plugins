@@ -380,7 +380,7 @@ fn select_plex_token(api_key: Option<String>, auth_token: Option<String>) -> Opt
     api_key.or(auth_token)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PlexRefreshTarget {
     section_id: String,
     path: Option<String>,
@@ -419,35 +419,31 @@ fn refresh_targets(
         return Err(Error::msg("Plex returned no matching library sections"));
     }
 
+    Ok(targets_for_sections(path, &sections))
+}
+
+fn targets_for_sections(path: Option<&str>, sections: &[PlexSection]) -> Vec<PlexRefreshTarget> {
     if let Some(path) = path {
-        let mut matching = sections.iter().filter(|section| section.matches_path(path));
-        let targets = matching
-            .by_ref()
-            .flat_map(|section| {
-                [
-                    PlexRefreshTarget {
-                        section_id: section.id.clone(),
-                        path: Some(path.to_string()),
-                    },
-                    PlexRefreshTarget {
-                        section_id: section.id.clone(),
-                        path: None,
-                    },
-                ]
+        let targets = sections
+            .iter()
+            .filter(|section| section.matches_path(path))
+            .map(|section| PlexRefreshTarget {
+                section_id: section.id.clone(),
+                path: Some(path.to_string()),
             })
             .collect::<Vec<_>>();
         if !targets.is_empty() {
-            return Ok(targets);
+            return targets;
         }
     }
 
-    Ok(sections
-        .into_iter()
+    sections
+        .iter()
         .map(|section| PlexRefreshTarget {
-            section_id: section.id,
+            section_id: section.id.clone(),
             path: None,
         })
-        .collect())
+        .collect()
 }
 
 fn plex_sections(section_types: &[&str]) -> Result<Vec<PlexSection>, Error> {
@@ -1352,34 +1348,44 @@ mod tests {
     }
 
     #[test]
-    fn matching_path_refresh_targets_include_section_fallback() {
-        let section = PlexSection {
-            id: "1".to_string(),
-            locations: vec!["/data/series".to_string()],
-        };
-        let path = "/data/series/Bluey (2018)/Season 01";
-        let targets = [section]
-            .iter()
-            .filter(|section| section.matches_path(path))
-            .flat_map(|section| {
-                [
+    fn matching_paths_refresh_only_the_matching_folder() {
+        let sections = vec![
+            PlexSection {
+                id: "1".into(),
+                locations: vec!["/data/series".into()],
+            },
+            PlexSection {
+                id: "2".into(),
+                locations: vec!["/data/other".into()],
+            },
+        ];
+        let path = "/data/series/Example Show/Season 01";
+        assert_eq!(
+            targets_for_sections(Some(path), &sections),
+            vec![PlexRefreshTarget {
+                section_id: "1".into(),
+                path: Some(path.into()),
+            }]
+        );
+        for path in [
+            None,
+            Some("/unmatched/Show"),
+            Some("/data/series-other/Show"),
+        ] {
+            assert_eq!(
+                targets_for_sections(path, &sections),
+                vec![
                     PlexRefreshTarget {
-                        section_id: section.id.clone(),
-                        path: Some(path.to_string()),
+                        section_id: "1".into(),
+                        path: None
                     },
                     PlexRefreshTarget {
-                        section_id: section.id.clone(),
-                        path: None,
+                        section_id: "2".into(),
+                        path: None
                     },
                 ]
-            })
-            .collect::<Vec<_>>();
-
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].section_id, "1");
-        assert_eq!(targets[0].path.as_deref(), Some(path));
-        assert_eq!(targets[1].section_id, "1");
-        assert_eq!(targets[1].path, None);
+            );
+        }
     }
 
     #[test]

@@ -67,3 +67,133 @@ fn assert_an_unknown_action_answers_empty_rather_than_trapping(
     };
     assert_eq!(response.payload, serde_json::json!({}));
 }
+
+#[test]
+fn refresh_requests_stay_scoped_and_preserve_move_fallbacks() {
+    use scryer_plugin_conformance::notification::test_request;
+    use scryer_plugin_conformance::{HttpReply, HttpRoute, HttpScript};
+    use scryer_plugin_sdk::PluginNotificationTitleMove;
+    let sections = r#"{"MediaContainer":{"Directory":[{"key":"1","type":"show","Location":[{"path":"/media/TV"}]},{"key":"2","type":"show","Location":[{"path":"/media/Other"}]},{"key":"3","type":"movie","Location":[{"path":"/media/TV"}]}]}}"#;
+    let cases = [
+        (
+            Some("/media/TV/Example"),
+            None,
+            false,
+            false,
+            vec![("1", Some("/media/TV/Example"))],
+        ),
+        (
+            Some("/unmatched/Example"),
+            None,
+            false,
+            false,
+            vec![("1", None), ("2", None)],
+        ),
+        (None, None, false, false, vec![("1", None), ("2", None)]),
+        (
+            Some("/media/TV/Example"),
+            None,
+            true,
+            false,
+            vec![("9", Some("/media/TV/Example"))],
+        ),
+        (
+            Some("/downloads/Example"),
+            None,
+            false,
+            true,
+            vec![("1", Some("/media/TV/Example"))],
+        ),
+        (
+            Some("/media/TV/Example"),
+            Some("/media/Other/Example"),
+            false,
+            false,
+            vec![
+                ("1", Some("/media/TV/Example")),
+                ("2", Some("/media/Other/Example")),
+            ],
+        ),
+        (
+            Some("/media/TV/Example"),
+            Some("/unmatched/Example"),
+            false,
+            false,
+            vec![("1", Some("/media/TV/Example"))],
+        ),
+        (
+            Some("/media/TV/Example"),
+            Some("/media/TV/Example"),
+            false,
+            false,
+            vec![("1", Some("/media/TV/Example"))],
+        ),
+    ];
+    for (path, old, explicit, mapped, expected) in cases {
+        let mut suite = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "plex")
+            .wasm("plex_notification.wasm")
+            .config("base_url", "http://plex.test.invalid:32400")
+            .config("update_library", "true")
+            .config("auth_token", "synthetic-token");
+        if explicit {
+            suite = suite.config("section_ids", "9");
+        }
+        if mapped {
+            suite = suite
+                .config("map_from", "/downloads")
+                .config("map_to", "/media/TV");
+        }
+        let mut script = suite.script();
+        script.http = HttpScript::Routed(vec![
+            HttpRoute::contains("/refresh?", HttpReply::ok("{}")),
+            HttpRoute::contains("/library/sections?", HttpReply::ok(sections)),
+        ]);
+        let mut request = test_request(if old.is_some() {
+            NotificationEventType::TitleMoved
+        } else {
+            NotificationEventType::Download
+        });
+        request.title.as_mut().unwrap().facet = "series".into();
+        request.title.as_mut().unwrap().path = path.map(str::to_owned);
+        request.file = None;
+        request.media_files.clear();
+        if let Some(old) = old {
+            request.title_move = Some(PluginNotificationTitleMove {
+                source_path: Some(old.into()),
+                destination_path: path.map(str::to_owned),
+                ..Default::default()
+            });
+        }
+        let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+        let result = call_notification(
+            &mut store,
+            &plugin,
+            PluginNotificationCommand::Send(request),
+        );
+        let PluginNotificationCommandResult::Send(PluginResult::Ok(response)) = result else {
+            panic!("{result:?}")
+        };
+        assert!(response.success, "{response:?}");
+        let urls: Vec<_> = store
+            .data()
+            .script
+            .urls
+            .iter()
+            .filter(|url| url.contains("/refresh?"))
+            .collect();
+        assert_eq!(urls.len(), expected.len(), "{urls:?}");
+        for (url, (section, path)) in urls.iter().zip(expected) {
+            assert!(
+                url.contains(&format!("/sections/{section}/refresh?")),
+                "{url}"
+            );
+            match path {
+                Some(path) => assert!(
+                    url.contains(&format!("path={}", path.replace('/', "%2F"))),
+                    "{url}"
+                ),
+                None => assert!(!url.contains("path="), "{url}"),
+            }
+        }
+    }
+}

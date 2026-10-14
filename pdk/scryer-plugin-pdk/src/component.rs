@@ -303,6 +303,20 @@ pub fn descriptor_bytes(descriptor: scryer_plugin_sdk::PluginDescriptor) -> Vec<
     serde_json::to_vec(&descriptor).unwrap_or_default()
 }
 
+/// Additive capability on the existing JSON descriptor, compatible with the
+/// published SDK until its next release includes this optional field.
+pub fn descriptor_bytes_with_endpoints(
+    descriptor: scryer_plugin_sdk::PluginDescriptor,
+    resolve: bool,
+) -> Vec<u8> {
+    if !resolve {
+        return descriptor_bytes(descriptor);
+    }
+    let mut value = serde_json::to_value(descriptor).expect("JSON descriptor");
+    value["provider"]["capabilities"]["resolve_network_endpoints"] = serde_json::Value::Bool(true);
+    serde_json::to_vec(&value).expect("JSON descriptor")
+}
+
 pub fn strategy_plan_parallelism(descriptor: &scryer_plugin_sdk::PluginDescriptor) -> Option<u32> {
     let scryer_plugin_sdk::ProviderDescriptor::Indexer(indexer) = &descriptor.provider else {
         return None;

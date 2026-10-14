@@ -266,6 +266,14 @@ async fn search(request: sdk::PluginSearchRequest) -> FnResult<sdk::PluginSearch
 /// Anything else is reported as unsupported so the host can keep its own
 /// fallbacks.
 async fn action(request: PluginActionRequest) -> FnResult<PluginActionResponse> {
+    if request.action == "resolve_network_endpoints" {
+        let (definition, config) = load_definition_and_config().map_err(Error::msg)?;
+        let origins =
+            runtime::resolve_network_endpoints(&definition, &config).map_err(Error::msg)?;
+        return Ok(PluginActionResponse {
+            payload: serde_json::json!({ "origins": origins }),
+        });
+    }
     let action = match request.action.as_str() {
         "checkCaptcha" | "check_captcha" => EngineAction::CheckCaptcha,
         "grab" => EngineAction::Grab(action_url(&request.payload).map_err(Error::msg)?),
@@ -336,7 +344,12 @@ fn load_definition_and_config() -> Result<(Definition, BTreeMap<String, String>)
     let definition_yaml = load_definition_source()?;
     let definition = parse_definition(&definition_yaml)?;
     let mut config = BTreeMap::new();
-    for key in HOST_CONFIG_KEYS {
+    for key in HOST_CONFIG_KEYS.into_iter().chain(
+        definition
+            .settings
+            .iter()
+            .map(|setting| setting.name.as_str()),
+    ) {
         if let Some(value) = host_config(key)?
             && !value.trim().is_empty()
         {
@@ -486,6 +499,15 @@ search:
         assert_eq!(indexer.provider_type, "cardigann");
         assert!(indexer.allowed_hosts.is_empty());
         assert!(indexer.capabilities.search);
+        let wire: Value = serde_json::from_slice(&component::descriptor_bytes_with_endpoints(
+            build_descriptor(),
+            true,
+        ))
+        .unwrap();
+        assert_eq!(
+            wire["provider"]["capabilities"]["resolve_network_endpoints"],
+            true
+        );
         assert_eq!(
             indexer
                 .config_fields
@@ -821,4 +843,5 @@ scryer_plugin_pdk::scryer_indexer_component_main!(
     descriptor = build_descriptor,
     search = search,
     action = action,
+    resolve_network_endpoints = true,
 );

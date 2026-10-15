@@ -132,6 +132,19 @@ fn refresh_requests_stay_scoped_and_preserve_move_fallbacks() {
     for version in ["1.20.0.3125-build", "1.19.9.9999", "unknown"] {
         for (path, old, explicit, mapped, expected) in cases.clone() {
             let expected = if version == "1.20.0.3125-build" {
+                let mut expected = expected;
+                let mut sections: std::collections::BTreeSet<_> = expected
+                    .iter()
+                    .filter(|(_, path)| path.is_none())
+                    .map(|(id, _)| *id)
+                    .collect();
+                let fallbacks: Vec<_> = expected
+                    .iter()
+                    .filter_map(|(id, path)| {
+                        (path.is_some() && sections.insert(*id)).then_some((*id, None))
+                    })
+                    .collect();
+                expected.extend(fallbacks);
                 expected
             } else {
                 let mut ids = std::collections::BTreeSet::new();
@@ -186,6 +199,19 @@ fn refresh_requests_stay_scoped_and_preserve_move_fallbacks() {
                 panic!("{result:?}")
             };
             assert!(response.success, "{response:?}");
+            for request in &store.data().script.requests {
+                let expected_method = if request.url.contains("/refresh?") {
+                    "POST"
+                } else {
+                    "GET"
+                };
+                assert_eq!(
+                    request.method.as_deref(),
+                    Some(expected_method),
+                    "{}",
+                    request.url
+                );
+            }
             let urls: Vec<_> = store
                 .data()
                 .script

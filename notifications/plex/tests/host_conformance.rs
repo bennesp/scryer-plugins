@@ -236,3 +236,88 @@ fn refresh_requests_stay_scoped_and_preserve_move_fallbacks() {
         }
     }
 }
+
+#[test]
+fn movie_series_and_anime_refresh_only_the_matching_library() {
+    use scryer_plugin_conformance::notification::test_request;
+    use scryer_plugin_conformance::{HttpReply, HttpRoute, HttpScript};
+    use scryer_plugin_sdk::PluginNotificationTitleMove;
+
+    let sections = r#"{"MediaContainer":{"Directory":[{"key":"1","type":"show","Location":[{"path":"/media/Shows"}]},{"key":"2","type":"movie","Location":[{"path":"/media/Movies"}]}]}}"#;
+    for (facet, root, section) in [
+        ("movie", "/media/Movies", "2"),
+        ("series", "/media/Shows", "1"),
+        ("anime", "/media/Shows", "1"),
+        ("anime", "/media/Movies", "2"),
+    ] {
+        for moved in [false, true] {
+            let suite = NotificationConformance::new(env!("CARGO_MANIFEST_DIR"), "plex")
+                .wasm("plex_notification.wasm")
+                .config("base_url", "http://plex.test.invalid:32400")
+                .config("update_library", "true")
+                .config("auth_token", "synthetic-token");
+            let mut script = suite.script();
+            script.http = HttpScript::Routed(vec![
+                HttpRoute::contains(
+                    "/identity?",
+                    HttpReply::ok(r#"{"MediaContainer":{"version":"1.43.4.10903"}}"#),
+                ),
+                HttpRoute::contains("/refresh?", HttpReply::ok("{}")),
+                HttpRoute::contains("/library/sections?", HttpReply::ok(sections)),
+            ]);
+            let mut request = test_request(if moved {
+                NotificationEventType::TitleMoved
+            } else {
+                NotificationEventType::Download
+            });
+            let path = format!("{root}/Example");
+            request.title.as_mut().unwrap().facet = facet.into();
+            request.title.as_mut().unwrap().path = Some(path.clone());
+            request.file = None;
+            request.media_files.clear();
+            if moved {
+                request.title_move = Some(PluginNotificationTitleMove {
+                    source_path: Some(format!("{root}/Previous")),
+                    destination_path: Some(path),
+                    ..Default::default()
+                });
+            }
+            let (mut store, plugin) = instantiate(&suite.wasm_path(), script);
+            let result = call_notification(
+                &mut store,
+                &plugin,
+                PluginNotificationCommand::Send(request),
+            );
+            let PluginNotificationCommandResult::Send(PluginResult::Ok(response)) = result else {
+                panic!("{result:?}");
+            };
+            assert!(response.success, "{facet}: {response:?}");
+            let refreshes: Vec<_> = store
+                .data()
+                .script
+                .requests
+                .iter()
+                .filter(|request| request.url.contains("/refresh?"))
+                .collect();
+            assert_eq!(refreshes.len(), if moved { 3 } else { 2 }, "{facet}");
+            for request in &refreshes {
+                assert_eq!(request.method.as_deref(), Some("POST"));
+                assert!(
+                    request
+                        .url
+                        .contains(&format!("/sections/{section}/refresh?")),
+                    "{}",
+                    request.url
+                );
+            }
+            assert_eq!(
+                refreshes
+                    .iter()
+                    .filter(|request| !request.url.contains("path="))
+                    .count(),
+                1
+            );
+            assert!(!refreshes.last().unwrap().url.contains("path="));
+        }
+    }
+}

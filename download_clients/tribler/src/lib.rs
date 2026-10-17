@@ -237,11 +237,9 @@ struct TriblerDownload {
     /// 7.x name for `all_time_ratio`.
     #[serde(default)]
     ratio: Option<f64>,
-    /// Parsed but deliberately unused. Sonarr's only use of it is the seeding
-    /// time goal (`TriblerDownloadClient.cs:205-210`), where it is the wrong
-    /// clock — see `derive_can_remove` — and Scryer's queue item has no
-    /// "added at" of its own to carry it in.
-    #[allow(dead_code)]
+    /// The unix second the download was added. Sonarr's only use of it is the
+    /// seeding time goal (`TriblerDownloadClient.cs:205-210`), where it is the
+    /// wrong clock — see `derive_can_remove`; here it only feeds `added_at`.
     #[serde(default)]
     time_added: Option<i64>,
     /// `tdef.atp.completed_time` — the unix second at which the payload
@@ -1135,6 +1133,7 @@ fn torrent_to_item(
     let message = state_message(&download);
     let category = item_category(config, settings, &download);
     let completed_at = download.seeding_started_at().and_then(unix_to_rfc3339);
+    let added_at = download.time_added.and_then(unix_to_rfc3339);
     let seed_time_seconds = download
         .seeding_started_at()
         .map(|started| (now - started).max(0));
@@ -1181,6 +1180,7 @@ fn torrent_to_item(
         removed: Some(false),
         raw_state: download.status,
         completed_at,
+        added_at,
     })
 }
 
@@ -2195,6 +2195,20 @@ mod tests {
         assert_eq!(torrent.seeding_started_at(), None);
         torrent.time_finished = Some(1_700_000_000);
         assert_eq!(torrent.seeding_started_at(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn time_added_becomes_an_rfc3339_added_at() {
+        let mut torrent = download("DOWNLOADING", 0.5, 0.0);
+        torrent.time_added = Some(1_700_000_000);
+        let item = torrent_to_item(&config(), &TriblerSettings::default(), torrent.clone(), NOW)
+            .expect("item");
+        assert_eq!(item.added_at.as_deref(), Some("2023-11-14T22:13:20Z"));
+
+        torrent.time_added = Some(0);
+        let item =
+            torrent_to_item(&config(), &TriblerSettings::default(), torrent, NOW).expect("item");
+        assert_eq!(item.added_at, None);
     }
 
     /// 7.x names for the transfer counters, which Tribler renamed in 8.x.

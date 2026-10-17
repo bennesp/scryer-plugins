@@ -159,6 +159,9 @@ struct TransmissionTorrent {
     /// Unix seconds; `0` when the torrent has never finished.
     #[serde(default, rename = "doneDate")]
     done_date: i64,
+    /// Unix seconds; `0` when unknown.
+    #[serde(default, rename = "addedDate")]
+    added_date: i64,
     #[serde(default)]
     labels: Vec<String>,
     #[serde(default, rename = "seedRatioLimit")]
@@ -1317,6 +1320,7 @@ fn list_torrents(config: &TransmissionConfig) -> Result<Vec<TransmissionTorrent>
         "rateDownload",
         "rateUpload",
         "doneDate",
+        "addedDate",
         "seedRatioLimit",
         "seedRatioMode",
         "seedIdleLimit",
@@ -1578,6 +1582,7 @@ fn torrent_to_item(
         removed: Some(false),
         raw_state: Some(torrent.status.to_string()),
         completed_at: unix_to_rfc3339(torrent.done_date),
+        added_at: unix_to_rfc3339(torrent.added_date),
     }
 }
 
@@ -2739,6 +2744,26 @@ mod tests {
         );
         assert_eq!(
             item(&SessionConfig::default(), complete_torrent(STATUS_STOPPED)).completed_at,
+            None
+        );
+    }
+
+    #[test]
+    fn added_date_becomes_an_rfc_3339_added_time() {
+        let torrent = TransmissionTorrent {
+            added_date: 1_700_000_000,
+            ..downloading_torrent(STATUS_DOWNLOADING)
+        };
+        assert_eq!(
+            item(&SessionConfig::default(), torrent).added_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+        assert_eq!(
+            item(
+                &SessionConfig::default(),
+                downloading_torrent(STATUS_DOWNLOADING)
+            )
+            .added_at,
             None
         );
     }

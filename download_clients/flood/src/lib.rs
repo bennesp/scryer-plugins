@@ -103,6 +103,8 @@ struct FloodTorrent {
     tags: Vec<String>,
     #[serde(default, rename = "dateFinished")]
     date_finished: Option<i64>,
+    #[serde(default, rename = "dateAdded")]
+    date_added: Option<i64>,
     #[serde(default, rename = "upTotal")]
     up_total: Option<i64>,
     #[serde(default, rename = "downTotal")]
@@ -1398,6 +1400,7 @@ fn torrent_to_item(client_hash: &str, torrent: FloodTorrent, now: i64) -> Plugin
         removed: Some(false),
         raw_state: Some(torrent.status.join(",")),
         completed_at: completed_at(&torrent),
+        added_at: added_at(&torrent),
     }
 }
 
@@ -1476,6 +1479,13 @@ fn completed_at(torrent: &FloodTorrent) -> Option<String> {
         .date_finished
         .filter(|finished| *finished > 0)
         .map(|finished| finished.to_string())
+}
+
+fn added_at(torrent: &FloodTorrent) -> Option<String> {
+    torrent
+        .date_added
+        .filter(|added| *added > 0)
+        .map(|added| added.to_string())
 }
 
 fn progress_percent(torrent: &FloodTorrent) -> Option<u8> {
@@ -2434,6 +2444,23 @@ mod tests {
         // (`download_client_adapter.rs:311` on release-0.19.8).
         let item = torrent_to_item("ABC", seeding_torrent(1.0), NOW);
         assert_eq!(item.completed_at.as_deref(), Some("1699999400"));
+    }
+
+    #[test]
+    fn date_added_is_reported_as_unix_seconds_added_at() {
+        let item = FloodTorrent {
+            date_added: Some(1_700_000_000),
+            ..torrent(&["downloading"])
+        };
+        assert_eq!(
+            torrent_to_item("ABC", item, NOW).added_at.as_deref(),
+            Some("1700000000")
+        );
+        let item = FloodTorrent {
+            date_added: Some(0),
+            ..torrent(&["downloading"])
+        };
+        assert_eq!(torrent_to_item("ABC", item, NOW).added_at, None);
     }
 
     #[test]

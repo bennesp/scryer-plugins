@@ -419,6 +419,7 @@ fn entry_to_item(_config: &BlackholeConfig, entry: WatchFolderEntry) -> PluginDo
             "waiting-for-stable-watch-folder-entry".to_string()
         }),
         completed_at: None,
+        added_at: None,
     }
 }
 

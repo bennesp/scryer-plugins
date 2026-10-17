@@ -1467,6 +1467,7 @@ fn torrent_to_item(torrent: Aria2Status) -> PluginDownloadItem {
         // aria2's status carries no completion timestamp — `tellStatus` has no
         // such member — so there is nothing honest to report here.
         completed_at: None,
+        added_at: None,
     }
 }
 

@@ -2256,6 +2256,7 @@ fn build_item(
         removed: Some(false),
         raw_state: Some(status_name(task.status).to_string()),
         completed_at: unix_to_rfc3339(task.detail_i64("completed_time")),
+        added_at: unix_to_rfc3339(task.detail_i64("create_time")),
     }
 }
 
@@ -3173,6 +3174,45 @@ mod tests {
             completed[0].completed_at.as_deref(),
             Some("2023-11-14T22:13:20Z")
         );
+    }
+
+    #[test]
+    fn a_task_reports_the_clients_create_time_as_added_at() {
+        let mut created = task(DsStatus::Downloading, 1_000);
+        created
+            .additional
+            .detail
+            .insert("create_time".to_string(), serde_json::json!(1_700_000_000));
+        let item = build_item(
+            &test_config(),
+            "SERIAL",
+            &created,
+            ItemContext {
+                state: DownloadItemState::Downloading,
+                remaining: 1_000,
+                eta_seconds: None,
+                output_dir: None,
+            },
+        );
+        assert_eq!(item.added_at.as_deref(), Some("2023-11-14T22:13:20Z"));
+
+        let mut zeroed = task(DsStatus::Downloading, 1_000);
+        zeroed
+            .additional
+            .detail
+            .insert("create_time".to_string(), serde_json::json!(0));
+        let item = build_item(
+            &test_config(),
+            "SERIAL",
+            &zeroed,
+            ItemContext {
+                state: DownloadItemState::Downloading,
+                remaining: 1_000,
+                eta_seconds: None,
+                output_dir: None,
+            },
+        );
+        assert_eq!(item.added_at, None);
     }
 
     #[test]

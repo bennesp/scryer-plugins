@@ -91,6 +91,8 @@ struct QbTorrent {
     #[serde(default)]
     completion_on: Option<i64>,
     #[serde(default)]
+    added_on: Option<i64>,
+    #[serde(default)]
     tags: Option<String>,
     #[serde(default)]
     uploaded: Option<i64>,
@@ -2319,6 +2321,7 @@ fn torrent_to_item_with_preferences(
         removed: Some(false),
         raw_state,
         completed_at: unix_to_rfc3339(torrent.completion_on),
+        added_at: unix_to_rfc3339(torrent.added_on),
     }
 }
 
@@ -3891,6 +3894,19 @@ mod tests {
         assert_eq!(map(public), Some(false));
         // Pre-5.0 qBittorrent omits the field entirely; never claim a torrent is public.
         assert_eq!(map(absent), None);
+    }
+
+    #[test]
+    fn added_on_is_reported_as_added_at() {
+        let raw = r#"[{"hash":"a1","name":"n","state":"stalledDL","added_on":1700000000}]"#;
+        let torrents: Vec<QbTorrent> = serde_json::from_str(raw).unwrap();
+        let item = torrent_to_item_with_preferences(torrents.into_iter().next().unwrap(), None);
+        assert_eq!(item.added_at.as_deref(), Some("2023-11-14T22:13:20Z"));
+
+        let raw = r#"[{"hash":"a1","name":"n","state":"metaDL","added_on":0}]"#;
+        let torrents: Vec<QbTorrent> = serde_json::from_str(raw).unwrap();
+        let item = torrent_to_item_with_preferences(torrents.into_iter().next().unwrap(), None);
+        assert_eq!(item.added_at, None);
     }
 
     #[test]

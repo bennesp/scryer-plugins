@@ -573,6 +573,7 @@ fn torrent_to_item(torrent: TorrentWithStats) -> PluginDownloadItem {
         removed: Some(false),
         raw_state: Some(torrent.stats.state.clone()),
         completed_at,
+        added_at: None,
     }
 }
 

@@ -224,6 +224,8 @@ struct DelugeTorrent {
     download_rate: Option<f64>,
     #[serde(default, rename = "upload_payload_rate")]
     upload_rate: Option<f64>,
+    #[serde(default, rename = "time_added")]
+    time_added: Option<f64>,
     /// Deluge 2's unix completion time; `0` on a torrent that has never finished, and
     /// absent entirely on Deluge 1.3.
     #[serde(default, rename = "completed_time")]
@@ -1446,6 +1448,7 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
     let label = reported_label(config, &torrent);
     let message = state_message(&torrent);
     let completed_at = completed_at(&torrent);
+    let added_at = added_at(&torrent);
     PluginDownloadItem {
         client_item_id: hash.clone(),
         download_id: None,
@@ -1481,6 +1484,7 @@ fn torrent_to_item(config: &DelugeConfig, torrent: DelugeTorrent) -> PluginDownl
         removed: Some(false),
         raw_state: Some(torrent.state),
         completed_at,
+        added_at,
     }
 }
 
@@ -1529,6 +1533,13 @@ fn rate_to_bytes(rate: Option<f64>) -> Option<i64> {
 fn completed_at(torrent: &DelugeTorrent) -> Option<String> {
     torrent
         .completed_time
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| unix_to_rfc3339(value as i64))
+}
+
+fn added_at(torrent: &DelugeTorrent) -> Option<String> {
+    torrent
+        .time_added
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| unix_to_rfc3339(value as i64))
 }
@@ -2191,6 +2202,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(torrent_to_item(&test_config(), zero).completed_at, None);
+    }
+
+    #[test]
+    fn time_added_becomes_an_rfc3339_added_at() {
+        let added: DelugeTorrent = serde_json::from_str(
+            r#"{"hash":"a1","name":"n","state":"Downloading","time_added":1700000000.75}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            torrent_to_item(&test_config(), added).added_at.as_deref(),
+            Some("2023-11-14T22:13:20Z")
+        );
+
+        let zero: DelugeTorrent = serde_json::from_str(
+            r#"{"hash":"a1","name":"n","state":"Downloading","time_added":0}"#,
+        )
+        .unwrap();
+        assert_eq!(torrent_to_item(&test_config(), zero).added_at, None);
     }
 
     #[test]

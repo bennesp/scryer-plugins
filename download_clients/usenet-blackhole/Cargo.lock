@@ -1746,7 +1746,7 @@ dependencies = [
 
 [[package]]
 name = "usenet-blackhole-download-client"
-version = "2.0.2"
+version = "2.0.3"
 dependencies = [
  "base64 0.23.1",
  "scryer-plugin-conformance",

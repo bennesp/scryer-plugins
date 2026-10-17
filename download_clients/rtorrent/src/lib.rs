@@ -758,6 +758,7 @@ fn torrent_to_item(torrent: RTorrentTorrent) -> PluginDownloadItem {
             torrent.is_active, torrent.is_finished
         )),
         completed_at: (torrent.finished_time > 0).then(|| torrent.finished_time.to_string()),
+        added_at: None,
     }
 }
 

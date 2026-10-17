@@ -208,6 +208,8 @@ struct FreeboxDownloadTask {
     transmitted_bytes: i64,
     #[serde(default, rename = "tx_rate")]
     transmitted_rate: i64,
+    #[serde(default, rename = "created_ts")]
+    created_timestamp: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1151,7 @@ fn torrent_to_item(config: &FreeboxConfig, torrent: FreeboxDownloadTask) -> Plug
         // timestamp to hand over, and inventing one from the creation time
         // would be worse than saying nothing.
         completed_at: None,
+        added_at: (torrent.created_timestamp > 0).then(|| torrent.created_timestamp.to_string()),
     }
 }
 
@@ -2174,6 +2177,19 @@ mod tests {
     #[test]
     fn can_remove_is_unknown_for_a_user_stopped_complete_task() {
         assert_eq!(derive_can_remove(&task("stopped")), None);
+    }
+
+    #[test]
+    fn created_ts_is_reported_as_added_at() {
+        let torrent = FreeboxDownloadTask {
+            created_timestamp: 1_700_000_000,
+            ..task("downloading")
+        };
+        let item = torrent_to_item(&test_config(), torrent);
+        assert_eq!(item.added_at.as_deref(), Some("1700000000"));
+
+        let item = torrent_to_item(&test_config(), task("downloading"));
+        assert_eq!(item.added_at, None);
     }
 
     #[test]

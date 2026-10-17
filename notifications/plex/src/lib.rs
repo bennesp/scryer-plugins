@@ -197,8 +197,22 @@ fn send_notification(req: &PluginNotificationRequest) -> FnResult<PluginNotifica
         targets.retain(|target| sections.insert(target.section_id.clone()));
     }
     let mut responses = Vec::new();
+    let mut full_sections: std::collections::BTreeSet<_> = targets
+        .iter()
+        .filter(|target| target.path.is_none())
+        .map(|target| target.section_id.clone())
+        .collect();
+    let mut fallback_sections = Vec::new();
     for target in targets {
         responses.push(refresh_section(&target.section_id, target.path.as_deref()));
+        // Plex can accept a folder refresh without discovering a new directory.
+        // Keep the section scan fallback, once per affected section.
+        if target.path.is_some() && full_sections.insert(target.section_id.clone()) {
+            fallback_sections.push(target.section_id);
+        }
+    }
+    for section_id in fallback_sections {
+        responses.push(refresh_section(&section_id, None));
     }
     Ok(merge_responses(responses))
 }
@@ -347,7 +361,7 @@ fn refresh_section(section_id: &str, path: Option<&str>) -> PluginNotificationRe
         &format!("{}/library/sections/{section_id}/refresh", base_url()),
         &params,
     );
-    send_bytes(&url, "GET", &[], Vec::new())
+    send_bytes(&url, "POST", &[], Vec::new())
 }
 
 fn base_url() -> String {

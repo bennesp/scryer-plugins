@@ -11,11 +11,11 @@ official = true
 plugin_id = "aria2"
 status = "beta"
 catalog_versions = ["v3"]
-# Scryer 0.20.0 is the first release whose download-client backing is the
-# `scryer:download-client/download-client@1.0.0` component host. Earlier
-# releases run the Preview 1 command runtime and cannot instantiate this
-# artifact at all, so the floor is load-bearing, not advisory.
-min_scryer_version = "0.20.0"
+# Scryer 0.21.17 is the first release whose host accepts plugin SDK 3.16,
+# which this artifact declares. Older releases reject it before
+# registration (0.20.0 was the earlier floor, for the component host), so
+# the floor is load-bearing, not advisory.
+min_scryer_version = "0.21.17"
 docs_url = "https://github.com/scryer-media/scryer-plugins/tree/main/download_clients/aria2"
 source_repo = "https://github.com/scryer-media/scryer-plugins/tree/main/download_clients/aria2"
 
@@ -28,7 +28,7 @@ crate-type = ["cdylib"]
 [dependencies]
 base64 = "0.23"
 roxmltree = "0.21"
-scryer-plugin-sdk = "3.11.0"
+scryer-plugin-sdk = "3.16.0"
 scryer-plugin-pdk = { path = "../../pdk/scryer-plugin-pdk", version = "0.7.0" }
 serde = "1"
 serde_json = "1"

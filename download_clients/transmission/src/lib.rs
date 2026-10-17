@@ -321,6 +321,7 @@ pub fn scryer_describe(_input: String) -> FnResult<String> {
         sdk_version: SDK_VERSION.to_string(),
         sdk_constraint: current_sdk_constraint(),
         socket_permissions: vec![],
+        settings: Vec::new(),
         provider: ProviderDescriptor::DownloadClient(DownloadClientDescriptor {
             provider_type: "transmission".to_string(),
             provider_aliases: vec!["vuze".to_string(), "azureus".to_string()],

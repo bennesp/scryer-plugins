@@ -343,7 +343,7 @@ score_entry["nzbgeek_thumbs_down"] := penalty if {
 const REGO_INDEXER_LANGUAGE_CONFIRMED: &str = r#"package scryer.rules.user.plugin_indexer_language_confirmed
 import rego.v1
 
-score_entry["indexer_language_confirmed"] := 200 if {
+score_entry["indexer_language_confirmed"] := 80 if {
     required := {lower(lang) | some lang in input.profile.required_audio_languages}
     some lang in input.release.indexer_languages
     lower(lang) in required
@@ -472,6 +472,11 @@ mod tests {
             language
                 .rego_source
                 .contains("input.profile.required_audio_languages")
+        );
+        assert!(
+            language
+                .rego_source
+                .contains(r#"score_entry["indexer_language_confirmed"] := 80 if"#)
         );
         assert!(!language.rego_source.contains("languages_audio"));
         assert!(!language.rego_source.contains("input.release.extra"));

@@ -344,9 +344,11 @@ const REGO_INDEXER_LANGUAGE_CONFIRMED: &str = r#"package scryer.rules.user.plugi
 import rego.v1
 
 score_entry["indexer_language_confirmed"] := 80 if {
-    required := {lower(lang) | some lang in input.profile.required_audio_languages}
-    some lang in input.release.indexer_languages
-    lower(lang) in required
+    count(input.profile.required_audio_languages) > 0
+    reported := {lower(lang) | some lang in input.release.indexer_languages}
+    every lang in input.profile.required_audio_languages {
+        lower(lang) in reported
+    }
 }
 "#;
 
@@ -477,6 +479,11 @@ mod tests {
             language
                 .rego_source
                 .contains(r#"score_entry["indexer_language_confirmed"] := 80 if"#)
+        );
+        assert!(
+            language
+                .rego_source
+                .contains("every lang in input.profile.required_audio_languages")
         );
         assert!(!language.rego_source.contains("languages_audio"));
         assert!(!language.rego_source.contains("input.release.extra"));
